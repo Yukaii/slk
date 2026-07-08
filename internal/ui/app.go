@@ -169,6 +169,11 @@ type App struct {
 
 	uploader UploadFunc
 
+	// statusReport mirrors slk's unread state onto an external surface,
+	// invoked by notifyReadStateChanged on every read-state change. Nil unless
+	// a status_command is configured (config: notifications.status_command).
+	statusReport StatusReportFunc
+
 	// clipboardAvailable is set at startup based on the result of
 	// clipboard.Init(). When false, Ctrl+V smart-paste is a no-op.
 	clipboardAvailable bool
@@ -1917,6 +1922,13 @@ func (a *App) SetWorkspaceUnreadReader(f func() []string) {
 	a.workspaceRail.SetUnreadReader(f)
 }
 
+// SetStatusReporter installs the StatusReportFunc invoked on every unread-state
+// change to mirror slk's unread state onto an external surface (config:
+// notifications.status_command).
+func (a *App) SetStatusReporter(fn StatusReportFunc) {
+	a.statusReport = fn
+}
+
 func (a *App) SetChannelFinderItems(items []channelfinder.Item) {
 	a.channelFinder.SetItems(items)
 }
@@ -2873,12 +2885,13 @@ func (a *App) beginEditOfSelected() tea.Cmd {
 func (a *App) notifyReadStateChanged() {
 	a.sidebar.Invalidate()
 	a.workspaceRail.RefreshUnreads()
-	a.windowTitle = computeWindowTitle(
-		a.activeTeamID,
-		a.workspaceRail.NameByID(a.activeTeamID),
-		a.sidebar.UnreadChannelCount(),
-		a.workspaceRail.OtherUnreadCount(a.activeTeamID),
-	)
+	active := a.sidebar.UnreadChannelCount()
+	other := a.workspaceRail.OtherUnreadCount(a.activeTeamID)
+	name := a.workspaceRail.NameByID(a.activeTeamID)
+	a.windowTitle = computeWindowTitle(a.activeTeamID, name, active, other)
+	if a.statusReport != nil {
+		a.statusReport(active, other, name, a.windowTitle)
+	}
 }
 
 // applyChannelMark updates local state for a channel-level read-state

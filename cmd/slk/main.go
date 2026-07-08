@@ -549,7 +549,7 @@ func run() error {
 	// the active TeamID up front (workspaces connect in goroutines).
 	styles.Apply(cfg.Appearance.Theme, cfg.Theme)
 
-	notifier := notify.New(cfg.Notifications.Enabled)
+	notifier := notify.New(cfg.Notifications.Enabled, cfg.Notifications.NotifyCommand)
 
 	// Initialize the OS clipboard for paste-to-upload.
 	//
@@ -615,6 +615,12 @@ func run() error {
 	app := ui.NewApp()
 	app.SetHelpFooter(versionpkg.ModalFooter(version))
 	app.SetClipboardAvailable(clipboardOK)
+	if sr := notify.NewStatusReporter(cfg.Notifications.StatusCommand); sr != nil {
+		// Run off the UI goroutine so the status_command subprocess never blocks a render.
+		app.SetStatusReporter(func(unread, other int, ws, title string) {
+			go sr.Report(unread, other, ws, title)
+		})
+	}
 	if useWaylandClipboard {
 		app.SetClipboardReader(ui.WaylandClipboardReader())
 	}

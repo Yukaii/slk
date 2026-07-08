@@ -28,6 +28,23 @@ on_dm = true
 on_keyword = ["deploy", "incident"]
 quiet_hours = "22:00-08:00"   # planned
 
+# notify_command (optional): run INSTEAD of the built-in OS notification for any
+# message that would notify (DM / mention / keyword). Executed via `sh -c` with
+# $SLK_TITLE and $SLK_BODY set, so you can route notifications through your own
+# tooling (terminal-notifier, a multiplexer's notifier, mako, ...). Values are
+# passed via the environment, so message text can't inject shell syntax.
+# notify_command = 'terminal-notifier -title "$SLK_TITLE" -message "$SLK_BODY"'
+
+# status_command (optional): run on every unread-state change (a message arrives
+# or a channel is read) so an external surface can mirror slk's unread state.
+# Because it fires on reads too, it can clear a status as well as set one.
+# Executed via `sh -c` with:
+#   $SLK_UNREAD        unread channels in the active workspace (mute-filtered)
+#   $SLK_OTHER_UNREAD  unread count across other workspaces
+#   $SLK_WORKSPACE     active workspace name
+#   $SLK_TITLE         the window-title string, e.g. "slk SW (3) +1"
+# status_command = 'my-statusbar --slack-unread "$SLK_UNREAD"'
+
 [cache]
 message_retention_days = 30
 max_db_size_mb = 500
