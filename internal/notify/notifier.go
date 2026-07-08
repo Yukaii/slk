@@ -58,6 +58,7 @@ type NotifyContext struct {
 	OnDM            bool
 	OnKeyword       []string
 	IsDND           bool // when true, ShouldNotify always returns false
+	IsMuted         bool // when true (conversation is muted), ShouldNotify always returns false
 }
 
 // ShouldNotify returns true if a message should trigger a desktop notification.
@@ -69,6 +70,12 @@ func ShouldNotify(ctx NotifyContext, channelID, userID, text, channelType string
 
 	// Suppress entirely while DND/snoozed.
 	if ctx.IsDND {
+		return false
+	}
+
+	// Suppress notifications from a muted conversation — a muted channel or DM
+	// is silent, matching Slack.
+	if ctx.IsMuted {
 		return false
 	}
 

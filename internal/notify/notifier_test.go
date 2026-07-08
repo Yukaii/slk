@@ -154,6 +154,21 @@ func TestShouldNotify_SuppressedByDND(t *testing.T) {
 	}
 }
 
+func TestShouldNotify_SuppressedByMute(t *testing.T) {
+	ctx := NotifyContext{
+		CurrentUserID:   "U1",
+		ActiveChannelID: "C_OTHER",
+		IsActiveWS:      false, // would otherwise notify
+		OnDM:            true,
+		OnMention:       true,
+		OnKeyword:       []string{"deploy"},
+		IsMuted:         true,
+	}
+	if ShouldNotify(ctx, "C1", "U2", "hey <@U1> deploy", "dm") {
+		t.Error("a muted conversation should suppress notifications regardless of triggers")
+	}
+}
+
 func TestStripSlackMarkup(t *testing.T) {
 	userNames := map[string]string{
 		"U123": "Alice",
