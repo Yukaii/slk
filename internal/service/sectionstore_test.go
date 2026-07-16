@@ -90,8 +90,7 @@ func TestSectionStore_Bootstrap_TruncatedSection_LogsAndContinues(t *testing.T) 
 func TestSectionStore_OrderedSections_FiltersSystemTypes(t *testing.T) {
 	sections := []slk.SidebarSection{
 		{ID: "S", Type: "salesforce_records", Next: "G", LastUpdate: 1},
-		{ID: "G", Type: "agents", Next: "T", LastUpdate: 1},
-		{ID: "T", Type: "stars", Next: "K", LastUpdate: 1},
+		{ID: "G", Type: "agents", Next: "K", LastUpdate: 1},
 		{ID: "K", Type: "slack_connect", Next: "U", LastUpdate: 1},
 		{ID: "U", Type: "standard", Name: "Mine", Next: "", LastUpdate: 1, ChannelIDs: []string{"C1"}, ChannelsCount: 1},
 	}
@@ -104,6 +103,71 @@ func TestSectionStore_OrderedSections_FiltersSystemTypes(t *testing.T) {
 	}
 	if got[0].ID != "U" {
 		t.Errorf("got %q, want U", got[0].ID)
+	}
+}
+
+// stars is a Slack-native section type (the "Starred" feature). A
+// non-empty stars section must render in the sidebar, matching how the
+// official Slack client surfaces starred channels.
+func TestSectionStore_OrderedSections_StarsRenderWhenNonEmpty(t *testing.T) {
+	sections := []slk.SidebarSection{
+		{ID: "ST", Type: "stars", Name: "", Next: "U", LastUpdate: 1,
+			ChannelIDs: []string{"C1"}, ChannelsCount: 1},
+		{ID: "U", Type: "standard", Name: "Mine", Next: "", LastUpdate: 1},
+	}
+	c := &fakeSectionsClient{sections: sections}
+	store := NewSectionStore()
+	_ = store.Bootstrap(context.Background(), c)
+	got := store.OrderedSections()
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2 (stars + standard); got %+v", len(got), got)
+	}
+	if got[0].ID != "ST" {
+		t.Errorf("got[0].ID = %q, want ST (stars comes first in linked list)", got[0].ID)
+	}
+	if got[1].ID != "U" {
+		t.Errorf("got[1].ID = %q, want U", got[1].ID)
+	}
+}
+
+// An empty stars section must stay hidden so users who haven't starred
+// anything don't see an empty header — mirrors recent_apps semantics.
+func TestSectionStore_OrderedSections_StarsHiddenWhenEmpty(t *testing.T) {
+	sections := []slk.SidebarSection{
+		{ID: "ST", Type: "stars", Name: "", Next: "U", LastUpdate: 1},
+		{ID: "U", Type: "standard", Name: "Mine", Next: "", LastUpdate: 1,
+			ChannelIDs: []string{"C1"}, ChannelsCount: 1},
+	}
+	c := &fakeSectionsClient{sections: sections}
+	store := NewSectionStore()
+	_ = store.Bootstrap(context.Background(), c)
+	got := store.OrderedSections()
+	if len(got) != 1 {
+		t.Fatalf("len = %d, want 1 (empty stars hidden); got %+v", len(got), got)
+	}
+	if got[0].ID != "U" {
+		t.Errorf("got[0].ID = %q, want U", got[0].ID)
+	}
+}
+
+// SectionForChannel must claim channels that Slack has placed in a
+// stars section, so they render under the Starred header rather than
+// falling through to the type-default bucket.
+func TestSectionStore_SectionForChannel_StarsClaimed(t *testing.T) {
+	sections := []slk.SidebarSection{
+		{ID: "ST", Type: "stars", Name: "", Next: "U", LastUpdate: 1,
+			ChannelIDs: []string{"C9"}, ChannelsCount: 1},
+		{ID: "U", Type: "standard", Name: "Mine", Next: "", LastUpdate: 1},
+	}
+	c := &fakeSectionsClient{sections: sections}
+	store := NewSectionStore()
+	_ = store.Bootstrap(context.Background(), c)
+	id, ok := store.SectionForChannel("C9")
+	if !ok {
+		t.Fatalf("SectionForChannel(C9) ok=false, want true (stars section should claim its channels)")
+	}
+	if id != "ST" {
+		t.Errorf("SectionForChannel(C9) = %q, want ST", id)
 	}
 }
 
@@ -275,10 +339,10 @@ func (cc *countingClient) GetChannelSections(ctx context.Context) ([]slk.Sidebar
 func TestSectionForChannel_HidesNonRenderableSections(t *testing.T) {
 	store := NewSectionStore()
 	c := &fakeSectionsClient{sections: []slk.SidebarSection{
-		// A starred channel: real, indexed, but the section type is
-		// hidden by the v1 renderability filter.
-		{ID: "L_STARS", Type: "stars", Next: "L_STD", LastUpdate: 100,
-			ChannelIDs: []string{"C_STARRED"}, ChannelsCount: 1},
+		// A channel in a slack_connect section: real, indexed, but the
+		// section type is hidden by the renderability filter.
+		{ID: "L_SC", Type: "slack_connect", Next: "L_STD", LastUpdate: 100,
+			ChannelIDs: []string{"C_EXTERNAL"}, ChannelsCount: 1},
 		// A regular standard section, fully renderable.
 		{ID: "L_STD", Type: "standard", Name: "Mine", Next: "", LastUpdate: 100,
 			ChannelIDs: []string{"C_STD"}, ChannelsCount: 1},
@@ -291,11 +355,11 @@ func TestSectionForChannel_HidesNonRenderableSections(t *testing.T) {
 	if id, ok := store.SectionForChannel("C_STD"); !ok || id != "L_STD" {
 		t.Errorf("C_STD → (%q, %v), want (L_STD, true)", id, ok)
 	}
-	// Channel in the non-renderable (stars) section — returns ("", false)
+	// Channel in the non-renderable (slack_connect) section — returns ("", false)
 	// even though the channelToSection index has it. This prevents the
 	// sidebar from receiving a Section ID it can't bucket against.
-	if id, ok := store.SectionForChannel("C_STARRED"); ok {
-		t.Errorf("C_STARRED → (%q, %v), want ('', false) for non-renderable section", id, ok)
+	if id, ok := store.SectionForChannel("C_EXTERNAL"); ok {
+		t.Errorf("C_EXTERNAL → (%q, %v), want ('', false) for non-renderable section", id, ok)
 	}
 }
 

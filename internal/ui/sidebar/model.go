@@ -1393,7 +1393,15 @@ func (m *Model) sectionDisplayMeta(sectionKey string) (name, emoji string) {
 			if meta.ID == sectionKey {
 				name = meta.Name
 				if name == "" {
-					name = "(unnamed)"
+					// Built-in sections Slack sends without a user-set
+					// name need a friendly fallback. Today only "stars"
+					// reaches this branch (other unnamed system types
+					// are filtered by SectionStore.includeInSidebar).
+					if meta.Type == "stars" {
+						name = "Starred"
+					} else {
+						name = "(unnamed)"
+					}
 				}
 				return name, meta.Emoji
 			}

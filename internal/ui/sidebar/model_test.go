@@ -609,6 +609,26 @@ func TestSectionHeader_RendersEmojiPrefix(t *testing.T) {
 	}
 }
 
+// Slack sends the stars section with name="" (it's a built-in section,
+// not user-named). The sidebar must fall back to a friendly header
+// ("Starred") rather than rendering "(unnamed)".
+func TestSectionHeader_StarsSection_FallsBackToStarred(t *testing.T) {
+	items := []ChannelItem{{ID: "C1", Name: "ch1", Type: "channel", Section: "ST"}}
+	provider := &fakeProvider{
+		ready:    true,
+		sections: []SectionMeta{{ID: "ST", Name: "", Type: "stars"}},
+	}
+	m := New(items)
+	m.SetSectionsProvider(provider)
+	out := m.View(20, 40)
+	if !strings.Contains(out, "Starred") {
+		t.Errorf("stars section with empty name should fall back to \"Starred\"; got:\n%s", out)
+	}
+	if strings.Contains(out, "(unnamed)") {
+		t.Errorf("stars section should not render the generic \"(unnamed)\" fallback; got:\n%s", out)
+	}
+}
+
 func TestCollapseByID_PreservedAcrossRename(t *testing.T) {
 	items := []ChannelItem{{ID: "C1", Name: "ch1", Type: "channel", Section: "A"}}
 	p := &fakeProvider{
