@@ -171,6 +171,84 @@ func TestSectionStore_SectionForChannel_StarsClaimed(t *testing.T) {
 	}
 }
 
+// Slack's users.channelSections.list returns the stars section with an
+// empty channel_ids array. PopulateStars fills it from stars.list, the
+// authoritative source for starred channels. Without this call, a
+// bootstrapped stars section stays empty and includeInSidebar hides it.
+func TestSectionStore_PopulateStars_FillsEmptyStarsSection(t *testing.T) {
+	sections := []slk.SidebarSection{
+		{ID: "ST", Type: "stars", Name: "", Next: "U", LastUpdate: 1},
+		{ID: "U", Type: "standard", Name: "Mine", Next: "", LastUpdate: 1},
+	}
+	c := &fakeSectionsClient{sections: sections}
+	store := NewSectionStore()
+	_ = store.Bootstrap(context.Background(), c)
+
+	// Before: stars section is empty → hidden by includeInSidebar.
+	// The standard section U renders regardless (standard always shows).
+	got := store.OrderedSections()
+	if len(got) != 1 || got[0].ID != "U" {
+		t.Fatalf("before PopulateStars: OrderedSections = %+v, want just [U] (empty stars hidden)", got)
+	}
+
+	store.PopulateStars([]string{"C1", "C2"})
+
+	// After: stars section renders, channels claimed.
+	got = store.OrderedSections()
+	if len(got) != 2 {
+		t.Fatalf("after PopulateStars: OrderedSections len = %d, want 2 (stars + standard); got %+v", len(got), got)
+	}
+	if got[0].ID != "ST" {
+		t.Errorf("got[0].ID = %q, want ST (stars is earlier in linked list)", got[0].ID)
+	}
+	for _, cid := range []string{"C1", "C2"} {
+		id, ok := store.SectionForChannel(cid)
+		if !ok || id != "ST" {
+			t.Errorf("SectionForChannel(%s) = (%q,%v), want (ST,true)", cid, id, ok)
+		}
+	}
+}
+
+// PopulateStars is a no-op when there is no stars section (workspace
+// doesn't have one, or it was deleted). It must not synthesize one.
+func TestSectionStore_PopulateStars_NoOpWithoutStarsSection(t *testing.T) {
+	sections := []slk.SidebarSection{
+		{ID: "U", Type: "standard", Name: "Mine", Next: "", LastUpdate: 1},
+	}
+	c := &fakeSectionsClient{sections: sections}
+	store := NewSectionStore()
+	_ = store.Bootstrap(context.Background(), c)
+	store.PopulateStars([]string{"C1", "C2"})
+	// Channel C1 is not in any real section.
+	if _, ok := store.SectionForChannel("C1"); ok {
+		t.Errorf("SectionForChannel(C1) ok=true, want false (no stars section to claim it)")
+	}
+}
+
+// PopulateStars replaces the stars section's channel list on re-call so
+// star/unstar events stay consistent. Re-starring the same channel and
+// un-starring another should reflect in the new state.
+func TestSectionStore_PopulateStars_ReplacesPreviousStarList(t *testing.T) {
+	sections := []slk.SidebarSection{
+		{ID: "ST", Type: "stars", Name: "", Next: "U", LastUpdate: 1},
+		{ID: "U", Type: "standard", Name: "Mine", Next: "", LastUpdate: 1},
+	}
+	c := &fakeSectionsClient{sections: sections}
+	store := NewSectionStore()
+	_ = store.Bootstrap(context.Background(), c)
+	store.PopulateStars([]string{"C1", "C2"})
+	store.PopulateStars([]string{"C2", "C3"})
+	// C1 un-starred, C3 newly starred.
+	if _, ok := store.SectionForChannel("C1"); ok {
+		t.Errorf("C1 should no longer be claimed after re-populate without it")
+	}
+	for _, cid := range []string{"C2", "C3"} {
+		if id, ok := store.SectionForChannel(cid); !ok || id != "ST" {
+			t.Errorf("SectionForChannel(%s) = (%q,%v), want (ST,true)", cid, id, ok)
+		}
+	}
+}
+
 func TestSectionStore_BootstrapFailure_NotReady(t *testing.T) {
 	c := &fakeSectionsClient{getErr: context.DeadlineExceeded}
 	store := NewSectionStore()

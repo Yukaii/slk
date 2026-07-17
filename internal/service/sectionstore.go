@@ -88,6 +88,46 @@ func (s *SectionStore) Bootstrap(ctx context.Context, client SectionsClient) err
 	return nil
 }
 
+// PopulateStars fills the stars section's ChannelIDs from stars.list,
+// the authoritative source for starred channels. Slack's
+// users.channelSections.list returns the stars section with an empty
+// channel_ids array (it doesn't populate built-in section types); without
+// this call the stars section stays empty and includeInSidebar hides it.
+//
+// Safe to call repeatedly — each call replaces the previous star list
+// and remaps the channelToSection index accordingly. No-op when the
+// workspace has no stars section (won't synthesize one).
+func (s *SectionStore) PopulateStars(channelIDs []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.ready {
+		return
+	}
+	var starsSectionID string
+	var stars *slk.SidebarSection
+	for id, sec := range s.sectionsByID {
+		if sec.Type == "stars" {
+			starsSectionID = id
+			stars = sec
+			break
+		}
+	}
+	if stars == nil {
+		return
+	}
+	// Drop the old stars→channel index entries.
+	for _, cid := range stars.ChannelIDs {
+		if existing, ok := s.channelToSection[cid]; ok && existing == starsSectionID {
+			delete(s.channelToSection, cid)
+		}
+	}
+	stars.ChannelIDs = append([]string(nil), channelIDs...)
+	stars.ChannelsCount = len(channelIDs)
+	for _, cid := range channelIDs {
+		s.channelToSection[cid] = starsSectionID
+	}
+}
+
 // SectionForChannel returns the renderable section ID a channel belongs
 // to. Returns ok=false when the store isn't ready, the channel isn't
 // indexed, OR the indexed section is not renderable in the sidebar
