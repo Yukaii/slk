@@ -19,6 +19,7 @@ import (
 	"github.com/gammons/slk/internal/ui/scrollbar"
 	"github.com/gammons/slk/internal/ui/selection"
 	"github.com/gammons/slk/internal/ui/styles"
+	"github.com/gammons/slk/internal/usergroups"
 )
 
 type MessageItem struct {
@@ -231,6 +232,7 @@ type Model struct {
 	avatarFn     AvatarFunc        // optional: returns half-block avatar for a userID
 	userNames    map[string]string // user ID -> display name for mention resolution
 	channelNames map[string]string // channel ID -> name for bare <#CID> resolution
+	userGroups   map[string]string // usergroup ID -> handle for bare subteam resolution
 
 	// searchTerms are folded word-prefix terms of the active in-channel
 	// search; non-empty enables highlight rendering. nil = no search.
@@ -1369,6 +1371,14 @@ func (m *Model) SetChannelNames(names map[string]string) {
 	m.dirty()
 }
 
+// SetUserGroups sets the workspace-scoped usergroup ID -> handle map used
+// to resolve bare <!subteam^SID> mentions.
+func (m *Model) SetUserGroups(groups map[string]string) {
+	m.userGroups = usergroups.Copy(groups)
+	m.cache = nil
+	m.dirty()
+}
+
 // EmojiContext bundles the emoji-image rendering dependencies. Held
 // by the Model and threaded through RenderSlackMarkdownWith when
 // building each message's body and reaction pills.
@@ -1857,6 +1867,7 @@ func (m *Model) blockkitContext(msg MessageItem, userNames, channelNames map[str
 			return RenderSlackMarkdownWith(s, RenderSlackMarkdownOpts{
 				UserNames:    un,
 				ChannelNames: channelNames,
+				UserGroups:   m.userGroups,
 				PlaceCtx:     m.emojiCtx.PlaceCtx,
 				EmojiCells:   m.emojiCtx.Cells,
 				Customs:      m.emojiCtx.Customs,
@@ -1914,6 +1925,7 @@ func (m *Model) renderMessagePlain(msg MessageItem, width int, avatarStr string,
 	bodyOpts := RenderSlackMarkdownOpts{
 		UserNames:    userNames,
 		ChannelNames: channelNames,
+		UserGroups:   m.userGroups,
 		PlaceCtx:     m.emojiCtx.PlaceCtx,
 		EmojiCells:   m.emojiCtx.Cells,
 		Customs:      m.emojiCtx.Customs,

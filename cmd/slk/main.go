@@ -165,6 +165,7 @@ type WorkspaceContext struct {
 	UserID        string
 	UnresolvedDMs []UnresolvedDM
 	CustomEmoji   map[string]string // emoji name -> URL or "alias:target"
+	UserGroups    map[string]string // usergroup ID -> handle
 	// Self presence and DND state for this workspace. Populated on connect
 	// and updated by manual_presence_change / dnd_updated WS events plus
 	// optimistic writes from the presence menu.
@@ -1528,6 +1529,7 @@ func run() error {
 			ExternalUsers:    external,
 			UserID:           wctx.UserID,
 			CustomEmoji:      wctx.CustomEmoji,
+			UserGroups:       wctx.UserGroups,
 			SectionsProvider: sectionsProviderAdapter{store: wctx.SectionStore},
 		}
 	})
@@ -1682,6 +1684,7 @@ func run() error {
 				ExternalUsers:    external,
 				UserID:           wctx.UserID,
 				CustomEmoji:      wctx.CustomEmoji, // empty at this point; filled by the goroutine below
+				UserGroups:       wctx.UserGroups,  // empty at this point; filled by the goroutine below
 				SectionsProvider: sectionsProviderAdapter{store: wctx.SectionStore},
 				InitialActive:    isInitial,
 				LastChannelID:    mostRecentlyVisitedChannel(wctx.LastVisitedByChannel),
@@ -1700,6 +1703,24 @@ func run() error {
 				p.Send(ui.CustomEmojisLoadedMsg{
 					TeamID:      teamID,
 					CustomEmoji: emojis,
+				})
+			}(wctx.TeamID)
+
+			// Fetch workspace usergroups in the background. When done,
+			// send a follow-up so render caches and compose pickers can
+			// refresh for the active workspace. Best-effort: failure leaves
+			// bare subteam mentions rendered as "@group".
+			go func(teamID string) {
+				groups, err := wctx.Client.GetUserGroups(ctx)
+				if err != nil {
+					log.Printf("usergroups fetch for %s failed: %v (subteam mentions will render as @group)", wctx.TeamName, err)
+					return
+				}
+				byID := usergroupHandles(groups)
+				wctx.UserGroups = byID
+				p.Send(ui.UserGroupsLoadedMsg{
+					TeamID:     teamID,
+					UserGroups: byID,
 				})
 			}(wctx.TeamID)
 
@@ -1758,6 +1779,20 @@ func run() error {
 	return err
 }
 
+func usergroupHandles(groups []slack.UserGroup) map[string]string {
+	byID := make(map[string]string, len(groups))
+	for _, g := range groups {
+		handle := g.Handle
+		if handle == "" {
+			handle = g.Name
+		}
+		if handle != "" {
+			byID[g.ID] = handle
+		}
+	}
+	return byID
+}
+
 func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB, cfg config.Config, avatarCache *avatar.Cache, p *tea.Program) (*WorkspaceContext, error) {
 	client := slackclient.NewClient(token.AccessToken, token.Cookie)
 	if err := client.Connect(ctx); err != nil {
@@ -1774,6 +1809,7 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		UserNamesByHandle:    make(map[string]string),
 		BotUserIDs:           make(map[string]bool),
 		CustomEmoji:          make(map[string]string),
+		UserGroups:           make(map[string]string),
 		LastVisitedByChannel: make(map[string]int64),
 	}
 	wctx.SubscriptionsAvailable = true
@@ -2977,7 +3013,7 @@ func searchWorkspaceFunc(router *workspaceRouter, db *cache.DB, tsFormat string)
 			}
 			return "", false
 		}
-		items := searchResultItems(res.Matches, tsFormat, time.Now(), resolveUser, resolveChannel)
+		items := searchResultItems(res.Matches, tsFormat, time.Now(), resolveUser, resolveChannel, wctx.UserGroups)
 		return ui.WorkspaceSearchResultsMsg{Query: query, Items: items, Total: res.Total}
 	}
 }
@@ -2992,7 +3028,7 @@ var userIDShapeRe = regexp.MustCompile(`^[UW][A-Z0-9]{5,}$`)
 // channel names (raw user IDs on the wire) are resolved to the
 // counterpart's display name, and thread TSes are recovered from
 // permalinks. Pure: all lookups go through the supplied resolvers.
-func searchResultItems(matches []slack.SearchMessage, tsFormat string, now time.Time, resolveUser, resolveChannel func(id string) (string, bool)) []searchresults.Item {
+func searchResultItems(matches []slack.SearchMessage, tsFormat string, now time.Time, resolveUser, resolveChannel func(id string) (string, bool), userGroups map[string]string) []searchresults.Item {
 	items := make([]searchresults.Item, 0, len(matches))
 	for _, match := range matches {
 		// ThreadTS comes from the hit's permalink. Known v1
@@ -3023,7 +3059,7 @@ func searchResultItems(matches []slack.SearchMessage, tsFormat string, now time.
 			UserName:    match.Username,
 			TS:          match.Timestamp,
 			ThreadTS:    threadTS,
-			Text:        messages.FlattenMrkdwn(match.Text, resolveUser, resolveChannel),
+			Text:        messages.FlattenMrkdwnWithUserGroups(match.Text, resolveUser, resolveChannel, userGroups),
 			Timestamp:   formatSearchTimestamp(match.Timestamp, tsFormat, now),
 			IsDM:        isDM,
 		})
@@ -3287,7 +3323,11 @@ func (h *rtmEventHandler) OnMessage(channelID, userID, ts, text, threadTS, subty
 			if chType == "dm" || chType == "group_dm" {
 				title = h.workspaceName + ": " + senderName
 			}
-			body := senderName + ": " + notify.StripSlackMarkup(text, h.userNames)
+			var groupNames map[string]string
+			if h.wsCtx != nil {
+				groupNames = h.wsCtx.UserGroups
+			}
+			body := senderName + ": " + notify.StripSlackMarkupWithUserGroups(text, h.userNames, groupNames)
 			go h.notifier.Notify(title, body)
 		}
 	}

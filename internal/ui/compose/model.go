@@ -15,6 +15,7 @@ import (
 	"github.com/gammons/slk/internal/ui/emojipicker"
 	"github.com/gammons/slk/internal/ui/mentionpicker"
 	"github.com/gammons/slk/internal/ui/styles"
+	"github.com/gammons/slk/internal/usergroups"
 )
 
 // PendingAttachment is a file (or in-memory image) waiting to be
@@ -40,6 +41,7 @@ type Model struct {
 	mentionStartCol int // cursor column where @ was typed
 	users           []mentionpicker.User
 	reverseNames    map[string]string // displayName -> userID
+	userGroups      map[string]string // usergroup ID -> handle for active workspace
 
 	// activeChannelID is the channel currently shown in the messages
 	// pane. Drives the InChannel computation when rebuilding the
@@ -447,6 +449,11 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			if atPos == 0 || val[atPos-1] == ' ' || val[atPos-1] == '\n' {
 				m.mentionActive = true
 				m.mentionStartCol = cursorAbsPos // cursor is after the @
+				// Rebuild on open so usergroup entries reflect the
+				// registry's current contents — the background
+				// usergroups.list fetch may have landed after the
+				// last SetUsers/SetActiveChannel rebuild.
+				m.rebuildMentionUsers()
 				m.mentionPicker.Open()
 			}
 		}
@@ -768,6 +775,13 @@ func (m *Model) SetUsers(users []mentionpicker.User) {
 	m.rebuildMentionUsers()
 }
 
+// SetUserGroups provides the active workspace's Slack usergroups for
+// @handle autocomplete and send-time <!subteam^SID|@handle> translation.
+func (m *Model) SetUserGroups(groups map[string]string) {
+	m.userGroups = usergroups.Copy(groups)
+	m.rebuildMentionUsers()
+}
+
 // SetActiveChannel tells the compose model which channel context to
 // use when computing InChannel for the mention picker. Called from
 // App on every ChannelSelectedMsg. Idempotent: a no-op if the channel
@@ -841,6 +855,21 @@ func (m *Model) rebuildMentionUsers() {
 		u.InChannel = inCh
 		derived = append(derived, u)
 	}
+	// Usergroups (@backend-team etc.) come from the active workspace's
+	// usergroup map rather than m.users: they aren't channel members,
+	// and pinging one is channel-agnostic, so they bypass the membership
+	// filter and always rank in the in-channel tier. The "usergroup:"
+	// ID prefix keeps them out of the <@UID> translation path —
+	// TranslateMentionsForSend maps their handle via m.userGroups
+	// instead.
+	for id, handle := range m.userGroups {
+		derived = append(derived, mentionpicker.User{
+			ID:          "usergroup:" + id,
+			DisplayName: handle,
+			Username:    handle,
+			InChannel:   true,
+		})
+	}
 	m.mentionPicker.SetUsers(derived)
 }
 
@@ -882,6 +911,14 @@ func (m Model) TranslateMentionsForSend(text string) string {
 	// User mentions
 	for name, userID := range m.reverseNames {
 		entries = append(entries, entry{'@', name, "<@" + userID + ">"})
+	}
+
+	// Usergroup mentions. Like channels below, we emit the labeled
+	// wire form <!subteam^SID|@handle> so the optimistically-added
+	// echo renders the handle even if the server echo arrives before
+	// usergroups.list refreshes this workspace's map.
+	for id, handle := range m.userGroups {
+		entries = append(entries, entry{'@', handle, "<!subteam^" + id + "|@" + handle + ">"})
 	}
 
 	// Channel mentions. We emit <#CHANNELID|name> rather than the

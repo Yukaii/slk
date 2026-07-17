@@ -23,6 +23,7 @@ func (a *App) newWindowModel(chName string) *messages.Model {
 	m.SetAvatarFunc(a.avatarFn)
 	m.SetUserNames(a.userNames)
 	m.SetChannelNames(a.channelNames)
+	m.SetUserGroups(a.userGroups)
 	m.SetEmojiContext(a.emojiCtx)
 	if a.emojiCustoms != nil {
 		// SetCustomEmoji ran after SetEmojiContext: its customs map

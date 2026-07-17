@@ -28,6 +28,7 @@ type SlackAPI interface {
 	GetConversationReplies(params *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error)
 	SearchMessagesContext(ctx context.Context, query string, params slack.SearchParameters) (*slack.SearchMessages, error)
 	GetUsersContext(ctx context.Context, options ...slack.GetUsersOption) ([]slack.User, error)
+	GetUserGroupsContext(ctx context.Context, options ...slack.GetUserGroupsOption) ([]slack.UserGroup, error)
 	GetUsersInConversationContext(ctx context.Context, params *slack.GetUsersInConversationParameters) ([]string, string, error)
 	GetUserInfo(user string) (*slack.User, error)
 	GetBotInfoContext(ctx context.Context, parameters slack.GetBotInfoParameters) (*slack.Bot, error)
@@ -729,6 +730,16 @@ func (c *Client) GetUsers(ctx context.Context) ([]slack.User, error) {
 		return nil, fmt.Errorf("getting users: %w", err)
 	}
 	return users, nil
+}
+
+// GetUserGroups retrieves the workspace's usergroups (the @team
+// handles behind <!subteam^S…> mentions) via usergroups.list.
+func (c *Client) GetUserGroups(ctx context.Context) ([]slack.UserGroup, error) {
+	groups, err := c.api.GetUserGroupsContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getting usergroups: %w", err)
+	}
+	return groups, nil
 }
 
 // ListCustomEmoji fetches the workspace's custom emoji list via Slack's

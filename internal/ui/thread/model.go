@@ -20,6 +20,7 @@ import (
 	"github.com/gammons/slk/internal/ui/scrollbar"
 	"github.com/gammons/slk/internal/ui/selection"
 	"github.com/gammons/slk/internal/ui/styles"
+	"github.com/gammons/slk/internal/usergroups"
 )
 
 var thickLeftBorder = lipgloss.Border{Left: "▌"}
@@ -145,6 +146,7 @@ type Model struct {
 	// cache that depends on these maps) to detect changes without hashing.
 	userNamesV    uint64
 	channelNamesV uint64
+	userGroups    map[string]string
 
 	// Mouse selection state. selRange is the user's drag selection.
 	// replyIDToIdx maps reply TS -> entry index in m.cache for O(1)
@@ -584,6 +586,13 @@ func (m *Model) SetAvatarFunc(fn messages.AvatarFunc) {
 func (m *Model) SetUserNames(names map[string]string) {
 	m.userNames = names
 	m.userNamesV++
+	m.InvalidateCache()
+}
+
+// SetUserGroups sets the workspace-scoped usergroup ID -> handle map used
+// to resolve bare <!subteam^SID> mentions in the parent and replies.
+func (m *Model) SetUserGroups(groups map[string]string) {
+	m.userGroups = usergroups.Copy(groups)
 	m.InvalidateCache()
 }
 
@@ -1755,6 +1764,7 @@ func (m *Model) blockkitContext(msg messages.MessageItem, userNames, channelName
 			return messages.RenderSlackMarkdownWith(s, messages.RenderSlackMarkdownOpts{
 				UserNames:    un,
 				ChannelNames: channelNames,
+				UserGroups:   m.userGroups,
 				PlaceCtx:     m.emojiCtx.PlaceCtx,
 				EmojiCells:   m.emojiCtx.Cells,
 				Customs:      m.emojiCtx.Customs,
@@ -1786,6 +1796,7 @@ func (m *Model) renderThreadMessage(msg messages.MessageItem, width int, userNam
 	bodyOpts := messages.RenderSlackMarkdownOpts{
 		UserNames:    userNames,
 		ChannelNames: channelNames,
+		UserGroups:   m.userGroups,
 		PlaceCtx:     m.emojiCtx.PlaceCtx,
 		EmojiCells:   m.emojiCtx.Cells,
 		Customs:      m.emojiCtx.Customs,

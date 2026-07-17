@@ -3894,6 +3894,53 @@ func TestUserResolvedMsg_DropsForOtherWorkspace(t *testing.T) {
 	}
 }
 
+func TestUserGroupsLoadedMsgPatchesActiveWorkspace(t *testing.T) {
+	app := NewApp()
+	app.activeTeamID = "T1"
+	app.messagepane.SetMessages([]messages.MessageItem{
+		{TS: "1.0", UserID: "U1", UserName: "alice", Text: "ping <!subteam^S0TESTGRP01>"},
+	})
+	messageVersion := app.messagepane.Version()
+	threadVersion := app.threadPanel.Version()
+
+	app.Update(UserGroupsLoadedMsg{
+		TeamID:     "T1",
+		UserGroups: map[string]string{"S0TESTGRP01": "platform-team"},
+	})
+
+	found := false
+	for _, u := range app.compose.MentionUsers() {
+		if u.ID == "usergroup:S0TESTGRP01" && u.DisplayName == "platform-team" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("active workspace usergroup missing from compose picker: %+v", app.compose.MentionUsers())
+	}
+	if app.messagepane.Version() == messageVersion {
+		t.Error("message pane version did not change after active usergroups loaded")
+	}
+	if app.threadPanel.Version() == threadVersion {
+		t.Error("thread panel version did not change after active usergroups loaded")
+	}
+}
+
+func TestUserGroupsLoadedMsgDropsOtherWorkspace(t *testing.T) {
+	app := NewApp()
+	app.activeTeamID = "T1"
+
+	app.Update(UserGroupsLoadedMsg{
+		TeamID:     "T-other",
+		UserGroups: map[string]string{"S0TESTGRP01": "side-team"},
+	})
+
+	for _, u := range app.compose.MentionUsers() {
+		if u.ID == "usergroup:S0TESTGRP01" {
+			t.Fatalf("inactive workspace usergroup leaked into compose picker: %+v", app.compose.MentionUsers())
+		}
+	}
+}
+
 func TestUserExternalMsgFlagsPickerEntry(t *testing.T) {
 	app := NewApp()
 	app.activeTeamID = "T1"

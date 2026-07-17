@@ -150,6 +150,14 @@ type mockSlackAPI struct {
 	getUsersInConversationContextFn func(ctx context.Context, params *slack.GetUsersInConversationParameters) ([]string, string, error)
 	openConversationContextFn       func(ctx context.Context, params *slack.OpenConversationParameters) (*slack.Channel, bool, bool, error)
 	searchMessagesFn                func(ctx context.Context, query string, params slack.SearchParameters) (*slack.SearchMessages, error)
+	getUserGroupsContextFn          func(ctx context.Context, options ...slack.GetUserGroupsOption) ([]slack.UserGroup, error)
+}
+
+func (m *mockSlackAPI) GetUserGroupsContext(ctx context.Context, options ...slack.GetUserGroupsOption) ([]slack.UserGroup, error) {
+	if m.getUserGroupsContextFn != nil {
+		return m.getUserGroupsContextFn(ctx, options...)
+	}
+	return nil, nil
 }
 
 func (m *mockSlackAPI) SearchMessagesContext(ctx context.Context, query string, params slack.SearchParameters) (*slack.SearchMessages, error) {

@@ -145,6 +145,12 @@ var reduceWorkspace reducerFunc = func(a *App, msg tea.Msg) (tea.Cmd, bool) {
 			a.SetCustomEmoji(m.CustomEmoji)
 		}
 		return nil, true
+
+	case UserGroupsLoadedMsg:
+		if m.TeamID == a.activeTeamID {
+			a.SetUserGroups(m.UserGroups)
+		}
+		return nil, true
 	}
 	return nil, false
 }
@@ -195,6 +201,7 @@ func reduceWorkspaceReady(a *App, m WorkspaceReadyMsg) tea.Cmd {
 		a.SetExternalUsers(m.ExternalUsers)
 		a.SetUserNames(m.UserNames)
 		a.SetCustomEmoji(m.CustomEmoji)
+		a.SetUserGroups(m.UserGroups)
 		// Route through the setter so messagepane/threadPanel also learn
 		// the current user — production never calls SetCurrentUserID
 		// otherwise, which would leave live self-reactions unstyled.
@@ -289,6 +296,7 @@ func reduceWorkspaceSwitched(a *App, m WorkspaceSwitchedMsg) tea.Cmd {
 	a.SetExternalUsers(m.ExternalUsers)
 	a.SetUserNames(m.UserNames)
 	a.SetCustomEmoji(m.CustomEmoji)
+	a.SetUserGroups(m.UserGroups)
 	// Route through the setter so messagepane/threadPanel also learn the
 	// current user (see WorkspaceReadyMsg above).
 	a.SetCurrentUserID(m.UserID)

@@ -50,6 +50,7 @@ import (
 	"github.com/gammons/slk/internal/ui/wintree"
 	"github.com/gammons/slk/internal/ui/workspace"
 	"github.com/gammons/slk/internal/ui/workspacefinder"
+	"github.com/gammons/slk/internal/usergroups"
 	"golang.design/x/clipboard"
 )
 
@@ -211,6 +212,7 @@ type App struct {
 	emojiCtx     messages.EmojiContext
 	emojiCustoms map[string]string
 	channelNames map[string]string
+	userGroups   map[string]string
 
 	// externalUsers tracks which user IDs are Slack Connect / shared-channel
 	// guests. Populated by main.go via SetExternalUsers as users are
@@ -2238,6 +2240,19 @@ func (a *App) SetUserNames(names map[string]string) {
 	}
 	a.compose.SetUsers(users)
 	a.threadCompose.SetUsers(users)
+}
+
+// SetUserGroups passes the active workspace's usergroup map to every
+// surface that renders, previews, or composes usergroup mentions.
+func (a *App) SetUserGroups(groups map[string]string) {
+	a.userGroups = usergroups.Copy(groups)
+	a.threadsView.SetUserGroups(a.userGroups)
+	for _, m := range a.allWinModels() {
+		m.SetUserGroups(a.userGroups)
+	}
+	a.threadPanel.SetUserGroups(a.userGroups)
+	a.compose.SetUserGroups(a.userGroups)
+	a.threadCompose.SetUserGroups(a.userGroups)
 }
 
 // seedNewMessagePicker snapshots the current workspace's user list
