@@ -750,6 +750,15 @@ func renderInlineFormattingWith(text string, opts RenderSlackMarkdownOpts) strin
 		return mentionStyle().Render(usergroupDisplay(opts.UserGroups, groups[1], groups[2]))
 	})
 
+	// Broadcast mentions: <!here> / <!channel> / <!everyone> (labels,
+	// when present, duplicate the keyword and are dropped) -> styled
+	// @here / @channel / @everyone. Shares specialMentionRe with
+	// FlattenMrkdwn (flatten.go). Runs after the date and subteam
+	// passes so their `<!...>` forms are already consumed.
+	text = specialMentionRe.ReplaceAllStringFunc(text, func(match string) string {
+		return mentionStyle().Render("@" + specialMentionRe.FindStringSubmatch(match)[1])
+	})
+
 	// Channel mentions: <#C1234|channel-name> -> #channel-name, or
 	// <#C1234> -> #resolved-name (via channelNames map). When the
 	// channel can't be resolved we render "#unknown" so the user sees
@@ -967,6 +976,10 @@ func slackMrkdwnToCommonMarkInline(text string, userNames map[string]string, cha
 	text = usergroupMentionRe.ReplaceAllStringFunc(text, func(match string) string {
 		groups := usergroupMentionRe.FindStringSubmatch(match)
 		return usergroupDisplay(userGroups, groups[1], groups[2])
+	})
+
+	text = specialMentionRe.ReplaceAllStringFunc(text, func(match string) string {
+		return "@" + specialMentionRe.FindStringSubmatch(match)[1]
 	})
 
 	text = resolveShortcodesCommonMark(emojiutil.StripSkinToneFromText(text))
