@@ -295,7 +295,7 @@ func TestMigrate_CreatesThreadSubscriptionsTable(t *testing.T) {
 	if count == 0 {
 		t.Fatalf("thread_subscriptions table missing after migrate()")
 	}
-	const wantCols = 6 // workspace_id, channel_id, thread_ts, last_read, active, updated_at
+	const wantCols = 7 // workspace_id, channel_id, thread_ts, last_read, latest_reply, active, updated_at
 	if count != wantCols {
 		t.Fatalf("thread_subscriptions: want %d cols, got %d", wantCols, count)
 	}

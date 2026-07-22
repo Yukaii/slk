@@ -1982,17 +1982,27 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		debuglog.Cache("workspace_unread_bootstrap: team=%s GetUnreadCounts failed: %v", token.TeamName, ucErr)
 	}
 	wctx.ThreadsHasUnreads = threadsAgg.HasUnreads
-	if ucErr == nil && len(unreadCounts) > 0 {
+	// Boot applies an authoritative FULL snapshot: reset every channel
+	// in the workspace to read, then set the ones client.counts reports
+	// unread. This runs BEFORE the WebSocket goes live (ConnMgr.Run is
+	// started by the caller after connectWorkspace returns), so the
+	// reset cannot race an inbound *_marked event.
+	//
+	// Guard on ucErr only (not len>0): a successful call returning zero
+	// unreads legitimately means "everything is read" and must clear
+	// stale dots carried over from a prior session. A FAILED call must
+	// NOT reset — that would wipe every dot with no data to restore.
+	if ucErr == nil {
 		updates := make([]cache.ChannelReadStateUpdate, 0, len(unreadCounts))
 		for _, u := range unreadCounts {
 			updates = append(updates, cache.ChannelReadStateUpdate{
 				ChannelID:  u.ChannelID,
-				LastReadTS: u.LastRead, // may be ""; BatchUpdate preserves existing in that case
+				LastReadTS: u.LastRead, // may be ""; ReplaceWorkspaceReadState preserves existing in that case
 				HasUnread:  u.HasUnread,
 			})
 		}
-		if err := db.BatchUpdateChannelReadState(updates); err != nil {
-			log.Printf("Warning: bootstrap BatchUpdateChannelReadState for team=%s: %v", token.TeamName, err)
+		if err := db.ReplaceWorkspaceReadState(client.TeamID(), updates); err != nil {
+			log.Printf("Warning: bootstrap ReplaceWorkspaceReadState for team=%s: %v", token.TeamName, err)
 		}
 	}
 	mutedItemCount := 0

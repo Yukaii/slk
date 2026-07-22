@@ -206,6 +206,82 @@ func TestWorkspacesWithUnreads(t *testing.T) {
 	}
 }
 
+func TestReplaceWorkspaceReadState_ClearsChannelsAbsentFromSnapshot(t *testing.T) {
+	db, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer db.Close()
+	newRSChannel(t, db, "C1", "T1")
+	newRSChannel(t, db, "C2", "T1")
+	newRSChannel(t, db, "C3", "T1")
+	newRSChannel(t, db, "D1", "T2") // different workspace
+
+	// Prior-session state: C1, C2 unread; D1 (other workspace) unread.
+	_ = db.UpdateChannelReadState("C1", "1.0001", true)
+	_ = db.UpdateChannelReadState("C2", "1.0002", true)
+	_ = db.UpdateChannelReadState("D1", "1.0003", true)
+
+	// Fresh authoritative snapshot for T1: only C3 is unread now.
+	// C1 was read in the official client while slk was closed and is
+	// therefore ABSENT from the snapshot; it must be cleared. C2 is
+	// explicitly reported read. C3 becomes unread.
+	updates := []ChannelReadStateUpdate{
+		{ChannelID: "C2", LastReadTS: "1.0100", HasUnread: false},
+		{ChannelID: "C3", LastReadTS: "1.0101", HasUnread: true},
+	}
+	if err := db.ReplaceWorkspaceReadState("T1", updates); err != nil {
+		t.Fatalf("ReplaceWorkspaceReadState: %v", err)
+	}
+
+	s1, _ := db.GetChannelReadState("C1")
+	if s1.HasUnread {
+		t.Errorf("C1 HasUnread = true; absent-from-snapshot channel must be cleared (Symptom 2)")
+	}
+	// last_read_ts of an absent channel is left untouched (no fresh value to apply).
+	if s1.LastReadTS != "1.0001" {
+		t.Errorf("C1 LastReadTS = %q, want preserved %q", s1.LastReadTS, "1.0001")
+	}
+	s2, _ := db.GetChannelReadState("C2")
+	if s2.HasUnread || s2.LastReadTS != "1.0100" {
+		t.Errorf("C2 = %+v, want {1.0100 false}", s2)
+	}
+	s3, _ := db.GetChannelReadState("C3")
+	if !s3.HasUnread || s3.LastReadTS != "1.0101" {
+		t.Errorf("C3 = %+v, want {1.0101 true}", s3)
+	}
+
+	// Other workspace is untouched by a T1 replace.
+	d1, _ := db.GetChannelReadState("D1")
+	if !d1.HasUnread || d1.LastReadTS != "1.0003" {
+		t.Errorf("D1 (other workspace) = %+v, want {1.0003 true} untouched", d1)
+	}
+}
+
+func TestReplaceWorkspaceReadState_EmptySnapshotClearsAll(t *testing.T) {
+	db, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer db.Close()
+	newRSChannel(t, db, "C1", "T1")
+	newRSChannel(t, db, "C2", "T1")
+	_ = db.UpdateChannelReadState("C1", "1.0", true)
+	_ = db.UpdateChannelReadState("C2", "1.0", true)
+
+	// A successful client.counts call that reports zero unreads means
+	// everything is read.
+	if err := db.ReplaceWorkspaceReadState("T1", nil); err != nil {
+		t.Fatalf("ReplaceWorkspaceReadState: %v", err)
+	}
+	for _, id := range []string{"C1", "C2"} {
+		s, _ := db.GetChannelReadState(id)
+		if s.HasUnread {
+			t.Errorf("%s HasUnread = true after empty snapshot; want cleared", id)
+		}
+	}
+}
+
 func TestUpsertChannel_DoesNotClobberReadState(t *testing.T) {
 	db, err := New(":memory:")
 	if err != nil {

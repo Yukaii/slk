@@ -35,8 +35,14 @@ type ThreadSummary struct {
 // Ordering: newest LastReplyTS first.
 //
 // Unread is computed from the subscription's per-thread LastRead
-// (not the per-channel channels.last_read_ts): unread iff a reply
-// exists later than LastRead AND the last reply isn't by self.
+// (not the per-channel channels.last_read_ts): unread iff the newest
+// activity is later than LastRead. "Newest activity" is the max of the
+// authoritative latest_reply watermark (from subscriptions.thread.getView)
+// and the newest locally-cached reply — so a subscribed thread with
+// unread replies renders unread even when those replies have not been
+// fetched into the cache yet (the boot case). The only suppression is
+// the optimistic just-sent window: a locally-cached newest reply known
+// to be authored by self does not count as unread.
 func (db *DB) ListSubscribedThreads(workspaceID, selfUserID string) ([]ThreadSummary, error) {
 	const q = `
 SELECT
@@ -45,6 +51,7 @@ SELECT
     COALESCE(c.name, ''),
     COALESCE(c.type, ''),
     s.last_read,
+    s.latest_reply,
     COALESCE((SELECT user_id FROM messages
               WHERE channel_id = s.channel_id AND ts = s.thread_ts AND is_deleted = 0), ''),
     COALESCE((SELECT text FROM messages
@@ -56,8 +63,8 @@ SELECT
     COALESCE(
         (SELECT MAX(ts) FROM messages
          WHERE channel_id = s.channel_id AND thread_ts = s.thread_ts AND is_deleted = 0),
-        s.last_read
-    ) AS last_reply_ts,
+        ''
+    ) AS cached_max_ts,
     COALESCE(
         (SELECT user_id FROM messages
          WHERE channel_id = s.channel_id AND thread_ts = s.thread_ts AND is_deleted = 0
@@ -77,23 +84,50 @@ WHERE s.workspace_id = ? AND s.active = 1
 	var out []ThreadSummary
 	for rows.Next() {
 		var s ThreadSummary
-		var lastRead string
+		var lastRead, latestReply, cachedMaxTS string
 		if err := rows.Scan(
 			&s.ChannelID,
 			&s.ThreadTS,
 			&s.ChannelName,
 			&s.ChannelType,
 			&lastRead,
+			&latestReply,
 			&s.ParentUserID,
 			&s.ParentText,
 			&s.ReplyCount,
-			&s.LastReplyTS,
+			&cachedMaxTS,
 			&s.LastReplyBy,
 		); err != nil {
 			return nil, fmt.Errorf("scanning subscribed thread row: %w", err)
 		}
 		s.ParentTS = s.ThreadTS
-		s.Unread = s.LastReplyTS > lastRead && s.LastReplyBy != selfUserID && s.LastReplyBy != ""
+
+		// Effective newest activity = the max of the authoritative
+		// getView watermark (latest_reply) and the newest reply we've
+		// cached locally, falling back to last_read so uncached/read
+		// threads still sort sensibly. Comparing string ts is valid:
+		// Slack ts are fixed-width "secs.micros".
+		effLatest := lastRead
+		if cachedMaxTS > effLatest {
+			effLatest = cachedMaxTS
+		}
+		if latestReply > effLatest {
+			effLatest = latestReply
+		}
+		s.LastReplyTS = effLatest
+
+		// Unread when the newest activity is past our read watermark.
+		// Suppress only when that newest activity is a locally-cached
+		// reply we know was authored by self (the optimistic just-sent
+		// window, before last_read catches up). When the newest activity
+		// comes from the authoritative latest_reply (author unknown /
+		// uncached), we trust the ts comparison — this is the boot case
+		// the old cached-reply-only heuristic got wrong.
+		unread := effLatest > lastRead
+		if unread && cachedMaxTS == effLatest && s.LastReplyBy == selfUserID {
+			unread = false
+		}
+		s.Unread = unread
 		out = append(out, s)
 	}
 	if err := rows.Err(); err != nil {
