@@ -282,6 +282,11 @@ func reduceWorkspaceSwitched(a *App, m WorkspaceSwitchedMsg) tea.Cmd {
 	a.SetMode(ModeNormal)
 	a.compose.Blur()
 	a.sidebar.SetSectionsProvider(m.SectionsProvider)
+	// Forget the previous workspace's live DM presence before loading
+	// the new one, so its cache-seeded item presence isn't overwritten
+	// by a stale peer from the workspace we're leaving. The new
+	// workspace's own presence_change events repopulate it.
+	a.sidebar.ResetPresence()
 	a.SetChannels(m.Channels)
 	a.channelFinder.SetItems(m.FinderItems)
 	// SetExternalUsers re-pushes user-names; calling SetUserNames

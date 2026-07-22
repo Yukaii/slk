@@ -189,6 +189,16 @@ type Model struct {
 	filter   string
 	filtered []int // indices into items that match filter
 
+	// presenceByUser is the authoritative live presence for DM peers,
+	// keyed by DMUserID ("active"/"away"). It is updated by presence_change
+	// WS events (UpdatePresenceByUser) and re-applied onto items on every
+	// SetItems, so a sidebar rebuild (sections refresh, DM-name resolution,
+	// workspace-ready) can't wipe live presence back to the "away" default
+	// that freshly-built ChannelItems carry. Cleared on workspace switch
+	// via ResetPresence. Also remembers events that arrive before their DM
+	// item exists (startup race) so they apply once the item is set.
+	presenceByUser map[string]string
+
 	// Flat list of navigable stops in display order: threads row,
 	// section headers, and channel rows belonging to expanded sections.
 	// cursor indexes into nav and is the single source of truth for what
@@ -613,10 +623,36 @@ func (m *Model) ThreadsUnreadCount() int { return m.threadsUnread }
 // SelectThreadsRow() after SetItems.
 func (m *Model) SetItems(items []ChannelItem) {
 	m.items = items
+	m.applyPresence()
 	m.rebuildFilter()
 	m.rebuildNavPreserveCursor()
 	m.cacheValid = false
 	m.dirty()
+}
+
+// applyPresence overwrites each DM item's Presence with the authoritative
+// live value from presenceByUser, so a rebuild that supplies stale/default
+// presence doesn't clobber the real state. No-op when no presence is known.
+func (m *Model) applyPresence() {
+	if len(m.presenceByUser) == 0 {
+		return
+	}
+	for i := range m.items {
+		uid := m.items[i].DMUserID
+		if uid == "" {
+			continue
+		}
+		if p, ok := m.presenceByUser[uid]; ok {
+			m.items[i].Presence = p
+		}
+	}
+}
+
+// ResetPresence forgets all remembered per-user presence. Called on
+// workspace switch so the newly-active workspace starts from its own
+// cache-seeded item presence rather than the previous workspace's peers.
+func (m *Model) ResetPresence() {
+	m.presenceByUser = nil
 }
 
 // UpsertItem inserts a new ChannelItem keyed by ID, or updates an existing
@@ -630,6 +666,14 @@ func (m *Model) SetItems(items []ChannelItem) {
 // staleness state may have changed) is reflected in the visible list
 // immediately.
 func (m *Model) UpsertItem(item ChannelItem) {
+	// Seed the incoming item with known live presence so a DM opened at
+	// runtime shows the right dot immediately instead of the "away"
+	// default it was built with.
+	if item.DMUserID != "" {
+		if p, ok := m.presenceByUser[item.DMUserID]; ok {
+			item.Presence = p
+		}
+	}
 	for i := range m.items {
 		if m.items[i].ID == item.ID {
 			m.items[i] = item
@@ -774,8 +818,19 @@ func (m *Model) VisibleItems() []ChannelItem {
 	return result
 }
 
-// UpdatePresenceByUser updates the presence for any DM item whose DMUserID matches.
+// UpdatePresenceByUser records the authoritative live presence for a user
+// and updates any DM item whose DMUserID matches. Recording in
+// presenceByUser (even when no item matches yet) makes the value survive
+// later SetItems rebuilds and applies it to items that appear afterward
+// (startup race).
 func (m *Model) UpdatePresenceByUser(userID, presence string) {
+	if userID == "" {
+		return
+	}
+	if m.presenceByUser == nil {
+		m.presenceByUser = make(map[string]string)
+	}
+	m.presenceByUser[userID] = presence
 	for i := range m.items {
 		if m.items[i].DMUserID == userID {
 			if m.items[i].Presence != presence {
