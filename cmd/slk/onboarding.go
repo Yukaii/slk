@@ -2,15 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
-	"strings"
 
 	"charm.land/huh/v2"
-	"charm.land/huh/v2/spinner"
 	"charm.land/lipgloss/v2"
 	"github.com/gammons/slk/internal/config"
 	slackclient "github.com/gammons/slk/internal/slack"
+	"github.com/gammons/slk/internal/slackdesktop"
 )
 
 func addWorkspace() error {
@@ -18,214 +18,108 @@ func addWorkspace() error {
 	tokenDir := filepath.Join(dataDir, "tokens")
 	tokenStore := slackclient.NewTokenStore(tokenDir)
 
-	// Styles
-	titleStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#4A9EFF")).
-		MarginBottom(1)
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#4A9EFF")).MarginBottom(1)
+	subtitleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).MarginBottom(1)
+	stepStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#50C878"))
+	successStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#50C878")).MarginTop(1)
+	errorStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#E04040"))
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#666666"))
 
-	subtitleStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#888888")).
-		MarginBottom(1)
-
-	stepStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#50C878"))
-
-	successStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#50C878")).
-		MarginTop(1)
-
-	errorStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("#E04040"))
-
-	dimStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#666666"))
-
-	// Welcome
 	fmt.Println()
 	fmt.Println(titleStyle.Render("slk -- Add Workspace"))
-	fmt.Println(subtitleStyle.Render("Connect a Slack workspace using your browser session."))
+	fmt.Println(subtitleStyle.Render("Reading your signed-in workspaces from the Slack desktop app."))
 	fmt.Println()
 
-	// Step 1: Instructions
-	fmt.Println(stepStyle.Render("Step 1: Get your browser tokens"))
-	fmt.Println()
-	fmt.Println(dimStyle.Render("  a. Open Slack in your browser and log into your workspace"))
-	fmt.Println(dimStyle.Render("  b. Open DevTools (F12 or Cmd+Option+I)"))
-	fmt.Println(dimStyle.Render("  c. Go to Application > Cookies > https://app.slack.com"))
-	fmt.Println(dimStyle.Render("     Find the cookie named 'd' and copy its value"))
-	fmt.Println(dimStyle.Render("  d. Go to the Console tab and run:"))
-	fmt.Println(dimStyle.Render("     Object.entries(JSON.parse(localStorage.localConfig_v2).teams).forEach(([id,t]) => console.log(t.name, t.token))"))
-	fmt.Println(dimStyle.Render("     This prints the name and xoxc token for each workspace."))
-	fmt.Println(dimStyle.Render("     Copy the xoxc-... token for the workspace you want to add."))
-	fmt.Println()
+	// Read cookie + workspaces from the desktop app.
+	cookie, err := slackdesktop.Cookie()
+	if err != nil {
+		fmt.Println(errorStyle.Render("  " + desktopErrorMessage(err)))
+		return err
+	}
+	workspaces, err := slackdesktop.Workspaces()
+	if err != nil {
+		fmt.Println(errorStyle.Render("  " + desktopErrorMessage(err)))
+		return err
+	}
 
-	// Step 2: Enter tokens via huh form
-	fmt.Println(stepStyle.Render("Step 2: Enter your tokens"))
-	fmt.Println()
-
-	var xoxcToken, dCookie string
-
+	// Multi-select (all pre-selected).
+	var opts []huh.Option[string]
+	for _, w := range workspaces {
+		opts = append(opts, huh.NewOption(fmt.Sprintf("%s  (%s.slack.com)", w.Name, w.Domain), w.TeamID))
+	}
+	chosen := make([]string, 0, len(workspaces))
+	for _, w := range workspaces {
+		chosen = append(chosen, w.TeamID)
+	}
 	form := huh.NewForm(
 		huh.NewGroup(
-			huh.NewInput().
-				Title("Cookie (d)").
-				Description("The 'd' cookie value from Application > Cookies").
-				Placeholder("xoxd-...").
-				Value(&dCookie).
-				Validate(func(s string) error {
-					s = strings.TrimSpace(s)
-					if s == "" {
-						return fmt.Errorf("cookie is required")
-					}
-					return nil
-				}),
-
-			huh.NewInput().
-				Title("Token (xoxc)").
-				Description("The xoxc-... token from your browser console").
-				Placeholder("xoxc-...").
-				Value(&xoxcToken).
-				Validate(func(s string) error {
-					s = strings.TrimSpace(s)
-					if s == "" {
-						return fmt.Errorf("token is required")
-					}
-					if !strings.HasPrefix(s, "xoxc-") {
-						return fmt.Errorf("must start with xoxc-")
-					}
-					return nil
-				}),
+			huh.NewMultiSelect[string]().
+				Title("Workspaces to add").
+				Description("All selected by default; space to toggle, enter to confirm.").
+				Options(opts...).
+				Value(&chosen),
 		),
 	).WithTheme(huh.ThemeFunc(huh.ThemeDracula))
-
-	err := form.Run()
-	if err != nil {
+	if err := form.Run(); err != nil {
 		return fmt.Errorf("form cancelled")
 	}
+	selected := map[string]bool{}
+	for _, id := range chosen {
+		selected[id] = true
+	}
 
-	xoxcToken = strings.TrimSpace(xoxcToken)
-	dCookie = strings.TrimSpace(dCookie)
-
-	// Step 3: Validate tokens with spinner
+	// Mint tokens for the selected workspaces.
 	fmt.Println()
-	fmt.Println(stepStyle.Render("Step 3: Validating tokens..."))
-
-	var client *slackclient.Client
-	var connectErr error
-
-	spinErr := spinner.New().
-		Title("Connecting to Slack...").
-		Action(func() {
-			client = slackclient.NewClient(xoxcToken, dCookie)
-			connectErr = client.Connect(context.Background())
-		}).
-		Run()
-
-	if spinErr != nil {
-		return fmt.Errorf("spinner error: %w", spinErr)
+	fmt.Println(stepStyle.Render("Connecting..."))
+	tokens, err := buildWorkspaceTokens(context.Background(), cookie, workspaces, selected, slackclient.MintToken)
+	if err != nil {
+		fmt.Println(errorStyle.Render("  Failed to mint token: " + err.Error()))
+		return err
 	}
 
-	if connectErr != nil {
-		fmt.Println(errorStyle.Render("  Authentication failed: " + connectErr.Error()))
-		fmt.Println()
-		fmt.Println(dimStyle.Render("  Make sure you're logged into Slack in your browser"))
-		fmt.Println(dimStyle.Render("  and that you copied the correct token and cookie values."))
-		return fmt.Errorf("authentication failed: %w", connectErr)
-	}
+	// Validate each and save.
+	for _, tok := range tokens {
+		client := slackclient.NewClient(tok.AccessToken, tok.Cookie)
+		if err := client.Connect(context.Background()); err != nil {
+			fmt.Println(errorStyle.Render(fmt.Sprintf("  %s: authentication failed: %v", tok.TeamName, err)))
+			return fmt.Errorf("authentication failed for %s: %w", tok.TeamName, err)
+		}
+		if err := tokenStore.Save(tok); err != nil {
+			return fmt.Errorf("saving token for %s: %w", tok.TeamName, err)
+		}
 
-	teamID := client.TeamID()
-	fmt.Println(successStyle.Render("  Connected!") + dimStyle.Render(fmt.Sprintf(" (team: %s)", teamID)))
-	fmt.Println()
-
-	// Step 4: Workspace name
-	fmt.Println(stepStyle.Render("Step 4: Name your workspace"))
-	fmt.Println()
-
-	var wsName string
-	nameForm := huh.NewForm(
-		huh.NewGroup(
-			huh.NewInput().
-				Title("Display Name").
-				Description("A friendly name for this workspace (e.g., 'Acme Corp')").
-				Placeholder(teamID).
-				Value(&wsName),
-		),
-	).WithTheme(huh.ThemeFunc(huh.ThemeDracula))
-
-	if err := nameForm.Run(); err != nil {
-		wsName = teamID
-	}
-
-	wsName = strings.TrimSpace(wsName)
-	if wsName == "" {
-		wsName = teamID
-	}
-
-	// Save
-	token := slackclient.Token{
-		AccessToken: xoxcToken,
-		Cookie:      dCookie,
-		TeamID:      teamID,
-		TeamName:    wsName,
-	}
-
-	if err := tokenStore.Save(token); err != nil {
-		return fmt.Errorf("saving token: %w", err)
-	}
-
-	// Pick a slug for the new workspace and append a [workspaces.<slug>]
-	// block to config.toml so the user can extend per-workspace settings
-	// (sections, theme, etc.) later by hand.
-	configPath := filepath.Join(xdgConfig(), "config.toml")
-	defaultSlug := uniqueSlug(config.Slugify(wsName), existingSlugs(configPath))
-
-	var slug string
-	slugForm := huh.NewForm(
-		huh.NewGroup(
-			huh.NewInput().
-				Title("Workspace slug").
-				Description("Short identifier used in config.toml (e.g. [workspaces.<slug>])").
-				Placeholder(defaultSlug).
-				Value(&slug).
-				Validate(func(s string) error {
-					s = strings.TrimSpace(s)
-					if s == "" {
-						return nil // empty -> placeholder default
-					}
-					if config.Slugify(s) != s {
-						return fmt.Errorf("must be lowercase letters, digits, and hyphens")
-					}
-					if existingSlugs(configPath)[s] {
-						return fmt.Errorf("slug %q is already used", s)
-					}
-					return nil
-				}),
-		),
-	).WithTheme(huh.ThemeFunc(huh.ThemeDracula))
-
-	if err := slugForm.Run(); err != nil {
-		slug = defaultSlug
-	}
-	slug = strings.TrimSpace(slug)
-	if slug == "" {
-		slug = defaultSlug
-	}
-
-	if err := appendWorkspaceConfigBlock(configPath, slug, teamID, wsName); err != nil {
-		// Don't fail the whole onboarding: the token saved, the user
-		// can hand-edit config later. Just warn.
-		fmt.Println(errorStyle.Render("  Note: could not write config.toml: " + err.Error()))
+		// Append a [workspaces.<slug>] config block (best-effort).
+		configPath := filepath.Join(xdgConfig(), "config.toml")
+		slug := uniqueSlug(config.Slugify(tok.TeamName), existingSlugs(configPath))
+		if err := appendWorkspaceConfigBlock(configPath, slug, tok.TeamID, tok.TeamName); err != nil {
+			fmt.Println(dimStyle.Render("  Note: could not write config.toml: " + err.Error()))
+		}
+		fmt.Println(successStyle.Render("  Added ") + dimStyle.Render(tok.TeamName))
 	}
 
 	fmt.Println()
-	fmt.Println(successStyle.Render(fmt.Sprintf("  Workspace '%s' added successfully!", wsName)))
-	fmt.Println()
+	fmt.Println(successStyle.Render(fmt.Sprintf("  %d workspace(s) added!", len(tokens))))
 	fmt.Println(dimStyle.Render("  Run ") + lipgloss.NewStyle().Bold(true).Render("slk") + dimStyle.Render(" to start."))
 	fmt.Println()
-
 	return nil
+}
+
+// desktopErrorMessage maps a slackdesktop error to an actionable message.
+func desktopErrorMessage(err error) string {
+	switch {
+	case errors.Is(err, slackdesktop.ErrDesktopNotFound):
+		return "Slack desktop app not found. Install it and sign in, then retry."
+	case errors.Is(err, slackdesktop.ErrNotSignedIn):
+		return "No Slack workspaces are signed in. Open Slack, sign in, then retry."
+	case errors.Is(err, slackdesktop.ErrCookieDBMissing):
+		return "Slack is installed but has never signed in on this machine."
+	case errors.Is(err, slackdesktop.ErrKeyringLocked):
+		return "Your system keyring is locked. Unlock it (log in to your desktop session) and retry."
+	case errors.Is(err, slackdesktop.ErrNoSecretService):
+		return "No system keyring/secret service found. slk needs it to read the Slack session."
+	case errors.Is(err, slackdesktop.ErrDecryptFailed):
+		return "Could not decrypt the Slack session cookie. Please file an issue with your OS + Slack version."
+	default:
+		return "Could not read Slack desktop session: " + err.Error()
+	}
 }
