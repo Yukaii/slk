@@ -51,13 +51,23 @@ func addWorkspace() error {
 	for _, w := range workspaces {
 		chosen = append(chosen, w.TeamID)
 	}
+	// huh sizes the MultiSelect option viewport to (Height - title/description
+	// lines); when Height is unset the viewport collapses to a row or two and
+	// the user has to scroll a 3-item list. Size it to show every workspace
+	// (capped so a very long list can't overflow a small terminal). The +4
+	// covers the title + description overhead with a little slack.
+	visibleRows := len(workspaces)
+	if visibleRows > 12 {
+		visibleRows = 12
+	}
 	form := huh.NewForm(
 		huh.NewGroup(
 			huh.NewMultiSelect[string]().
 				Title("Workspaces to add").
 				Description("All selected by default; space to toggle, enter to confirm.").
 				Options(opts...).
-				Value(&chosen),
+				Value(&chosen).
+				Height(visibleRows+4),
 		),
 	).WithTheme(huh.ThemeFunc(huh.ThemeDracula))
 	if err := form.Run(); err != nil {
