@@ -14,6 +14,15 @@ type ThreadSubscription struct {
 	ChannelID   string
 	ThreadTS    string
 	LastRead    string
+	// LatestReply is the ts of the newest reply in the thread as
+	// reported by subscriptions.thread.getView (root_msg.latest_reply).
+	// It is the authoritative "newest activity" watermark and lets the
+	// threads view compute unread state (LatestReply > LastRead)
+	// WITHOUT requiring the thread's replies to be cached locally.
+	// Empty when unknown (e.g. rows created by a live thread_subscribed
+	// event before the next getView reconcile); the threads query then
+	// falls back to MAX(cached reply ts).
+	LatestReply string
 	Active      bool
 	UpdatedAt   int64 // unix seconds; bumped on every upsert
 }
@@ -116,18 +125,21 @@ func (db *DB) ReconcileThreadSubscriptions(workspaceID string, fresh []ThreadSub
 		freshKeys[key{s.ChannelID, s.ThreadTS}] = struct{}{}
 	}
 
-	// 1. Upsert each fresh entry as active=1.
+	// 1. Upsert each fresh entry as active=1. latest_reply comes from
+	// the authoritative getView snapshot and drives thread-unread
+	// without needing replies cached (see ThreadSubscription docs).
 	const upsertQ = `
 INSERT INTO thread_subscriptions
-    (workspace_id, channel_id, thread_ts, last_read, active, updated_at)
-VALUES (?, ?, ?, ?, 1, ?)
+    (workspace_id, channel_id, thread_ts, last_read, latest_reply, active, updated_at)
+VALUES (?, ?, ?, ?, ?, 1, ?)
 ON CONFLICT(workspace_id, channel_id, thread_ts) DO UPDATE SET
-    last_read  = excluded.last_read,
-    active     = 1,
-    updated_at = excluded.updated_at
+    last_read    = excluded.last_read,
+    latest_reply = excluded.latest_reply,
+    active       = 1,
+    updated_at   = excluded.updated_at
 `
 	for _, s := range fresh {
-		if _, err := tx.Exec(upsertQ, workspaceID, s.ChannelID, s.ThreadTS, s.LastRead, now); err != nil {
+		if _, err := tx.Exec(upsertQ, workspaceID, s.ChannelID, s.ThreadTS, s.LastRead, s.LatestReply, now); err != nil {
 			return fmt.Errorf("upserting fresh subscription (%s/%s): %w", s.ChannelID, s.ThreadTS, err)
 		}
 	}

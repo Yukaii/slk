@@ -25,6 +25,10 @@ type fakeHistory struct {
 	inFlight         int32
 	maxInFlight      int32
 	delay            time.Duration
+	// historyGate, when non-nil, blocks every GetHistorySince call
+	// until the channel is closed. Lets a test hold the channel phase
+	// open while asserting other phases proceed independently.
+	historyGate chan struct{}
 	responses        map[string][]*slack.GetConversationHistoryResponse
 	history          map[string][]slack.Message // alternate flat input: channelID → messages
 	calls            map[string]int
@@ -66,6 +70,9 @@ func (f *fakeHistory) ListThreadSubscriptions(ctx context.Context) ([]slackclien
 // more convenient. Capped is true when the returned slice was
 // truncated by maxTotal or when the queued response had HasMore set.
 func (f *fakeHistory) GetHistorySince(ctx context.Context, channelID, oldest string, maxTotal int) (slackclient.HistorySinceResult, error) {
+	if f.historyGate != nil {
+		<-f.historyGate
+	}
 	cur := atomic.AddInt32(&f.inFlight, 1)
 	defer atomic.AddInt32(&f.inFlight, -1)
 	for {
@@ -276,8 +283,11 @@ func TestBackfillThreads_FetchesRepliesForInvolvedThreads(t *testing.T) {
 }
 
 // TestBackfill_FiresThreadsListDirtyMsg verifies that run() dispatches
-// exactly one ThreadsListDirtyMsg into the program, carrying the
-// workspace ID so the UI knows which team's threads view to re-query.
+// ThreadsListDirtyMsg(s) into the program, each carrying the workspace
+// ID so the UI knows which team's threads view to re-query. run() now
+// fires an early refresh when the (concurrent) subscription phase lands
+// plus a final one after the thread phase, so there is at least one and
+// every dispatched message is a ThreadsListDirtyMsg for this workspace.
 func TestBackfill_FiresThreadsListDirtyMsg(t *testing.T) {
 	db := newTestDB(t)
 	db.UpsertChannel(cache.Channel{ID: "C1", WorkspaceID: "T1", Name: "a", Type: "channel"})
@@ -300,15 +310,101 @@ func TestBackfill_FiresThreadsListDirtyMsg(t *testing.T) {
 
 	captured.mu.Lock()
 	defer captured.mu.Unlock()
-	if len(captured.sent) != 1 {
-		t.Fatalf("expected 1 sent msg, got %d", len(captured.sent))
+	if len(captured.sent) == 0 {
+		t.Fatalf("expected at least one ThreadsListDirtyMsg, got none")
 	}
-	dirty, ok := captured.sent[0].(ui.ThreadsListDirtyMsg)
-	if !ok {
-		t.Fatalf("expected ThreadsListDirtyMsg, got %T", captured.sent[0])
+	for i, m := range captured.sent {
+		dirty, ok := m.(ui.ThreadsListDirtyMsg)
+		if !ok {
+			t.Fatalf("sent[%d]: expected ThreadsListDirtyMsg, got %T", i, m)
+		}
+		if dirty.TeamID != "T1" {
+			t.Errorf("sent[%d]: TeamID = %s, want T1", i, dirty.TeamID)
+		}
 	}
-	if dirty.TeamID != "T1" {
-		t.Errorf("TeamID = %s, want T1", dirty.TeamID)
+}
+
+// TestBackfill_SubscriptionRefreshNotGatedByChannelPhase pins the fix
+// for the "threads take ~45s to sync on launch" bug: the subscription
+// phase (the authoritative source for the Threads view) must run
+// independently of the slow channel-history phase and fire a Threads
+// refresh as soon as it lands — not wait for the whole backfill.
+//
+// The test holds the channel phase open (historyGate) and asserts the
+// subscription reconcile + ThreadsListDirtyMsg happen while it's still
+// blocked.
+func TestBackfill_SubscriptionRefreshNotGatedByChannelPhase(t *testing.T) {
+	db := newTestDB(t)
+	db.UpsertChannel(cache.Channel{ID: "C1", WorkspaceID: "T1", Name: "a", Type: "channel"})
+	db.UpsertMessage(cache.Message{TS: "1.000000", ChannelID: "C1", WorkspaceID: "T1", UserID: "U", Text: "x"})
+	db.SetChannelSyncedAt("C1", 100)
+
+	gate := make(chan struct{})
+	fh := &fakeHistory{
+		responses:   map[string][]*slack.GetConversationHistoryResponse{"C1": {{}}},
+		calls:       map[string]int{},
+		oldestSeen:  map[string][]string{},
+		historyGate: gate, // channel phase blocks here until we close it
+		subscriptionsResponse: []slackclient.ThreadSubscriptionView{{
+			Subscription: slackclient.ThreadSubscription{
+				ChannelID: "C1", ThreadTS: "100.000000", LastRead: "100.000000", Active: true,
+			},
+		}},
+	}
+
+	captured := &captureSender{}
+	bf := newBackfiller(fh, db, "T1", "USELF", captured, 4, 500, nil)
+
+	done := make(chan struct{})
+	go func() { _ = bf.run(context.Background()); close(done) }()
+
+	// Wait (bounded) for a Threads refresh WHILE the channel phase is
+	// still blocked in GetHistorySince.
+	dirtyFired := func() bool {
+		deadline := time.After(2 * time.Second)
+		for {
+			select {
+			case <-deadline:
+				return false
+			default:
+			}
+			captured.mu.Lock()
+			for _, m := range captured.sent {
+				if d, ok := m.(ui.ThreadsListDirtyMsg); ok && d.TeamID == "T1" {
+					captured.mu.Unlock()
+					return true
+				}
+			}
+			captured.mu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	if !dirtyFired {
+		close(gate) // release goroutine before failing
+		<-done
+		t.Fatal("Threads refresh did not fire while channel phase was blocked; subscription phase is still gated behind the channel backfill")
+	}
+
+	// The subscription must have been reconciled independently of the
+	// (still-blocked) channel phase.
+	subs, err := db.ListActiveThreadSubscriptions("T1")
+	if err != nil {
+		close(gate)
+		<-done
+		t.Fatalf("ListActiveThreadSubscriptions: %v", err)
+	}
+	if len(subs) != 1 {
+		close(gate)
+		<-done
+		t.Fatalf("expected 1 reconciled subscription while channel phase blocked, got %d", len(subs))
+	}
+
+	// Release the channel phase and let run() finish cleanly.
+	close(gate)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run() did not complete after releasing the channel gate")
 	}
 }
 
