@@ -11,7 +11,6 @@ require (
 	github.com/charmbracelet/x/ansi v0.11.7
 	github.com/gen2brain/beeep v0.11.2
 	github.com/gorilla/websocket v1.5.3
-	github.com/keybase/go-keychain v0.0.1
 	github.com/mattn/go-sixel v0.0.9
 	github.com/muesli/reflow v0.3.0
 	github.com/pelletier/go-toml/v2 v2.3.0

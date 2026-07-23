@@ -208,9 +208,11 @@ Port a small, focused package rather than vendoring `github.com/rneatherway/slac
 deps, all already transitively present or small:
 
 - `modernc.org/sqlite` — pure-Go cookie DB read.
-- Linux: `r00t2.io/gosecret` (libsecret via D-Bus).
-- macOS: `github.com/keybase/go-keychain`.
-- Windows: `github.com/billgraziano/dpapi`.
+- Linux: `r00t2.io/gosecret` (libsecret via D-Bus, pure Go).
+- macOS: shell out to `/usr/bin/security` (NOT a cgo binding like
+  `keybase/go-keychain` — the release builds with `CGO_ENABLED=0` and
+  cross-compiles darwin, which a Security.framework cgo dep would break).
+- Windows: `github.com/billgraziano/dpapi` (pure Go).
 - `golang.org/x/crypto/pbkdf2`.
 
 ## Out of Scope

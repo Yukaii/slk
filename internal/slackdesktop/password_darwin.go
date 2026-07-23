@@ -2,20 +2,30 @@
 
 package slackdesktop
 
-import "github.com/keybase/go-keychain"
+import (
+	"bytes"
+	"os/exec"
+	"strings"
+)
 
+// keyringPassword fetches the "Slack Safe Storage" password from the macOS
+// login keychain by shelling out to /usr/bin/security.
+//
+// We deliberately shell out rather than use a Security.framework binding: the
+// release build sets CGO_ENABLED=0 (see .goreleaser.yaml) and cross-compiles
+// darwin from Linux, so a cgo keychain dependency would break the macOS build.
+// `security find-generic-password -w -s "Slack Safe Storage"` prints just the
+// password on stdout.
 func keyringPassword() ([]byte, error) {
-	q := keychain.NewItem()
-	q.SetSecClass(keychain.SecClassGenericPassword)
-	q.SetService("Slack Safe Storage")
-	q.SetMatchLimit(keychain.MatchLimitOne)
-	q.SetReturnData(true)
-	results, err := keychain.QueryItem(q)
-	if err != nil {
+	cmd := exec.Command("/usr/bin/security", "find-generic-password", "-w", "-s", "Slack Safe Storage")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
 		return nil, ErrNoSecretService
 	}
-	if len(results) == 0 {
+	pw := strings.TrimRight(out.String(), "\r\n")
+	if pw == "" {
 		return nil, ErrNoSecretService
 	}
-	return results[0].Data, nil
+	return []byte(pw), nil
 }
