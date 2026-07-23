@@ -96,6 +96,7 @@ func TestCategoryPrefixes(t *testing.T) {
 	WS("ws-line %d", 4)
 	General("general-line %d", 5)
 	Backfill("backfill-line %d", 6)
+	Notify("notify-line %d", 7)
 
 	body, err := os.ReadFile(filepath.Join(dir, "slk-debug.log"))
 	if err != nil {
@@ -109,6 +110,7 @@ func TestCategoryPrefixes(t *testing.T) {
 		"[ws] ws-line 4",
 		"[general] general-line 5",
 		"[backfill] backfill-line 6",
+		"[notify] notify-line 7",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("log missing %q\nfull output:\n%s", want, out)

@@ -616,10 +616,11 @@ func run() error {
 	app.SetHelpFooter(versionpkg.ModalFooter(version))
 	app.SetClipboardAvailable(clipboardOK)
 	if sr := notify.NewStatusReporter(cfg.Notifications.StatusCommand); sr != nil {
-		// Run off the UI goroutine so the status_command subprocess never blocks a render.
-		app.SetStatusReporter(func(unread, other int, ws, title string) {
-			go sr.Report(unread, other, ws, title)
-		})
+		// Enqueue never blocks a render: it hands the state to the reporter's
+		// single worker, which serializes runs and coalesces bursts so the
+		// external surface can't end up pinned to a stale count by an
+		// out-of-order subprocess.
+		app.SetStatusReporter(sr.Enqueue)
 	}
 	if useWaylandClipboard {
 		app.SetClipboardReader(ui.WaylandClipboardReader())
@@ -3295,7 +3296,11 @@ func (h *rtmEventHandler) OnMessage(channelID, userID, ts, text, threadTS, subty
 				title = h.workspaceName + ": " + senderName
 			}
 			body := senderName + ": " + notify.StripSlackMarkup(text, h.userNames)
-			go h.notifier.Notify(title, body)
+			go func() {
+				if err := h.notifier.Notify(title, body); err != nil {
+					debuglog.Notify("notification failed: %v", err)
+				}
+			}()
 		}
 	}
 

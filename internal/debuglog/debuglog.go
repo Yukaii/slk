@@ -14,6 +14,7 @@
 //   - WS        — websocket events
 //   - Backfill  — reconnect-driven history backfill
 //   - Perf      — render/cache timing for perf investigation
+//   - Notify    — notification/status hook failures
 //   - General   — misc / catch-all
 //
 // All output goes to a single file. Categories are encoded as inline
@@ -138,6 +139,17 @@ func Perf(format string, args ...any) {
 		return
 	}
 	logger.Printf("[perf] "+format, args...)
+}
+
+// Notify logs a message tagged [notify] for notification and status
+// hook events — a failing notify_command / status_command would
+// otherwise fail invisibly, since both run detached from the UI.
+// No-op when !Enabled().
+func Notify(format string, args ...any) {
+	if !enabled.Load() {
+		return
+	}
+	logger.Printf("[notify] "+format, args...)
 }
 
 // General logs a message tagged [general] for miscellaneous events.

@@ -38,12 +38,24 @@ quiet_hours = "22:00-08:00"   # planned
 # status_command (optional): run on every unread-state change (a message arrives
 # or a channel is read) so an external surface can mirror slk's unread state.
 # Because it fires on reads too, it can clear a status as well as set one.
+# Runs are serialized and coalesced: states never run concurrently or out of
+# order, and under a burst intermediate states may be skipped — the newest
+# state always runs last, so the surface converges on the current state.
 # Executed via `sh -c` with:
 #   $SLK_UNREAD        unread channels in the active workspace (mute-filtered)
 #   $SLK_OTHER_UNREAD  unread count across other workspaces
 #   $SLK_WORKSPACE     active workspace name
 #   $SLK_TITLE         the window-title string, e.g. "slk SW (3) +1"
 # status_command = 'my-statusbar --slack-unread "$SLK_UNREAD"'
+
+# Both hooks require a POSIX `sh` on $PATH and are unavailable on Windows
+# (the built-in OS notification still works there). Hook failures are silent
+# in the UI; run slk with SLK_DEBUG=1 and check slk-debug.log ([notify] lines)
+# to diagnose a misbehaving command.
+
+# Muted channels and DMs never notify — including on mentions and keywords —
+# matching Slack. (This is a behavior change: previously a mention or keyword
+# in a muted channel would still notify.)
 
 [cache]
 message_retention_days = 30
