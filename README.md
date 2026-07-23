@@ -25,7 +25,7 @@
 - Threads side panel + a workspace-wide threads view
 - Smart paste: clipboard images, file paths, or text — multiple attachments + caption in one send
 - Slack-native sidebar sections, kept live; or glob-based config sections
-- Browser-cookie auth (`xoxc` + `d`) — no Slack App required
+- Automatic auth from the Slack desktop app — no tokens to copy, no Slack App required
 - Vim-style modal keybindings, fuzzy channel finder, workspace picker
 - 59 themes + drop-in custom themes, live theme switcher
 - OS desktop notifications on DMs, mentions, and configurable keywords
@@ -61,31 +61,25 @@ For `.deb` / `.rpm` / `.apk` packages, Windows, build-from-source, and checksums
 
 ## Setup
 
-slk uses your existing browser session. Grab your `xoxc` token and `d`
-cookie from DevTools, then:
+slk reads your session directly from the **Slack desktop app** — no DevTools,
+no tokens to copy. Make sure you're signed in to the desktop app, then:
 
 ```bash
 slk --add-workspace
 ```
 
+slk lists the workspaces you're signed in to; pick the ones you want and
+you're done.
+
 Full walkthrough: [Setup wiki page](https://github.com/gammons/slk/wiki/Setup).
 
 ## Enterprise Grid
 
-slk authenticates via the same `xoxc` browser session token and `d`
-cookie that `app.slack.com` uses. Every outbound request to `*.slack.com`
-is decorated with browser-like headers (`User-Agent`, `Origin`,
-`Referer`, `Sec-Fetch-*`) so Slack's anomaly detectors should treat the
-traffic the same way they treat the browser tab the token was extracted
-from.
-
-This is best-effort mitigation, not a contract. Your IT policy may still
-flag slk regardless. If you're on Enterprise Grid and slk signs you out
-or triggers a security email after login, please file an issue with:
-
-1. The exact email or notification text Slack sent.
-2. Whether you got logged out of *all* sessions or only slk's.
-3. The output of `slk --version`.
+slk reuses the **desktop app's** existing signed-in session (the same session
+your admin already sanctioned) rather than a browser session, which avoids the
+session-anomaly alerts that browser-token extraction can trigger. If you're on
+Enterprise Grid and still hit a sign-out or security alert after adding a
+workspace, please file an issue — include your OS and Slack desktop version.
 
 See [#5](https://github.com/gammons/slk/issues/5) for history.
 
@@ -165,7 +159,7 @@ the file before relaunching. Log lines are categorized
 Everything lives in the [**wiki**](https://github.com/gammons/slk/wiki):
 
 - [Installation](https://github.com/gammons/slk/wiki/Installation) — prebuilt binaries, Go install, build from source
-- [Setup](https://github.com/gammons/slk/wiki/Setup) — token extraction, adding workspaces
+- [Setup](https://github.com/gammons/slk/wiki/Setup) — desktop-app auth, adding workspaces
 - [Features](https://github.com/gammons/slk/wiki/Features) — full feature breakdown
 - [Keybindings](https://github.com/gammons/slk/wiki/Keybindings) — every key, every mode
 - [Configuration](https://github.com/gammons/slk/wiki/Configuration) — `config.toml`, custom themes, XDG paths
