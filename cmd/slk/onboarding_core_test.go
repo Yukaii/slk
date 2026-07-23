@@ -4,7 +4,6 @@ import (
 	"context"
 	"testing"
 
-	slackclient "github.com/gammons/slk/internal/slack"
 	"github.com/gammons/slk/internal/slackdesktop"
 )
 
@@ -29,4 +28,3 @@ func TestBuildWorkspaceTokens(t *testing.T) {
 	}
 }
 
-var _ = slackclient.Token{}
