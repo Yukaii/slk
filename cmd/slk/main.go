@@ -1773,6 +1773,7 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 	if err := client.Connect(ctx); err != nil {
 		return nil, fmt.Errorf("connecting %s: %w", token.TeamName, err)
 	}
+	client.SetReauth(token.Domain, slackdesktop.Cookie)
 
 	wctx := &WorkspaceContext{
 		Client:               client,
@@ -4015,6 +4016,7 @@ func dumpPrefs() error {
 			fmt.Fprintf(os.Stderr, "  connect failed: %v\n\n", err)
 			continue
 		}
+		client.SetReauth(tok.Domain, slackdesktop.Cookie)
 		raw, err := client.GetMutedChannelsRaw(ctx)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  fetch failed: %v\n\n", err)
@@ -4057,6 +4059,7 @@ func dumpSections() error {
 			fmt.Fprintf(os.Stderr, "  connect failed: %v\n\n", err)
 			continue
 		}
+		client.SetReauth(tok.Domain, slackdesktop.Cookie)
 		raw, err := client.GetChannelSectionsRaw(ctx)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  fetch failed: %v\n\n", err)
