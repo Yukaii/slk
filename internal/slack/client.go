@@ -1,7 +1,6 @@
 package slackclient
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -90,10 +89,6 @@ type Client struct {
 	// constructed directly in tests (e.g., &Client{api: mock}); in
 	// that case Connect() leaves the existing api field alone.
 	httpClient *http.Client
-
-	// reauth, when set, re-mints the token and rebuilds the inner api
-	// client. Called once on an invalid_auth response before retrying.
-	reauth func(ctx context.Context) error
 }
 
 // NewClient creates a new Slack client using browser cookie auth.
@@ -113,26 +108,6 @@ func NewClient(xoxcToken, dCookie string) *Client {
 		cookie:     dCookie,
 		apiBaseURL: defaultAPIBaseURL,
 		httpClient: httpClient,
-	}
-}
-
-// SetReauth installs the mid-session re-authentication hook. cookieFn reads
-// the live desktop cookie; the client re-mints for the given domain.
-func (c *Client) SetReauth(domain string, cookieFn func() (string, error)) {
-	c.reauth = func(ctx context.Context) error {
-		cookie, err := cookieFn()
-		if err != nil {
-			return err
-		}
-		tok, err := MintToken(ctx, domain, cookie)
-		if err != nil {
-			return err
-		}
-		c.token = tok
-		c.cookie = cookie
-		c.httpClient = newCookieHTTPClient(cookie)
-		c.api = slack.New(c.token, slack.OptionHTTPClient(c.httpClient), slack.OptionAPIURL(c.apiBaseURL))
-		return nil
 	}
 }
 
@@ -1341,40 +1316,27 @@ func (c *Client) postForm(ctx context.Context, method string, form url.Values) (
 	//
 	// Copy the caller's map so we don't mutate it across retries or
 	// concurrent calls.
-	do := func() ([]byte, error) {
-		body := url.Values{"token": {c.token}}
-		for k, vs := range form {
-			body[k] = vs
-		}
-
-		req, err := http.NewRequestWithContext(ctx, "POST", c.apiBaseURL+method, strings.NewReader(body.Encode()))
-		if err != nil {
-			return nil, fmt.Errorf("creating %s request: %w", method, err)
-		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-		httpClient := c.httpClient
-		if httpClient == nil {
-			httpClient = newCookieHTTPClient(c.cookie)
-		}
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("calling %s: %w", method, err)
-		}
-		defer resp.Body.Close()
-		return io.ReadAll(resp.Body)
+	body := url.Values{"token": {c.token}}
+	for k, vs := range form {
+		body[k] = vs
 	}
 
-	out, err := do()
+	req, err := http.NewRequestWithContext(ctx, "POST", c.apiBaseURL+method, strings.NewReader(body.Encode()))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("creating %s request: %w", method, err)
 	}
-	if c.reauth != nil && bytes.Contains(out, []byte(`"error":"invalid_auth"`)) {
-		if rerr := c.reauth(ctx); rerr == nil {
-			return do()
-		}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	httpClient := c.httpClient
+	if httpClient == nil {
+		httpClient = newCookieHTTPClient(c.cookie)
 	}
-	return out, nil
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("calling %s: %w", method, err)
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
 }
 
 // truncateForLog clips a response body to a length safe to splat into

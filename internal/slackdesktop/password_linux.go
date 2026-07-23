@@ -3,8 +3,6 @@
 package slackdesktop
 
 import (
-	"strings"
-
 	"r00t2.io/gosecret"
 )
 
@@ -13,9 +11,6 @@ import (
 func keyringPassword() ([]byte, error) {
 	service, err := gosecret.NewService()
 	if err != nil {
-		if strings.Contains(err.Error(), "not provided") || strings.Contains(err.Error(), "no such") {
-			return nil, ErrNoSecretService
-		}
 		return nil, ErrNoSecretService
 	}
 	defer service.Close()

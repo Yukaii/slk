@@ -36,3 +36,20 @@ func TestRemintTokensKeepsOldOnMintFailure(t *testing.T) {
 		t.Fatalf("expected fallback to cached token, got %+v", out[0])
 	}
 }
+
+// Cookie read succeeds but the per-token mint fails: keep that token's cached
+// credentials untouched (the more common partial-failure case).
+func TestRemintTokensKeepsOldOnPerTokenMintFailure(t *testing.T) {
+	in := []slackclient.Token{{AccessToken: "old1", Cookie: "c-old", Domain: "acme", TeamID: "T1"}}
+	out := remintTokens(context.Background(), in,
+		func() (string, error) { return "c-new", nil }, // cookie OK
+		func(_ context.Context, _, _ string) (string, error) { return "", context.Canceled }, // mint fails
+		func(slackclient.Token) error { return nil },
+	)
+	if out[0].AccessToken != "old1" {
+		t.Fatalf("expected cached token kept on mint failure, got %+v", out[0])
+	}
+	if out[0].Cookie != "c-old" {
+		t.Fatalf("cookie must not change when mint fails, got %+v", out[0])
+	}
+}
