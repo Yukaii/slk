@@ -18,5 +18,5 @@ type SectionMeta struct {
 	ID    string
 	Name  string
 	Emoji string // shortcode like "orange_book"; empty for none
-	Type  string // standard | channels | direct_messages | recent_apps
+	Type  string // standard | channels | direct_messages | recent_apps | stars
 }

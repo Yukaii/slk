@@ -1386,6 +1386,72 @@ func (c *Client) GetChannelSectionsRaw(ctx context.Context) ([]byte, error) {
 	return c.callChannelSectionsList(ctx, "")
 }
 
+// starsListResponse is the JSON shape returned by stars.list. Only the
+// channel-typed items are relevant for the sidebar; message/file/IM stars
+// are ignored.
+type starsListResponse struct {
+	OK     bool            `json:"ok"`
+	Error  string          `json:"error"`
+	Items  []starsListItem `json:"items"`
+	Paging starsListPaging `json:"paging"`
+}
+
+type starsListItem struct {
+	Type    string `json:"type"`
+	Channel string `json:"channel"` // populated when Type == "channel" or "im"
+}
+
+type starsListPaging struct {
+	Count int `json:"count"`
+	Total int `json:"total"`
+}
+
+// GetStarredChannels calls stars.list and returns the IDs of channels the
+// user has starred. Slack's users.channelSections.list returns the stars
+// section with an empty channel_ids array (it doesn't populate built-in
+// section types); stars.list is the authoritative source for starred
+// channels. Only type=="channel" items are returned — message/file/IM stars
+// don't belong in the channel sidebar.
+//
+// Best-effort: on error the caller proceeds with an empty star list and
+// the stars section stays hidden (no regression vs pre-fix behavior).
+func (c *Client) GetStarredChannels(ctx context.Context) ([]string, error) {
+	form := url.Values{"token": {c.token}, "limit": {"1000"}}
+	body := strings.NewReader(form.Encode())
+	endpoint := c.apiBaseURL + "stars.list"
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, body)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	httpClient := newCookieHTTPClient(c.cookie)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("calling stars.list: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading stars.list response: %w", err)
+	}
+	var slr starsListResponse
+	if err := json.Unmarshal(raw, &slr); err != nil {
+		return nil, fmt.Errorf("parsing stars.list response: %w", err)
+	}
+	if !slr.OK {
+		return nil, fmt.Errorf("stars.list API error: %s", slr.Error)
+	}
+	var ids []string
+	for _, it := range slr.Items {
+		if it.Type == "channel" && it.Channel != "" {
+			ids = append(ids, it.Channel)
+		}
+	}
+	return ids, nil
+}
+
 // GetChannelSections calls users.channelSections.list and returns the
 // fully-paginated section list. Loops on the top-level cursor until the
 // server reports no more sections. Per-section channel_ids_page pagination
