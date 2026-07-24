@@ -34,6 +34,27 @@ func TestTranslateUsergroupMentionForSend(t *testing.T) {
 	}
 }
 
+// A user and a usergroup can share a name. The entry sort must resolve
+// the collision the same way on every call -- sort.Slice is unstable and
+// the entries come out of map iteration, so an unbroken tie would pick a
+// different wire form run to run.
+func TestTranslateMentionsForSendResolvesNameCollisionDeterministically(t *testing.T) {
+	m := New("general")
+	m.SetUserGroups(map[string]string{"S0TESTGRP01": "design"})
+	m.SetUsers([]mentionpicker.User{
+		{ID: "U1234", DisplayName: "design", Username: "design"},
+	})
+
+	// The person wins: a name that resolves to a human should not ping
+	// a whole group.
+	const want = "ping <@U1234>"
+	for i := 0; i < 50; i++ {
+		if got := m.TranslateMentionsForSend("ping @design"); got != want {
+			t.Fatalf("iteration %d: TranslateMentionsForSend = %q, want %q", i, got, want)
+		}
+	}
+}
+
 func TestUsergroupsAreScopedPerComposeModel(t *testing.T) {
 	work := New("general")
 	work.SetUserGroups(map[string]string{"S0TESTGRP01": "work-team"})

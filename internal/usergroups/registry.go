@@ -18,6 +18,21 @@ func Copy(m map[string]string) map[string]string {
 	return out
 }
 
+// Equal reports whether two id -> handle maps hold the same entries.
+// nil and empty compare equal: both mean "no groups loaded", and the
+// setters that use this treat them identically.
+func Equal(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for id, handle := range a {
+		if other, ok := b[id]; !ok || other != handle {
+			return false
+		}
+	}
+	return true
+}
+
 // Display returns the "@handle" display text for a subteam token. The
 // embedded label wins when present; bare tokens resolve through the
 // provided workspace-scoped map; unresolved IDs fall back to "@group".

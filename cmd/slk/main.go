@@ -165,7 +165,20 @@ type WorkspaceContext struct {
 	UserID        string
 	UnresolvedDMs []UnresolvedDM
 	CustomEmoji   map[string]string // emoji name -> URL or "alias:target"
-	UserGroups    map[string]string // usergroup ID -> handle
+	// userGroups holds this workspace's usergroup ID -> handle map.
+	// Access it via UserGroups/SetUserGroups, never directly.
+	//
+	// atomic.Pointer (not a plain map) because the write happens on the
+	// background usergroups.list fetch goroutine while reads happen on
+	// the bubbletea Update/cmd goroutines (workspace switch, search) and
+	// on the RTM event loop (notification body stripping). This is where
+	// UserGroups differs from the CustomEmoji field it otherwise mirrors:
+	// CustomEmoji is only ever consumed through the tea message loop, so
+	// its single background write is never read cross-goroutine.
+	//
+	// The stored map is published once and never mutated afterwards, so
+	// readers need no further synchronization.
+	userGroups atomic.Pointer[map[string]string]
 	// Self presence and DND state for this workspace. Populated on connect
 	// and updated by manual_presence_change / dnd_updated WS events plus
 	// optimistic writes from the presence menu.
@@ -192,6 +205,22 @@ type WorkspaceContext struct {
 	// in connectWorkspace alongside UserResolver (it depends on the
 	// resolver to trigger external-user lookups for newly-seen IDs).
 	Membership *membership.Manager
+}
+
+// UserGroups returns this workspace's usergroup ID -> handle map, or an
+// empty map before usergroups.list has returned. Safe to call from any
+// goroutine; the result must be treated as read-only.
+func (w *WorkspaceContext) UserGroups() map[string]string {
+	if m := w.userGroups.Load(); m != nil {
+		return *m
+	}
+	return map[string]string{}
+}
+
+// SetUserGroups publishes a usergroup ID -> handle map for this
+// workspace. The caller must not mutate the map afterwards.
+func (w *WorkspaceContext) SetUserGroups(groups map[string]string) {
+	w.userGroups.Store(&groups)
 }
 
 // workspaceRouter holds the program-wide "active workspace" pointer.
@@ -1529,7 +1558,7 @@ func run() error {
 			ExternalUsers:    external,
 			UserID:           wctx.UserID,
 			CustomEmoji:      wctx.CustomEmoji,
-			UserGroups:       wctx.UserGroups,
+			UserGroups:       wctx.UserGroups(),
 			SectionsProvider: sectionsProviderAdapter{store: wctx.SectionStore},
 		}
 	})
@@ -1683,8 +1712,8 @@ func run() error {
 				UserNames:        wctx.UserNames,
 				ExternalUsers:    external,
 				UserID:           wctx.UserID,
-				CustomEmoji:      wctx.CustomEmoji, // empty at this point; filled by the goroutine below
-				UserGroups:       wctx.UserGroups,  // empty at this point; filled by the goroutine below
+				CustomEmoji:      wctx.CustomEmoji,  // empty at this point; filled by the goroutine below
+				UserGroups:       wctx.UserGroups(), // empty at this point; filled by the goroutine below
 				SectionsProvider: sectionsProviderAdapter{store: wctx.SectionStore},
 				InitialActive:    isInitial,
 				LastChannelID:    mostRecentlyVisitedChannel(wctx.LastVisitedByChannel),
@@ -1717,7 +1746,7 @@ func run() error {
 					return
 				}
 				byID := usergroupHandles(groups)
-				wctx.UserGroups = byID
+				wctx.SetUserGroups(byID)
 				p.Send(ui.UserGroupsLoadedMsg{
 					TeamID:     teamID,
 					UserGroups: byID,
@@ -1784,13 +1813,41 @@ func usergroupHandles(groups []slack.UserGroup) map[string]string {
 	for _, g := range groups {
 		handle := g.Handle
 		if handle == "" {
-			handle = g.Name
+			// Fall back to the display name, slugified: a name like
+			// "Platform Team" would otherwise become a handle with a
+			// space in it, which neither the @-token composer
+			// autocomplete nor the word-boundary send translation can
+			// round-trip.
+			handle = slugifyHandle(g.Name)
 		}
 		if handle != "" {
 			byID[g.ID] = handle
 		}
 	}
 	return byID
+}
+
+// slugifyHandle turns a usergroup display name into a mention-safe
+// handle: lowercased, with every run of characters Slack handles don't
+// use collapsed to a single "-" ("Platform Team" -> "platform-team").
+// Returns "" when nothing usable survives, so the caller can skip the
+// group entirely rather than register an unmentionable handle.
+func slugifyHandle(name string) string {
+	var b strings.Builder
+	pendingDash := false
+	for _, r := range strings.ToLower(name) {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '.':
+			if pendingDash && b.Len() > 0 {
+				b.WriteByte('-')
+			}
+			pendingDash = false
+			b.WriteRune(r)
+		default:
+			pendingDash = true
+		}
+	}
+	return b.String()
 }
 
 func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB, cfg config.Config, avatarCache *avatar.Cache, p *tea.Program) (*WorkspaceContext, error) {
@@ -1809,7 +1866,6 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		UserNamesByHandle:    make(map[string]string),
 		BotUserIDs:           make(map[string]bool),
 		CustomEmoji:          make(map[string]string),
-		UserGroups:           make(map[string]string),
 		LastVisitedByChannel: make(map[string]int64),
 	}
 	wctx.SubscriptionsAvailable = true
@@ -3013,7 +3069,7 @@ func searchWorkspaceFunc(router *workspaceRouter, db *cache.DB, tsFormat string)
 			}
 			return "", false
 		}
-		items := searchResultItems(res.Matches, tsFormat, time.Now(), resolveUser, resolveChannel, wctx.UserGroups)
+		items := searchResultItems(res.Matches, tsFormat, time.Now(), resolveUser, resolveChannel, wctx.UserGroups())
 		return ui.WorkspaceSearchResultsMsg{Query: query, Items: items, Total: res.Total}
 	}
 }
@@ -3325,7 +3381,7 @@ func (h *rtmEventHandler) OnMessage(channelID, userID, ts, text, threadTS, subty
 			}
 			var groupNames map[string]string
 			if h.wsCtx != nil {
-				groupNames = h.wsCtx.UserGroups
+				groupNames = h.wsCtx.UserGroups()
 			}
 			body := senderName + ": " + notify.StripSlackMarkupWithUserGroups(text, h.userNames, groupNames)
 			go h.notifier.Notify(title, body)

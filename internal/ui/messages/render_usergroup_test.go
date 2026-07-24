@@ -96,3 +96,21 @@ func TestFlattenUsergroupBareResolved(t *testing.T) {
 		t.Errorf("FlattenMrkdwnWithUserGroups = %q; want %q", out, "ping @backend please")
 	}
 }
+
+// App.SetUserGroups fires on every workspace switch, so an unchanged
+// map must not bust the render cache.
+func TestSetUserGroupsSkipsCacheBustWhenUnchanged(t *testing.T) {
+	m := New(nil, "general")
+	m.SetUserGroups(map[string]string{"S1": "platform-team"})
+	m.cache = []viewEntry{{}}
+
+	m.SetUserGroups(map[string]string{"S1": "platform-team"})
+	if m.cache == nil {
+		t.Error("identical usergroup map busted the render cache")
+	}
+
+	m.SetUserGroups(map[string]string{"S1": "platform-team", "S2": "design"})
+	if m.cache != nil {
+		t.Error("changed usergroup map left a stale render cache")
+	}
+}

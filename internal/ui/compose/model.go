@@ -893,24 +893,33 @@ func (m *Model) CloseMention() {
 func (m Model) TranslateMentionsForSend(text string) string {
 	// trigger is the leading character ('@' for users/specials, '#' for
 	// channels); name is what follows; replacement is the wire form.
+	// rank breaks ties when two kinds of mention share a name (a user
+	// and a usergroup can both be "@design") -- lower wins.
 	type entry struct {
 		trigger     byte
 		name        string
 		replacement string
+		rank        int
 	}
+	const (
+		rankSpecial = iota
+		rankUser
+		rankUserGroup
+		rankChannel
+	)
 
 	var entries []entry
 
 	// Special @ mentions
 	entries = append(entries,
-		entry{'@', "here", "<!here>"},
-		entry{'@', "channel", "<!channel>"},
-		entry{'@', "everyone", "<!everyone>"},
+		entry{'@', "here", "<!here>", rankSpecial},
+		entry{'@', "channel", "<!channel>", rankSpecial},
+		entry{'@', "everyone", "<!everyone>", rankSpecial},
 	)
 
 	// User mentions
 	for name, userID := range m.reverseNames {
-		entries = append(entries, entry{'@', name, "<@" + userID + ">"})
+		entries = append(entries, entry{'@', name, "<@" + userID + ">", rankUser})
 	}
 
 	// Usergroup mentions. Like channels below, we emit the labeled
@@ -918,7 +927,7 @@ func (m Model) TranslateMentionsForSend(text string) string {
 	// echo renders the handle even if the server echo arrives before
 	// usergroups.list refreshes this workspace's map.
 	for id, handle := range m.userGroups {
-		entries = append(entries, entry{'@', handle, "<!subteam^" + id + "|@" + handle + ">"})
+		entries = append(entries, entry{'@', handle, "<!subteam^" + id + "|@" + handle + ">", rankUserGroup})
 	}
 
 	// Channel mentions. We emit <#CHANNELID|name> rather than the
@@ -929,7 +938,7 @@ func (m Model) TranslateMentionsForSend(text string) string {
 	// Slack accepts both forms on the wire and normalizes echoes
 	// to the |name form anyway.
 	for name, channelID := range m.reverseChannels {
-		entries = append(entries, entry{'#', name, "<#" + channelID + "|" + name + ">"})
+		entries = append(entries, entry{'#', name, "<#" + channelID + "|" + name + ">", rankChannel})
 	}
 
 	// Sort by name length descending. This lives across both trigger
@@ -937,8 +946,27 @@ func (m Model) TranslateMentionsForSend(text string) string {
 	// the loop below builds the search needle as trigger+name, so a
 	// longer @name still won't collide with a shorter #name even when
 	// they share the same suffix.
+	//
+	// sort.Slice is unstable and the entries above come out of map
+	// iteration, so equal-length names need an explicit tie-break or
+	// the same text translates to different wire forms run to run.
+	// Earlier entries win: the loop below rewrites every occurrence, so
+	// by the time a later entry with the same name is tried, the text
+	// no longer contains it. Precedence is rank (a name shared by a
+	// person and a usergroup resolves to the person), then name, then
+	// replacement to settle same-rank duplicates.
 	sort.Slice(entries, func(i, j int) bool {
-		return len(entries[i].name) > len(entries[j].name)
+		a, b := entries[i], entries[j]
+		if len(a.name) != len(b.name) {
+			return len(a.name) > len(b.name)
+		}
+		if a.rank != b.rank {
+			return a.rank < b.rank
+		}
+		if a.name != b.name {
+			return a.name < b.name
+		}
+		return a.replacement < b.replacement
 	})
 
 	for _, e := range entries {

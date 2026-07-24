@@ -591,7 +591,13 @@ func (m *Model) SetUserNames(names map[string]string) {
 
 // SetUserGroups sets the workspace-scoped usergroup ID -> handle map used
 // to resolve bare <!subteam^SID> mentions in the parent and replies.
+// No-op when the new map matches the current one -- App.SetUserGroups
+// fires on every workspace switch, and busting the render cache for an
+// identical set is pure waste.
 func (m *Model) SetUserGroups(groups map[string]string) {
+	if usergroups.Equal(m.userGroups, groups) {
+		return
+	}
 	m.userGroups = usergroups.Copy(groups)
 	m.InvalidateCache()
 }

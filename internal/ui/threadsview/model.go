@@ -181,14 +181,15 @@ func (m *Model) SetChannelNames(names map[string]string) {
 }
 
 // SetUserGroups sets the workspace-scoped usergroup ID -> handle map used
-// to resolve bare <!subteam^SID> mentions in thread previews.
+// to resolve bare <!subteam^SID> mentions in thread previews. No-op when
+// the new map matches the current one.
 func (m *Model) SetUserGroups(groups map[string]string) {
+	if usergroups.Equal(m.userGroups, groups) {
+		return
+	}
 	copied := usergroups.Copy(groups)
 	if copied == nil {
 		copied = map[string]string{}
-	}
-	if stringMapsEqual(m.userGroups, copied) {
-		return
 	}
 	m.userGroups = copied
 	m.dirty()

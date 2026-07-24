@@ -32,3 +32,23 @@ func TestDisplayFallsBackForUnknownID(t *testing.T) {
 		t.Errorf("Display unknown ID = %q, want @group", got)
 	}
 }
+
+func TestEqual(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b map[string]string
+		want bool
+	}{
+		{"both nil", nil, nil, true},
+		{"nil vs empty", nil, map[string]string{}, true},
+		{"same entries", map[string]string{"S1": "eng"}, map[string]string{"S1": "eng"}, true},
+		{"changed handle", map[string]string{"S1": "eng"}, map[string]string{"S1": "ops"}, false},
+		{"changed id", map[string]string{"S1": "eng"}, map[string]string{"S2": "eng"}, false},
+		{"extra entry", map[string]string{"S1": "eng"}, map[string]string{"S1": "eng", "S2": "ops"}, false},
+	}
+	for _, tc := range cases {
+		if got := Equal(tc.a, tc.b); got != tc.want {
+			t.Errorf("%s: Equal(%v, %v) = %v, want %v", tc.name, tc.a, tc.b, got, tc.want)
+		}
+	}
+}

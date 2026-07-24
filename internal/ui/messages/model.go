@@ -1372,8 +1372,13 @@ func (m *Model) SetChannelNames(names map[string]string) {
 }
 
 // SetUserGroups sets the workspace-scoped usergroup ID -> handle map used
-// to resolve bare <!subteam^SID> mentions.
+// to resolve bare <!subteam^SID> mentions. No-op when the new map matches
+// the current one -- App.SetUserGroups fires on every workspace switch,
+// and busting the render cache for an identical set is pure waste.
 func (m *Model) SetUserGroups(groups map[string]string) {
+	if usergroups.Equal(m.userGroups, groups) {
+		return
+	}
 	m.userGroups = usergroups.Copy(groups)
 	m.cache = nil
 	m.dirty()
