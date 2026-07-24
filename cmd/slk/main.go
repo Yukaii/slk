@@ -1978,17 +1978,11 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		if err := store.Bootstrap(ctx, client); err != nil {
 			log.Printf("section store bootstrap for %s failed: %v (falling back to config sections)", token.TeamName, err)
 		} else {
-			// Slack's users.channelSections.list returns the stars section
-			// with an empty channel_ids array (it doesn't populate built-in
-			// section types). stars.list is the authoritative source for
-			// which channels the user has starred; fetch and inject so the
-			// sidebar can render the Starred header. Best-effort: on error
-			// the stars section stays empty and includeInSidebar hides it.
-			if starIDs, err := client.GetStarredChannels(ctx); err != nil {
-				log.Printf("stars.list for %s failed: %v (starred channels will be hidden)", token.TeamName, err)
-			} else if len(starIDs) > 0 {
-				store.PopulateStars(starIDs)
-			}
+			// Bootstrap repopulates the stars section from stars.list
+			// itself (channelSections.list returns built-in section
+			// types with empty channel_ids), so the Starred header is
+			// live at first render and survives reconnect-triggered
+			// re-bootstraps without caller help.
 			wctx.SectionStore = store
 			// One-time info log when the user has both Slack sections
 			// active AND a non-empty [sections.*] config — the latter
