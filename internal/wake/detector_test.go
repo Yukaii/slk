@@ -2,10 +2,20 @@ package wake
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// hasMonotonicReading reports whether t carries a monotonic clock
+// reading. time.Time.String appends " m=±<seconds>" when — and only
+// when — a monotonic reading is present (documented in the time
+// package), so this is a stable way to detect it without unsafe access
+// to unexported fields.
+func hasMonotonicReading(t time.Time) bool {
+	return strings.Contains(t.String(), " m=")
+}
 
 // fakeClock returns whatever its current field says. Tests advance
 // the clock via Advance or Set. The mutex is necessary for the
@@ -213,6 +223,37 @@ func TestStep_FirstCallSeedsWithoutFiring(t *testing.T) {
 	}
 	if !d.last.Equal(fc.Now()) {
 		t.Errorf("first Step did not store baseline; last=%v want=%v", d.last, fc.Now())
+	}
+}
+
+func TestStep_StripsMonotonicReading_SoWallJumpsAreDetected(t *testing.T) {
+	// Regression test for the suspend-detection bug.
+	//
+	// In production d.now is time.Now, whose results carry a monotonic
+	// clock reading. time.Time.Sub uses the monotonic clock alone when
+	// both operands have a reading. On Linux/macOS the monotonic clock
+	// does NOT advance while the system is suspended, so if Step stores
+	// a monotonic-carrying time, the wall-clock jump on wake is invisible
+	// to Sub and onWake never fires — exactly the "doesn't sync after
+	// lid close" symptom.
+	//
+	// The fix is for Step to strip the monotonic reading (Round(0)) so
+	// elapsed is computed from the wall clock. This test drives Step with
+	// the REAL clock (the only source of monotonic readings) and asserts
+	// the stored baseline has no monotonic reading.
+	d := New(10*time.Second, 5*time.Second, func(time.Duration) {})
+
+	if !hasMonotonicReading(d.now()) {
+		t.Skip("real clock does not carry a monotonic reading on this platform; " +
+			"the bug this guards against cannot occur here")
+	}
+
+	d.Step() // seeds d.last from the real clock
+
+	if hasMonotonicReading(d.last) {
+		t.Fatalf("Step stored a baseline with a monotonic reading (%v); "+
+			"Sub will then use the monotonic clock, which is frozen during "+
+			"OS suspend, so wall-clock jumps on wake go undetected", d.last)
 	}
 }
 
