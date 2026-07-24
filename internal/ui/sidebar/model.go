@@ -323,6 +323,57 @@ func (m *Model) UnreadChannelCount() int {
 	return count
 }
 
+// NextUnread returns the visibly-unread channel (HasUnread && !IsMuted)
+// that follows afterID, wrapping around, and the fields the App needs to
+// raise a ChannelSelectedMsg. afterID itself is always skipped so
+// repeated calls advance through the unread set; pass the currently-open
+// channel ID. dir > 0 walks forward (next), dir < 0 walks backward
+// (previous). ok is false when no *other* channel is unread (an empty
+// inbox, or afterID is the only unread one).
+//
+// Walk order is m.filtered -- the section-sorted set the sidebar actually
+// renders -- so a/A traverse the visible unread dots top-to-bottom, the
+// way the eye expects, rather than raw feed order. Unread channels are
+// never removed by the staleness filter (IsStale returns false whenever
+// hasUnread), so every unread row present in the sidebar is reachable
+// here; equivalently, a/A visit exactly what the sidebar shows.
+func (m *Model) NextUnread(afterID string, dir int) (id, name, chType string, ok bool) {
+	if m.readStateReader == nil {
+		return "", "", "", false
+	}
+	n := len(m.filtered)
+	if n == 0 {
+		return "", "", "", false
+	}
+	state := m.readStateReader()
+	step := 1
+	if dir < 0 {
+		step = -1
+	}
+	// Anchor at afterID; when it isn't in the visible set, start from the
+	// top (forward) or bottom (backward) so the first press still lands.
+	start := 0
+	if step < 0 {
+		start = n - 1
+	}
+	for pos, idx := range m.filtered {
+		if m.items[idx].ID == afterID {
+			start = pos
+			break
+		}
+	}
+	for off := 1; off <= n; off++ {
+		item := m.items[m.filtered[((start+step*off)%n+n)%n]]
+		if item.ID == afterID {
+			continue
+		}
+		if item.IsVisiblyUnread(state[item.ID]) {
+			return item.ID, item.Name, item.Type, true
+		}
+	}
+	return "", "", "", false
+}
+
 // Invalidate forces the next View() call to re-read read state from
 // the installed reader. Called by App.Update on ReadStateChangedMsg.
 func (m *Model) Invalidate() {

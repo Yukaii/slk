@@ -41,6 +41,8 @@ type KeyMap struct {
 	OpenPreview         key.Binding
 	OpenLink            key.Binding
 	MarkUnread          key.Binding
+	NextUnread          key.Binding
+	PrevUnread          key.Binding
 	WorkspaceFinder     key.Binding
 	NewMessage          key.Binding
 	ThemeSwitcher       key.Binding
@@ -100,6 +102,8 @@ func DefaultKeyMap() KeyMap {
 		OpenPreview:     key.NewBinding(key.WithKeys("O", "v"), key.WithHelp("O/v", "open image preview")),
 		OpenLink:        key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "open link in message")),
 		MarkUnread:      key.NewBinding(key.WithKeys("U"), key.WithHelp("U", "mark unread")),
+		NextUnread:      key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "next unread channel")),
+		PrevUnread:      key.NewBinding(key.WithKeys("A"), key.WithHelp("A", "prev unread channel")),
 		// Keyless: ctrl+w is reserved as the window-command prefix
 		// (window-management design §4). The keyless binding never
 		// matches but keeps the help-overlay entry pointing at :ws
