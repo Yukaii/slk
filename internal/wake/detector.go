@@ -74,7 +74,14 @@ func New(interval, threshold time.Duration, onWake func(time.Duration)) *Detecto
 // a goroutine and without relying on a real ticker. Run calls this
 // internally on every tick.
 func (d *Detector) Step() {
-	now := d.now()
+	// Round(0) strips the monotonic clock reading. time.Now carries
+	// one, and time.Time.Sub uses the monotonic clock alone when both
+	// operands have a reading. The monotonic clock does not advance
+	// while the OS is suspended (Linux CLOCK_MONOTONIC, macOS
+	// mach_absolute_time), so without stripping it the wall-clock jump
+	// on wake — the entire signal this detector relies on — would be
+	// invisible to the Sub below and onWake would never fire.
+	now := d.now().Round(0)
 	if !d.initialized {
 		d.last = now
 		d.initialized = true
