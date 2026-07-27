@@ -30,6 +30,7 @@ import (
 	"github.com/gammons/slk/internal/service"
 	slackclient "github.com/gammons/slk/internal/slack"
 	"github.com/gammons/slk/internal/slack/membership"
+	"github.com/gammons/slk/internal/slackdesktop"
 	"github.com/gammons/slk/internal/slackhttp"
 	"github.com/gammons/slk/internal/slackurl"
 	"github.com/gammons/slk/internal/text"
@@ -165,6 +166,20 @@ type WorkspaceContext struct {
 	UserID        string
 	UnresolvedDMs []UnresolvedDM
 	CustomEmoji   map[string]string // emoji name -> URL or "alias:target"
+	// userGroups holds this workspace's usergroup ID -> handle map.
+	// Access it via UserGroups/SetUserGroups, never directly.
+	//
+	// atomic.Pointer (not a plain map) because the write happens on the
+	// background usergroups.list fetch goroutine while reads happen on
+	// the bubbletea Update/cmd goroutines (workspace switch, search) and
+	// on the RTM event loop (notification body stripping). This is where
+	// UserGroups differs from the CustomEmoji field it otherwise mirrors:
+	// CustomEmoji is only ever consumed through the tea message loop, so
+	// its single background write is never read cross-goroutine.
+	//
+	// The stored map is published once and never mutated afterwards, so
+	// readers need no further synchronization.
+	userGroups atomic.Pointer[map[string]string]
 	// Self presence and DND state for this workspace. Populated on connect
 	// and updated by manual_presence_change / dnd_updated WS events plus
 	// optimistic writes from the presence menu.
@@ -191,6 +206,22 @@ type WorkspaceContext struct {
 	// in connectWorkspace alongside UserResolver (it depends on the
 	// resolver to trigger external-user lookups for newly-seen IDs).
 	Membership *membership.Manager
+}
+
+// UserGroups returns this workspace's usergroup ID -> handle map, or an
+// empty map before usergroups.list has returned. Safe to call from any
+// goroutine; the result must be treated as read-only.
+func (w *WorkspaceContext) UserGroups() map[string]string {
+	if m := w.userGroups.Load(); m != nil {
+		return *m
+	}
+	return map[string]string{}
+}
+
+// SetUserGroups publishes a usergroup ID -> handle map for this
+// workspace. The caller must not mutate the map afterwards.
+func (w *WorkspaceContext) SetUserGroups(groups map[string]string) {
+	w.userGroups.Store(&groups)
 }
 
 // workspaceRouter holds the program-wide "active workspace" pointer.
@@ -605,6 +636,15 @@ func run() error {
 			return fmt.Errorf("no workspaces configured after onboarding")
 		}
 	}
+
+	// Re-mint tokens from the live desktop cookie so every launch starts
+	// with fresh xoxc tokens (they expire; the desktop cookie is the source
+	// of truth). Falls back to cached tokens when offline / desktop absent.
+	tokens = remintTokens(context.Background(), tokens,
+		slackdesktop.Cookie,
+		slackclient.MintToken,
+		tokenStore.Save,
+	)
 
 	// Initialize services
 	wsMgr := service.NewWorkspaceManager(db)
@@ -1535,6 +1575,7 @@ func run() error {
 			ExternalUsers:    external,
 			UserID:           wctx.UserID,
 			CustomEmoji:      wctx.CustomEmoji,
+			UserGroups:       wctx.UserGroups(),
 			SectionsProvider: sectionsProviderAdapter{store: wctx.SectionStore},
 		}
 	})
@@ -1688,7 +1729,8 @@ func run() error {
 				UserNames:        wctx.UserNames,
 				ExternalUsers:    external,
 				UserID:           wctx.UserID,
-				CustomEmoji:      wctx.CustomEmoji, // empty at this point; filled by the goroutine below
+				CustomEmoji:      wctx.CustomEmoji,  // empty at this point; filled by the goroutine below
+				UserGroups:       wctx.UserGroups(), // empty at this point; filled by the goroutine below
 				SectionsProvider: sectionsProviderAdapter{store: wctx.SectionStore},
 				InitialActive:    isInitial,
 				LastChannelID:    mostRecentlyVisitedChannel(wctx.LastVisitedByChannel),
@@ -1707,6 +1749,24 @@ func run() error {
 				p.Send(ui.CustomEmojisLoadedMsg{
 					TeamID:      teamID,
 					CustomEmoji: emojis,
+				})
+			}(wctx.TeamID)
+
+			// Fetch workspace usergroups in the background. When done,
+			// send a follow-up so render caches and compose pickers can
+			// refresh for the active workspace. Best-effort: failure leaves
+			// bare subteam mentions rendered as "@group".
+			go func(teamID string) {
+				groups, err := wctx.Client.GetUserGroups(ctx)
+				if err != nil {
+					log.Printf("usergroups fetch for %s failed: %v (subteam mentions will render as @group)", wctx.TeamName, err)
+					return
+				}
+				byID := usergroupHandles(groups)
+				wctx.SetUserGroups(byID)
+				p.Send(ui.UserGroupsLoadedMsg{
+					TeamID:     teamID,
+					UserGroups: byID,
 				})
 			}(wctx.TeamID)
 
@@ -1763,6 +1823,48 @@ func run() error {
 	}
 
 	return err
+}
+
+func usergroupHandles(groups []slack.UserGroup) map[string]string {
+	byID := make(map[string]string, len(groups))
+	for _, g := range groups {
+		handle := g.Handle
+		if handle == "" {
+			// Fall back to the display name, slugified: a name like
+			// "Platform Team" would otherwise become a handle with a
+			// space in it, which neither the @-token composer
+			// autocomplete nor the word-boundary send translation can
+			// round-trip.
+			handle = slugifyHandle(g.Name)
+		}
+		if handle != "" {
+			byID[g.ID] = handle
+		}
+	}
+	return byID
+}
+
+// slugifyHandle turns a usergroup display name into a mention-safe
+// handle: lowercased, with every run of characters Slack handles don't
+// use collapsed to a single "-" ("Platform Team" -> "platform-team").
+// Returns "" when nothing usable survives, so the caller can skip the
+// group entirely rather than register an unmentionable handle.
+func slugifyHandle(name string) string {
+	var b strings.Builder
+	pendingDash := false
+	for _, r := range strings.ToLower(name) {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '.':
+			if pendingDash && b.Len() > 0 {
+				b.WriteByte('-')
+			}
+			pendingDash = false
+			b.WriteRune(r)
+		default:
+			pendingDash = true
+		}
+	}
+	return b.String()
 }
 
 func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB, cfg config.Config, avatarCache *avatar.Cache, p *tea.Program) (*WorkspaceContext, error) {
@@ -1876,6 +1978,17 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		if err := store.Bootstrap(ctx, client); err != nil {
 			log.Printf("section store bootstrap for %s failed: %v (falling back to config sections)", token.TeamName, err)
 		} else {
+			// Slack's users.channelSections.list returns the stars section
+			// with an empty channel_ids array (it doesn't populate built-in
+			// section types). stars.list is the authoritative source for
+			// which channels the user has starred; fetch and inject so the
+			// sidebar can render the Starred header. Best-effort: on error
+			// the stars section stays empty and includeInSidebar hides it.
+			if starIDs, err := client.GetStarredChannels(ctx); err != nil {
+				log.Printf("stars.list for %s failed: %v (starred channels will be hidden)", token.TeamName, err)
+			} else if len(starIDs) > 0 {
+				store.PopulateStars(starIDs)
+			}
 			wctx.SectionStore = store
 			// One-time info log when the user has both Slack sections
 			// active AND a non-empty [sections.*] config — the latter
@@ -1989,17 +2102,27 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		debuglog.Cache("workspace_unread_bootstrap: team=%s GetUnreadCounts failed: %v", token.TeamName, ucErr)
 	}
 	wctx.ThreadsHasUnreads = threadsAgg.HasUnreads
-	if ucErr == nil && len(unreadCounts) > 0 {
+	// Boot applies an authoritative FULL snapshot: reset every channel
+	// in the workspace to read, then set the ones client.counts reports
+	// unread. This runs BEFORE the WebSocket goes live (ConnMgr.Run is
+	// started by the caller after connectWorkspace returns), so the
+	// reset cannot race an inbound *_marked event.
+	//
+	// Guard on ucErr only (not len>0): a successful call returning zero
+	// unreads legitimately means "everything is read" and must clear
+	// stale dots carried over from a prior session. A FAILED call must
+	// NOT reset — that would wipe every dot with no data to restore.
+	if ucErr == nil {
 		updates := make([]cache.ChannelReadStateUpdate, 0, len(unreadCounts))
 		for _, u := range unreadCounts {
 			updates = append(updates, cache.ChannelReadStateUpdate{
 				ChannelID:  u.ChannelID,
-				LastReadTS: u.LastRead, // may be ""; BatchUpdate preserves existing in that case
+				LastReadTS: u.LastRead, // may be ""; ReplaceWorkspaceReadState preserves existing in that case
 				HasUnread:  u.HasUnread,
 			})
 		}
-		if err := db.BatchUpdateChannelReadState(updates); err != nil {
-			log.Printf("Warning: bootstrap BatchUpdateChannelReadState for team=%s: %v", token.TeamName, err)
+		if err := db.ReplaceWorkspaceReadState(client.TeamID(), updates); err != nil {
+			log.Printf("Warning: bootstrap ReplaceWorkspaceReadState for team=%s: %v", token.TeamName, err)
 		}
 	}
 	mutedItemCount := 0
@@ -2984,7 +3107,7 @@ func searchWorkspaceFunc(router *workspaceRouter, db *cache.DB, tsFormat string)
 			}
 			return "", false
 		}
-		items := searchResultItems(res.Matches, tsFormat, time.Now(), resolveUser, resolveChannel)
+		items := searchResultItems(res.Matches, tsFormat, time.Now(), resolveUser, resolveChannel, wctx.UserGroups())
 		return ui.WorkspaceSearchResultsMsg{Query: query, Items: items, Total: res.Total}
 	}
 }
@@ -2999,7 +3122,7 @@ var userIDShapeRe = regexp.MustCompile(`^[UW][A-Z0-9]{5,}$`)
 // channel names (raw user IDs on the wire) are resolved to the
 // counterpart's display name, and thread TSes are recovered from
 // permalinks. Pure: all lookups go through the supplied resolvers.
-func searchResultItems(matches []slack.SearchMessage, tsFormat string, now time.Time, resolveUser, resolveChannel func(id string) (string, bool)) []searchresults.Item {
+func searchResultItems(matches []slack.SearchMessage, tsFormat string, now time.Time, resolveUser, resolveChannel func(id string) (string, bool), userGroups map[string]string) []searchresults.Item {
 	items := make([]searchresults.Item, 0, len(matches))
 	for _, match := range matches {
 		// ThreadTS comes from the hit's permalink. Known v1
@@ -3030,7 +3153,7 @@ func searchResultItems(matches []slack.SearchMessage, tsFormat string, now time.
 			UserName:    match.Username,
 			TS:          match.Timestamp,
 			ThreadTS:    threadTS,
-			Text:        messages.FlattenMrkdwn(match.Text, resolveUser, resolveChannel),
+			Text:        messages.FlattenMrkdwnWithUserGroups(match.Text, resolveUser, resolveChannel, userGroups),
 			Timestamp:   formatSearchTimestamp(match.Timestamp, tsFormat, now),
 			IsDM:        isDM,
 		})
@@ -3103,17 +3226,22 @@ func xdgCache() string {
 
 // bootstrapPresenceAndDND fetches the user's current presence and DND
 // state from Slack, populates the WorkspaceContext, and sends an initial
-// StatusChangeMsg. Also subscribes to presence_change events for the
-// self user so external state changes arrive over the WS.
+// StatusChangeMsg. Also subscribes to presence_change events for the self
+// user and every DM peer so external state changes arrive over the WS.
 func bootstrapPresenceAndDND(ctx context.Context, wctx *WorkspaceContext, program *tea.Program) {
 	if wctx == nil || wctx.Client == nil {
 		return
 	}
 
-	// Subscribe so future presence_change events for our own user arrive.
-	// Failure is non-fatal — manual_presence_change and dnd_updated work
-	// without an explicit subscription.
-	_ = wctx.Client.SubscribePresence([]string{wctx.UserID})
+	// Subscribe to presence for our own user plus every 1:1 DM peer so the
+	// sidebar can show who is online. presence_sub REPLACES the prior
+	// subscription set, so self and peers must go in one call. Failure is
+	// non-fatal — manual_presence_change and dnd_updated work without it.
+	//
+	// This runs from OnConnect, which fires on the initial connect AND on
+	// every reconnect. Re-subscribing per connection is required because
+	// the subscription is connection-scoped.
+	subscribeWorkspacePresence(wctx)
 
 	// Initial presence fetch
 	if p, err := wctx.Client.GetUserPresence(ctx, wctx.UserID); err == nil && p != nil {
@@ -3156,6 +3284,58 @@ func bootstrapPresenceAndDND(ctx context.Context, wctx *WorkspaceContext, progra
 			DNDEndTS:   wctx.DNDEndTS,
 		})
 	}
+}
+
+// subscribeWorkspacePresence subscribes over the WebSocket to presence
+// updates for the authenticated user plus every 1:1 DM peer, so the
+// sidebar can show who is online. Slack's presence_sub REPLACES the prior
+// subscription set and is connection-scoped, so this sends self + all DM
+// peers in a single call and must be re-run on each (re)connect.
+//
+// Note: the WS is opened with no_query_on_subscribe=1, so Slack does not
+// reply with each peer's current presence at subscribe time — DM rows are
+// seeded from the local cache at build time and then updated live by
+// presence_change events. Safe to call repeatedly.
+func subscribeWorkspacePresence(wctx *WorkspaceContext) {
+	if wctx == nil || wctx.Client == nil {
+		return
+	}
+	ids := workspacePresenceIDs(wctx)
+	if len(ids) == 0 {
+		debuglog.General("subscribeWorkspacePresence: no ids to subscribe")
+		return
+	}
+	if err := wctx.Client.SubscribePresence(ids); err != nil {
+		debuglog.General("subscribeWorkspacePresence (%d ids) FAILED: %v", len(ids), err)
+		return
+	}
+	debuglog.General("subscribeWorkspacePresence: sent presence_sub for %d ids (self+%d dm peers)", len(ids), len(ids)-1)
+}
+
+// workspacePresenceIDs returns the deduped list of user IDs to subscribe
+// for presence: the authenticated user plus every 1:1 DM peer. Group DMs
+// and app/bot DMs (which carry no human presence dot in the sidebar) are
+// skipped. Pure function for testability.
+func workspacePresenceIDs(wctx *WorkspaceContext) []string {
+	seen := make(map[string]struct{})
+	ids := make([]string, 0, len(wctx.Channels)+1)
+	add := func(uid string) {
+		if uid == "" {
+			return
+		}
+		if _, ok := seen[uid]; ok {
+			return
+		}
+		seen[uid] = struct{}{}
+		ids = append(ids, uid)
+	}
+	add(wctx.UserID) // self — keeps the self presence subscription intact
+	for _, ch := range wctx.Channels {
+		if ch.Type == "dm" {
+			add(ch.DMUserID)
+		}
+	}
+	return ids
 }
 
 // mostRecentlyVisitedChannel returns the channel ID with the latest
@@ -3295,7 +3475,11 @@ func (h *rtmEventHandler) OnMessage(channelID, userID, ts, text, threadTS, subty
 			if chType == "dm" || chType == "group_dm" {
 				title = h.workspaceName + ": " + senderName
 			}
-			body := senderName + ": " + notify.StripSlackMarkup(text, h.userNames)
+			var groupNames map[string]string
+			if h.wsCtx != nil {
+				groupNames = h.wsCtx.UserGroups()
+			}
+			body := senderName + ": " + notify.StripSlackMarkupWithUserGroups(text, h.userNames, groupNames)
 			go func() {
 				if err := h.notifier.Notify(title, body); err != nil {
 					debuglog.Notify("notification failed: %v", err)

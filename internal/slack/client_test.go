@@ -150,6 +150,14 @@ type mockSlackAPI struct {
 	getUsersInConversationContextFn func(ctx context.Context, params *slack.GetUsersInConversationParameters) ([]string, string, error)
 	openConversationContextFn       func(ctx context.Context, params *slack.OpenConversationParameters) (*slack.Channel, bool, bool, error)
 	searchMessagesFn                func(ctx context.Context, query string, params slack.SearchParameters) (*slack.SearchMessages, error)
+	getUserGroupsContextFn          func(ctx context.Context, options ...slack.GetUserGroupsOption) ([]slack.UserGroup, error)
+}
+
+func (m *mockSlackAPI) GetUserGroupsContext(ctx context.Context, options ...slack.GetUserGroupsOption) ([]slack.UserGroup, error) {
+	if m.getUserGroupsContextFn != nil {
+		return m.getUserGroupsContextFn(ctx, options...)
+	}
+	return nil, nil
 }
 
 func (m *mockSlackAPI) SearchMessagesContext(ctx context.Context, query string, params slack.SearchParameters) (*slack.SearchMessages, error) {
@@ -1048,6 +1056,71 @@ func TestGetChannelSections_UsesAPIBaseURL(t *testing.T) {
 	}
 	if len(s.ChannelIDs) != 2 || s.ChannelIDs[0] != "C1" || s.ChannelIDs[1] != "C2" {
 		t.Errorf("ChannelIDs = %v", s.ChannelIDs)
+	}
+}
+
+// TestGetStarredChannels_ParsesItems verifies GetStarredChannels extracts
+// channel-typed starred items from stars.list. Slack's channelSections.list
+// returns the stars section with an empty channel_ids array; stars.list is
+// the authoritative source for which channels the user has starred.
+func TestGetStarredChannels_ParsesItems(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"ok": true,
+			"items": [
+				{"type": "channel", "channel": "C1", "date_create": 1700000001},
+				{"type": "channel", "channel": "C2", "date_create": 1700000002},
+				{"type": "message", "channel": "C9", "message": {"ts": "1.1"}, "date_create": 1700000003},
+				{"type": "im", "channel": "D1", "date_create": 1700000004}
+			],
+			"paging": {"count": 4, "total": 4}
+		}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{
+		token:      "xoxc-test",
+		cookie:     "d-cookie",
+		apiBaseURL: srv.URL + "/api/",
+	}
+	got, err := c.GetStarredChannels(context.Background())
+	if err != nil {
+		t.Fatalf("GetStarredChannels: %v", err)
+	}
+	if gotPath != "/api/stars.list" {
+		t.Errorf("path = %q, want %q", gotPath, "/api/stars.list")
+	}
+	// Only type=="channel" items count; message/im stars are not sidebar channels.
+	want := []string{"C1", "C2"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("[%d] = %q, want %q", i, got[i], w)
+		}
+	}
+}
+
+// TestGetStarredChannels_APIError verifies the client surfaces Slack's
+// ok=false responses as errors rather than returning an empty list silently.
+func TestGetStarredChannels_APIError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok": false, "error": "not_authed"}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{
+		token:      "xoxc-test",
+		cookie:     "d-cookie",
+		apiBaseURL: srv.URL + "/api/",
+	}
+	if _, err := c.GetStarredChannels(context.Background()); err == nil {
+		t.Errorf("expected error on ok=false response")
 	}
 }
 

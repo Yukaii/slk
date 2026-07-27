@@ -148,12 +148,12 @@ glob mode). In Slack-native mode, channel order within a section
 comes from Slack and the `:<N>` suffix is ignored along with the
 rest of the `[sections.*]` block.
 
-### v1 limitations of Slack-native sections
+### Limitations of Slack-native sections
 
-v1 is read-only — section editing still happens in the official client; slk
-reflects the results. Sections of type `stars`, `slack_connect`,
-`salesforce_records`, and `agents` are hidden (matching the official
-client's filtering). Sections with more than 10 channels may be returned
+Slack-native sections are read-only — section editing still happens in the official client; slk
+reflects the results. The `stars` section type (Slack's "Starred" feature) is rendered
+when non-empty, with the header `Starred`. Sections of type `slack_connect`,
+`salesforce_records`, and `agents` are hidden. Sections with more than 10 channels may be returned
 only partially by Slack's API on initial load; the missing channels
 temporarily fall into the catch-all bucket and migrate into their correct
 section as WebSocket events fire or the workspace reconnects. A debug-log

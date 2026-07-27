@@ -228,6 +228,10 @@ func (db *DB) migrate() error {
 		"ALTER TABLE users ADD COLUMN is_external INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
+	if err := db.addColumnIfMissing("thread_subscriptions", "latest_reply",
+		"ALTER TABLE thread_subscriptions ADD COLUMN latest_reply TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 
 	// Full-text search index. FTS5 may be unavailable in unusual
 	// driver builds; search degrades to LIKE rather than failing

@@ -223,6 +223,87 @@ func TestListSubscribedThreads_UnreadUsesPerThreadLastRead(t *testing.T) {
 	}
 }
 
+func TestListSubscribedThreads_UnreadFromLatestReplyWithoutCachedReplies(t *testing.T) {
+	const selfID = "U1"
+	db := setupDBWithWorkspace(t)
+	if err := db.UpsertChannel(Channel{ID: "C1", WorkspaceID: "T1", Name: "general", Type: "channel"}); err != nil {
+		t.Fatalf("UpsertChannel: %v", err)
+	}
+	// Authoritative snapshot from subscriptions.thread.getView: the
+	// server reports a latest_reply at ...200 newer than our per-thread
+	// last_read ...150, but NO replies are cached locally (the boot
+	// case). The thread must still render unread — the old heuristic
+	// wrongly showed it read because MAX(cached reply ts) was empty.
+	fresh := []ThreadSubscription{{
+		WorkspaceID: "T1", ChannelID: "C1", ThreadTS: "1700000100.000000",
+		LastRead: "1700000150.000000", LatestReply: "1700000200.000000", Active: true,
+	}}
+	if err := db.ReconcileThreadSubscriptions("T1", fresh); err != nil {
+		t.Fatalf("ReconcileThreadSubscriptions: %v", err)
+	}
+
+	got, err := db.ListSubscribedThreads("T1", selfID)
+	if err != nil {
+		t.Fatalf("ListSubscribedThreads: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1, got %d", len(got))
+	}
+	if !got[0].Unread {
+		t.Fatalf("expected Unread=true from authoritative latest_reply > last_read with no cached replies")
+	}
+}
+
+func TestListSubscribedThreads_ReadWhenLatestReplyNotNewerThanLastRead(t *testing.T) {
+	const selfID = "U1"
+	db := setupDBWithWorkspace(t)
+	if err := db.UpsertChannel(Channel{ID: "C1", WorkspaceID: "T1", Name: "general", Type: "channel"}); err != nil {
+		t.Fatalf("UpsertChannel: %v", err)
+	}
+	// Server reports latest_reply == last_read: the user has read the
+	// whole thread. No cached replies. Must render read.
+	fresh := []ThreadSubscription{{
+		WorkspaceID: "T1", ChannelID: "C1", ThreadTS: "1700000100.000000",
+		LastRead: "1700000200.000000", LatestReply: "1700000200.000000", Active: true,
+	}}
+	if err := db.ReconcileThreadSubscriptions("T1", fresh); err != nil {
+		t.Fatalf("ReconcileThreadSubscriptions: %v", err)
+	}
+
+	got, err := db.ListSubscribedThreads("T1", selfID)
+	if err != nil {
+		t.Fatalf("ListSubscribedThreads: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1, got %d", len(got))
+	}
+	if got[0].Unread {
+		t.Fatalf("expected Unread=false when latest_reply == last_read")
+	}
+}
+
+func TestReconcileThreadSubscriptions_PersistsLatestReply(t *testing.T) {
+	db := setupDBWithWorkspace(t)
+	defer db.Close()
+	fresh := []ThreadSubscription{{
+		WorkspaceID: "T1", ChannelID: "C1", ThreadTS: "1700000100.000000",
+		LastRead: "1700000150.000000", LatestReply: "1700000200.000000", Active: true,
+	}}
+	if err := db.ReconcileThreadSubscriptions("T1", fresh); err != nil {
+		t.Fatalf("ReconcileThreadSubscriptions: %v", err)
+	}
+	var latestReply string
+	if err := db.conn.QueryRow(
+		`SELECT latest_reply FROM thread_subscriptions WHERE workspace_id=? AND channel_id=? AND thread_ts=?`,
+		"T1", "C1", "1700000100.000000",
+	).Scan(&latestReply); err != nil {
+		t.Fatalf("query latest_reply: %v", err)
+	}
+	if latestReply != "1700000200.000000" {
+		t.Errorf("latest_reply = %q, want %q", latestReply, "1700000200.000000")
+	}
+}
+
 func TestListSubscribedThreads_ParentMissingShowsEmpty(t *testing.T) {
 	const selfID = "U1"
 	db := setupDBWithWorkspace(t)

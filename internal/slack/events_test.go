@@ -228,6 +228,25 @@ func TestDispatchWebSocketPresenceChangeEvent(t *testing.T) {
 	}
 }
 
+func TestDispatchWebSocketPresenceChangeBatch(t *testing.T) {
+	handler := &mockEventHandler{}
+
+	// batch_presence_aware connections deliver a "users" array sharing one
+	// presence value instead of a single "user" — each must be dispatched.
+	data := []byte(`{"type":"presence_change","users":["U1","U2","U3"],"presence":"away"}`)
+	dispatchWebSocketEvent(data, handler)
+
+	want := []string{"U1:away", "U2:away", "U3:away"}
+	if len(handler.presenceChanges) != len(want) {
+		t.Fatalf("expected %d presence changes, got %d (%v)", len(want), len(handler.presenceChanges), handler.presenceChanges)
+	}
+	for i, w := range want {
+		if handler.presenceChanges[i] != w {
+			t.Errorf("presenceChanges[%d] = %q, want %q", i, handler.presenceChanges[i], w)
+		}
+	}
+}
+
 func TestDispatchWebSocketMessageDeletedEvent(t *testing.T) {
 	handler := &mockEventHandler{}
 

@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/gammons/slk/internal/usergroups"
 	"github.com/gen2brain/beeep"
 )
 
@@ -113,7 +114,10 @@ func ShouldNotify(ctx NotifyContext, channelID, userID, text, channelType string
 var (
 	userMentionRe    = regexp.MustCompile(`<@([A-Z0-9]+)>`)
 	channelMentionRe = regexp.MustCompile(`<#[A-Z0-9]+\|([^>]+)>`)
-	subteamMentionRe = regexp.MustCompile(`<!subteam\^[A-Z0-9]+\|([^>]+)>`)
+	// Group 1 is the ID; group 2 the optional embedded label. Labeled
+	// forms are normalized to "@label"; bare forms resolve through the
+	// caller's workspace-scoped usergroup map.
+	subteamMentionRe = regexp.MustCompile(`<!subteam\^([A-Z0-9]+)(?:\|([^>]+))?>`)
 	broadcastRe      = regexp.MustCompile(`<!(here|channel|everyone)>`)
 	// Match both http(s) URLs and mailto: addresses; Slack
 	// auto-linkifies typed emails into <mailto:X|X>. Bare-link
@@ -129,6 +133,12 @@ var (
 // a user ID is missing from the map (or the map is nil) the raw user ID is
 // used as a fallback. Output is truncated to 100 characters with "..." suffix.
 func StripSlackMarkup(text string, userNames map[string]string) string {
+	return StripSlackMarkupWithUserGroups(text, userNames, nil)
+}
+
+// StripSlackMarkupWithUserGroups is StripSlackMarkup with a workspace-scoped
+// Slack usergroup map for resolving bare <!subteam^SID> tokens.
+func StripSlackMarkupWithUserGroups(text string, userNames map[string]string, userGroups map[string]string) string {
 	text = channelMentionRe.ReplaceAllString(text, "#$1")
 	text = linkWithLabelRe.ReplaceAllString(text, "$2")
 	// Bare links: drop the mailto: scheme so notification bodies read
@@ -137,7 +147,10 @@ func StripSlackMarkup(text string, userNames map[string]string) string {
 		url := linkBareRe.FindStringSubmatch(match)[1]
 		return strings.TrimPrefix(url, "mailto:")
 	})
-	text = subteamMentionRe.ReplaceAllString(text, "$1")
+	text = subteamMentionRe.ReplaceAllStringFunc(text, func(match string) string {
+		groups := subteamMentionRe.FindStringSubmatch(match)
+		return usergroups.Display(userGroups, groups[1], groups[2])
+	})
 	text = broadcastRe.ReplaceAllString(text, "@$1")
 	text = userMentionRe.ReplaceAllStringFunc(text, func(match string) string {
 		userID := userMentionRe.FindStringSubmatch(match)[1]

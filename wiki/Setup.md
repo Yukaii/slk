@@ -1,33 +1,15 @@
 # Setup
 
-slk uses your existing Slack browser session — no Slack App, no admin
-approval, no OAuth flow. You'll need two things from the browser: your
-`xoxc` token and the `d` cookie.
+slk reads your session directly from the **Slack desktop app** — no Slack App,
+no admin approval, no OAuth flow, and no tokens to copy. The only requirement is
+that the Slack desktop app is installed and you're signed in to it.
 
-## 1. Log into Slack in your browser
+## 1. Sign in to the Slack desktop app
 
-Open [https://app.slack.com](https://app.slack.com) and sign into your
-workspace. Use the browser version of Slack (not the desktop app).
+Install the Slack desktop app if you haven't already, and sign in to each
+workspace you want to use in slk.
 
-## 2. Grab your browser tokens
-
-### The `d` cookie
-
-- Open DevTools (F12 / Cmd+Option+I)
-- Go to **Application → Cookies → `https://app.slack.com`**
-- Copy the value of the cookie named `d`
-
-### The `xoxc` token
-
-In the DevTools **Console**, run:
-
-```javascript
-Object.entries(JSON.parse(localStorage.localConfig_v2).teams).forEach(([id,t]) => console.log(t.name, t.token))
-```
-
-Copy the `xoxc-…` token for the workspace you want.
-
-## 3. Add the workspace
+## 2. Add your workspaces
 
 ```bash
 slk --add-workspace
@@ -35,6 +17,10 @@ slk --add-workspace
 
 Or just run `slk`. Onboarding launches automatically when no workspaces are
 configured.
+
+slk detects the workspaces you're signed in to in the desktop app and shows
+them in a list. Select the ones you want (all are selected by default) and
+you're done.
 
 ## Removing a workspace
 
@@ -55,6 +41,10 @@ and per-workspace settings in [[Configuration]].
 
 ## Token expiry
 
-Browser-cookie tokens expire when you log out of the browser or Slack
-rotates them. Re-run `slk --add-workspace` and you're back in business.
-See the auth caveat in [[Tradeoffs and Non-Goals|Tradeoffs-and-Non-Goals]].
+You don't need to do anything when a token expires. slk re-mints tokens
+automatically from the Slack desktop app on each launch (and mid-session if
+needed), so sessions stay fresh on their own.
+
+If you ever sign out of the desktop app, just sign back in — slk will pick the
+session back up the next time it needs to re-mint. See the auth caveat in
+[[Tradeoffs and Non-Goals|Tradeoffs-and-Non-Goals]].

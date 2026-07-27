@@ -83,6 +83,70 @@ func (db *DB) BatchUpdateChannelReadState(updates []ChannelReadStateUpdate) erro
 	return nil
 }
 
+// ReplaceWorkspaceReadState applies an authoritative full snapshot of
+// unread state for a workspace. In a single transaction it first
+// resets has_unread=0 for EVERY channel in the workspace, then applies
+// the given updates (has_unread + last_read_ts). Channels absent from
+// updates are therefore treated as read.
+//
+// This is the boot/bootstrap path. Unlike BatchUpdateChannelReadState
+// (which only touches rows named in the batch), the reset step clears
+// stale unread flags for channels the user read in another client
+// while slk was closed — channels that Slack's client.counts response
+// omits entirely (the unread-counts endpoint need not list read
+// channels). last_read_ts of an absent channel is left untouched:
+// there is no fresh value to apply and has_unread=0 already suppresses
+// the dot.
+//
+// Callers MUST only invoke this with a snapshot they trust to list
+// every currently-unread channel (i.e. a successful client.counts
+// call). On fetch failure, do NOT call this — a reset with no data
+// would wrongly clear every dot.
+func (db *DB) ReplaceWorkspaceReadState(workspaceID string, updates []ChannelReadStateUpdate) error {
+	if workspaceID == "" {
+		return fmt.Errorf("ReplaceWorkspaceReadState: workspaceID required")
+	}
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("begin replace read-state tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := tx.Exec(
+		`UPDATE channels SET has_unread = 0 WHERE workspace_id = ?`,
+		workspaceID,
+	); err != nil {
+		return fmt.Errorf("reset workspace unread: %w", err)
+	}
+
+	stmtBoth, err := tx.Prepare(`UPDATE channels SET last_read_ts = ?, has_unread = ? WHERE id = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare both: %w", err)
+	}
+	defer stmtBoth.Close()
+	stmtFlag, err := tx.Prepare(`UPDATE channels SET has_unread = ? WHERE id = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare flag: %w", err)
+	}
+	defer stmtFlag.Close()
+
+	for _, u := range updates {
+		if u.LastReadTS == "" {
+			if _, err := stmtFlag.Exec(boolToInt(u.HasUnread), u.ChannelID); err != nil {
+				return fmt.Errorf("replace flag for %s: %w", u.ChannelID, err)
+			}
+		} else {
+			if _, err := stmtBoth.Exec(u.LastReadTS, boolToInt(u.HasUnread), u.ChannelID); err != nil {
+				return fmt.Errorf("replace both for %s: %w", u.ChannelID, err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit replace read-state: %w", err)
+	}
+	return nil
+}
+
 // GetChannelReadState returns the read state for a single channel.
 // A missing row yields a zero-valued ReadState and a nil error.
 func (db *DB) GetChannelReadState(channelID string) (ReadState, error) {

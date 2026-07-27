@@ -366,6 +366,10 @@ func (b *backfiller) runSubscriptionPhase(ctx context.Context) error {
 			ChannelID:   v.Subscription.ChannelID,
 			ThreadTS:    v.Subscription.ThreadTS,
 			LastRead:    v.Subscription.LastRead,
+			// Authoritative newest-reply watermark from the getView
+			// root_msg. Lets the threads view compute unread state
+			// without the thread's replies being cached locally.
+			LatestReply: v.RootMessage.LatestReply,
 			Active:      true,
 		})
 	}
@@ -410,22 +414,48 @@ func (b *backfiller) runSubscriptionPhase(ctx context.Context) error {
 	return nil
 }
 
-// run executes the full backfill pass: channel phase, thread phase,
-// subscription phase, then a ThreadsListDirtyMsg dispatch so the UI
-// re-queries the threads view from the now-current cache. Phase
-// errors are logged but do not abort subsequent work — best-effort
-// overall.
+// run executes the full backfill pass. The subscription phase runs
+// CONCURRENTLY with the channel→thread history phases because it is the
+// authoritative source for the Threads view and has no dependency on
+// the (potentially multi-second) history backfill. It fires a
+// ThreadsListDirtyMsg the moment it lands so the Threads view shows
+// correct unread state within ~1s of connect instead of after the whole
+// backfill — or never, if the user quits mid-backfill (the bug this
+// ordering fixes). A final ThreadsListDirtyMsg after the thread phase
+// picks up any replies it cached that post-date the getView snapshot.
+//
+// The channel→thread phases stay ordered relative to each other
+// (runThreadPhase consumes discoveredThreads from runChannelPhase).
+// Phase errors are logged but do not abort sibling work — best-effort.
 func (b *backfiller) run(ctx context.Context) error {
 	start := time.Now()
+
+	var subWG sync.WaitGroup
+	subWG.Add(1)
+	go func() {
+		defer subWG.Done()
+		if err := b.runSubscriptionPhase(ctx); err != nil {
+			debuglog.Backfill("team=%s subscription-phase err=%v", b.workspaceID, err)
+			return
+		}
+		// Early refresh: authoritative thread-unread state is ready,
+		// don't wait for the channel-history backfill.
+		if b.program != nil {
+			b.program.Send(ui.ThreadsListDirtyMsg{TeamID: b.workspaceID})
+		}
+	}()
+
 	if err := b.runChannelPhase(ctx); err != nil {
 		debuglog.Backfill("team=%s channel-phase err=%v", b.workspaceID, err)
 	}
 	if err := b.runThreadPhase(ctx); err != nil {
 		debuglog.Backfill("team=%s thread-phase err=%v", b.workspaceID, err)
 	}
-	if err := b.runSubscriptionPhase(ctx); err != nil {
-		debuglog.Backfill("team=%s subscription-phase err=%v", b.workspaceID, err)
-	}
+
+	// run() completing must still mean "all catch-up work is done" —
+	// callers and tests depend on that. Wait for the subscription phase.
+	subWG.Wait()
+
 	if b.program != nil {
 		b.program.Send(ui.ThreadsListDirtyMsg{TeamID: b.workspaceID})
 	}

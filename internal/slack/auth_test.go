@@ -59,3 +59,19 @@ func TestListTokens(t *testing.T) {
 		t.Errorf("expected 2 tokens, got %d", len(tokens))
 	}
 }
+
+func TestTokenRoundTripIncludesDomain(t *testing.T) {
+	dir := t.TempDir()
+	s := NewTokenStore(dir)
+	in := Token{AccessToken: "xoxc-1", Cookie: "xoxd-1", Domain: "acme", TeamID: "T1", TeamName: "Acme"}
+	if err := s.Save(in); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Load("T1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Domain != "acme" {
+		t.Errorf("Domain = %q, want acme", got.Domain)
+	}
+}
