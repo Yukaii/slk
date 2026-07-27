@@ -249,6 +249,7 @@ type (
 		ExternalUsers map[string]bool
 		UserID        string
 		CustomEmoji   map[string]string
+		UserGroups    map[string]string
 		// SectionsProvider supplies Slack-native sidebar sections for this
 		// workspace. Nil means "use config-glob behavior" (the App's
 		// sidebar reverts to its existing name-keyed buckets).
@@ -313,6 +314,7 @@ type (
 		ExternalUsers map[string]bool
 		UserID        string
 		CustomEmoji   map[string]string
+		UserGroups    map[string]string
 		// SectionsProvider supplies Slack-native sidebar sections for this
 		// workspace. Nil means "use config-glob behavior" (the App's
 		// sidebar reverts to its existing name-keyed buckets).
@@ -339,6 +341,13 @@ type (
 	CustomEmojisLoadedMsg struct {
 		TeamID      string
 		CustomEmoji map[string]string
+	}
+	// UserGroupsLoadedMsg is sent when a workspace's usergroups.list
+	// fetch finishes in the background. App refreshes render caches and
+	// compose mention entries only when TeamID matches the active workspace.
+	UserGroupsLoadedMsg struct {
+		TeamID     string
+		UserGroups map[string]string
 	}
 	WorkspaceFailedMsg struct {
 		TeamName string

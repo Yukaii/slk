@@ -16,6 +16,7 @@ import (
 	"github.com/gammons/slk/internal/cache"
 	"github.com/gammons/slk/internal/ui/messages"
 	"github.com/gammons/slk/internal/ui/styles"
+	"github.com/gammons/slk/internal/usergroups"
 	"github.com/muesli/reflow/truncate"
 )
 
@@ -82,10 +83,11 @@ func borderFillStyle() lipgloss.Style {
 
 // Model holds the threads-list state.
 type Model struct {
-	summaries  []cache.ThreadSummary
+	summaries    []cache.ThreadSummary
 	userNames    map[string]string
 	channelNames map[string]string
-	selfUserID string
+	userGroups   map[string]string
+	selfUserID   string
 
 	selected int
 	yOffset  int
@@ -175,6 +177,21 @@ func (m *Model) SetChannelNames(names map[string]string) {
 		return
 	}
 	m.channelNames = names
+	m.dirty()
+}
+
+// SetUserGroups sets the workspace-scoped usergroup ID -> handle map used
+// to resolve bare <!subteam^SID> mentions in thread previews. No-op when
+// the new map matches the current one.
+func (m *Model) SetUserGroups(groups map[string]string) {
+	if usergroups.Equal(m.userGroups, groups) {
+		return
+	}
+	copied := usergroups.Copy(groups)
+	if copied == nil {
+		copied = map[string]string{}
+	}
+	m.userGroups = copied
 	m.dirty()
 }
 
@@ -640,7 +657,11 @@ func (m *Model) renderCard(s cache.ThreadSummary, width int, selected bool) []st
 	if s.ParentText == "" && s.ParentUserID == "" {
 		previewBody = mutedStyle().Render("(parent not loaded)")
 	} else {
-		preview := messages.RenderSlackMarkdown(s.ParentText, m.userNames, m.channelNames)
+		preview := messages.RenderSlackMarkdownWith(s.ParentText, messages.RenderSlackMarkdownOpts{
+			UserNames:    m.userNames,
+			ChannelNames: m.channelNames,
+			UserGroups:   m.userGroups,
+		})
 		preview = strings.ReplaceAll(preview, "\n", " ")
 		previewMax := contentWidth - 4
 		if previewMax < 0 {
