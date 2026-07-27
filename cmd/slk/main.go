@@ -30,6 +30,7 @@ import (
 	"github.com/gammons/slk/internal/service"
 	slackclient "github.com/gammons/slk/internal/slack"
 	"github.com/gammons/slk/internal/slack/membership"
+	"github.com/gammons/slk/internal/slackdesktop"
 	"github.com/gammons/slk/internal/slackhttp"
 	"github.com/gammons/slk/internal/slackurl"
 	"github.com/gammons/slk/internal/text"
@@ -605,6 +606,15 @@ func run() error {
 			return fmt.Errorf("no workspaces configured after onboarding")
 		}
 	}
+
+	// Re-mint tokens from the live desktop cookie so every launch starts
+	// with fresh xoxc tokens (they expire; the desktop cookie is the source
+	// of truth). Falls back to cached tokens when offline / desktop absent.
+	tokens = remintTokens(context.Background(), tokens,
+		slackdesktop.Cookie,
+		slackclient.MintToken,
+		tokenStore.Save,
+	)
 
 	// Initialize services
 	wsMgr := service.NewWorkspaceManager(db)

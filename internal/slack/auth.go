@@ -15,6 +15,7 @@ import (
 type Token struct {
 	AccessToken string `json:"access_token"` // xoxc-... token
 	Cookie      string `json:"cookie"`       // d cookie value
+	Domain      string `json:"domain"`       // workspace subdomain (to re-mint)
 	TeamID      string `json:"team_id"`
 	TeamName    string `json:"team_name"`
 }
