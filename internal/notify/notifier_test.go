@@ -1,6 +1,8 @@
 package notify
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -152,6 +154,21 @@ func TestShouldNotify_SuppressedByDND(t *testing.T) {
 	}
 }
 
+func TestShouldNotify_SuppressedByMute(t *testing.T) {
+	ctx := NotifyContext{
+		CurrentUserID:   "U1",
+		ActiveChannelID: "C_OTHER",
+		IsActiveWS:      false, // would otherwise notify
+		OnDM:            true,
+		OnMention:       true,
+		OnKeyword:       []string{"deploy"},
+		IsMuted:         true,
+	}
+	if ShouldNotify(ctx, "C1", "U2", "hey <@U1> deploy", "dm") {
+		t.Error("a muted conversation should suppress notifications regardless of triggers")
+	}
+}
+
 func TestStripSlackMarkup(t *testing.T) {
 	userNames := map[string]string{
 		"U123": "Alice",
@@ -208,5 +225,53 @@ func TestStripSlackMarkup_Truncation(t *testing.T) {
 	}
 	if result[len(result)-3:] != "..." {
 		t.Error("expected ... suffix")
+	}
+}
+
+func TestNotify_RunsNotifyCommand(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "out")
+	n := New(true, "printf '%s\\n%s' \"$SLK_TITLE\" \"$SLK_BODY\" >"+out)
+	if err := n.Notify("the title", "the body"); err != nil {
+		t.Fatalf("Notify returned error: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("reading notify_command output: %v", err)
+	}
+	if want := "the title\nthe body"; string(got) != want {
+		t.Errorf("notify_command received %q, want %q", got, want)
+	}
+}
+
+func TestNotify_DisabledSkipsCommand(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "out")
+	n := New(false, "touch "+out)
+	if err := n.Notify("t", "b"); err != nil {
+		t.Fatalf("Notify returned error: %v", err)
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Error("disabled notifier must not run notify_command")
+	}
+}
+
+// Title/body reach the command through the environment, never interpolated into
+// the command string, so a message body cannot inject a second shell command.
+func TestNotify_CommandBodyIsNotInjected(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out")
+	pwned := filepath.Join(dir, "pwned")
+	n := New(true, "printf '%s' \"$SLK_BODY\" >"+out)
+	if err := n.Notify("title", "; touch "+pwned); err != nil {
+		t.Fatalf("Notify returned error: %v", err)
+	}
+	if _, err := os.Stat(pwned); !os.IsNotExist(err) {
+		t.Error("message body was able to inject a shell command")
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("reading notify_command output: %v", err)
+	}
+	if want := "; touch " + pwned; string(got) != want {
+		t.Errorf("body not passed literally: got %q, want %q", got, want)
 	}
 }

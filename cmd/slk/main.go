@@ -580,7 +580,7 @@ func run() error {
 	// the active TeamID up front (workspaces connect in goroutines).
 	styles.Apply(cfg.Appearance.Theme, cfg.Theme)
 
-	notifier := notify.New(cfg.Notifications.Enabled)
+	notifier := notify.New(cfg.Notifications.Enabled, cfg.Notifications.NotifyCommand)
 
 	// Initialize the OS clipboard for paste-to-upload.
 	//
@@ -655,6 +655,13 @@ func run() error {
 	app := ui.NewApp()
 	app.SetHelpFooter(versionpkg.ModalFooter(version))
 	app.SetClipboardAvailable(clipboardOK)
+	if sr := notify.NewStatusReporter(cfg.Notifications.StatusCommand); sr != nil {
+		// Enqueue never blocks a render: it hands the state to the reporter's
+		// single worker, which serializes runs and coalesces bursts so the
+		// external surface can't end up pinned to a stale count by an
+		// out-of-order subprocess.
+		app.SetStatusReporter(sr.Enqueue)
+	}
 	if useWaylandClipboard {
 		app.SetClipboardReader(ui.WaylandClipboardReader())
 	}
@@ -3449,6 +3456,7 @@ func (h *rtmEventHandler) OnMessage(channelID, userID, ts, text, threadTS, subty
 			OnDM:            h.notifyCfg.OnDM,
 			OnKeyword:       h.notifyCfg.OnKeyword,
 			IsDND:           h.wsCtx != nil && h.wsCtx.DNDEnabled && (h.wsCtx.DNDEndTS.IsZero() || time.Now().Before(h.wsCtx.DNDEndTS)),
+			IsMuted:         h.wsCtx != nil && h.wsCtx.MuteStore != nil && h.wsCtx.MuteStore.IsMuted(channelID),
 		}
 		chType := h.channelTypes[channelID]
 		// Pass the raw userID (not authorID): ShouldNotify's self-message
@@ -3472,7 +3480,11 @@ func (h *rtmEventHandler) OnMessage(channelID, userID, ts, text, threadTS, subty
 				groupNames = h.wsCtx.UserGroups()
 			}
 			body := senderName + ": " + notify.StripSlackMarkupWithUserGroups(text, h.userNames, groupNames)
-			go h.notifier.Notify(title, body)
+			go func() {
+				if err := h.notifier.Notify(title, body); err != nil {
+					debuglog.Notify("notification failed: %v", err)
+				}
+			}()
 		}
 	}
 

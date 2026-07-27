@@ -131,3 +131,9 @@ type clipboardWriter func(format clipboard.Format, data []byte) <-chan struct{}
 // defaultClipboardWriter is the real clipboard write function. It's
 // overridable per-App via SetClipboardWriter for tests.
 var defaultClipboardWriter clipboardWriter = clipboard.Write
+
+// StatusReportFunc mirrors slk's unread state onto an external surface. It is
+// called by notifyReadStateChanged on every read-state change with the
+// active-workspace unread count, the other-workspace unread count, the active
+// workspace name, and the window-title string. See notifications.status_command.
+type StatusReportFunc func(unread, otherUnread int, workspace, title string)
