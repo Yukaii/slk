@@ -324,7 +324,7 @@ func handleNormalMode(a *App, msg tea.KeyMsg) tea.Cmd {
 func (a *App) jumpToUnread(dir int) tea.Cmd {
 	id, name, chType, ok := a.sidebar.NextUnread(a.activeChannelID, dir)
 	if !ok {
-		return toastWithClear(a, "No unread channels", 2*time.Second)
+		return toastWithClear(a, "No other unread channels", 2*time.Second)
 	}
 	a.sidebar.SelectByID(id)
 	return func() tea.Msg {
