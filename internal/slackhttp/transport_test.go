@@ -1,6 +1,8 @@
 package slackhttp
 
 import (
+	"bytes"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -19,8 +21,30 @@ type captureRT struct {
 
 func (c *captureRT) RoundTrip(req *http.Request) (*http.Response, error) {
 	c.last = req.Clone(req.Context())
-	return c.wrapped.RoundTrip(req)
+	if req.Body == nil {
+		return c.wrapped.RoundTrip(req)
+	}
+	// Request.Clone shares Body — it is a one-shot reader, and the
+	// wrapped transport drains it. Buffer it so c.last still carries
+	// what was actually sent, and hand the wrapped transport an
+	// equivalent reader. ContentLength and GetBody on c.last are left
+	// exactly as the transport under test set them.
+	raw, err := io.ReadAll(req.Body)
+	req.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	c.last.Body = io.NopCloser(bytes.NewReader(raw))
+	fwd := req.Clone(req.Context())
+	fwd.Body = io.NopCloser(bytes.NewReader(raw))
+	return c.wrapped.RoundTrip(fwd)
 }
+
+// roundTripFunc is a minimal inner transport for tests that must call
+// BrowserTransport.RoundTrip directly, bypassing http.Client.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
 func newCaptureClient(t *testing.T, srv *httptest.Server) (*http.Client, *captureRT) {
 	t.Helper()
@@ -734,5 +758,233 @@ func TestEnvelopeQuery_NilEnvelopeIsSafe(t *testing.T) {
 	// Headers must still be applied.
 	if recorder.last.Header.Get("Sec-Ch-Ua") == "" {
 		t.Error("nil Envelope suppressed browser headers")
+	}
+}
+
+// doBodyReq issues one POST through BrowserTransport and returns the
+// decorated body as the inner transport saw it.
+func doBodyReq(t *testing.T, env *Envelope, host, path, contentType, body, reason string) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	client, recorder := newEnvelopeClient(t, env)
+
+	req, err := http.NewRequest("POST", srv.URL+path, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Host = host
+	req.Header.Set("Content-Type", contentType)
+	if reason != "" {
+		req = req.WithContext(WithReason(req.Context(), reason))
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+
+	sent, err := io.ReadAll(recorder.last.Body)
+	if err != nil {
+		t.Fatalf("read captured body: %v", err)
+	}
+	return string(sent)
+}
+
+func TestEnvelopeBody_AddsFieldsInCaptureOrder(t *testing.T) {
+	// Trailing order on 149/163 captured requests is exactly
+	// _x_reason, _x_mode, _x_sonic, _x_app_name — business params
+	// first. url.Values.Encode() would sort alphabetically, putting
+	// _x_app_name first and token last, an order no client emits.
+	got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
+		"/api/conversations.history", "application/x-www-form-urlencoded",
+		"token=xoxc-abc&channel=C123", "message-pane/requestHistory")
+
+	var keys []string
+	for _, kv := range strings.Split(got, "&") {
+		keys = append(keys, strings.SplitN(kv, "=", 2)[0])
+	}
+	want := []string{"token", "channel", "_x_reason", "_x_mode", "_x_sonic", "_x_app_name"}
+	if len(keys) != len(want) {
+		t.Fatalf("body keys = %v; want %v", keys, want)
+	}
+	for i := range want {
+		if keys[i] != want[i] {
+			t.Errorf("body key[%d] = %q; want %q (full: %v)", i, keys[i], want[i], keys)
+		}
+	}
+
+	vals, err := url.ParseQuery(got)
+	if err != nil {
+		t.Fatalf("ParseQuery(%q): %v", got, err)
+	}
+	for k, want := range map[string]string{
+		"token":       "xoxc-abc",
+		"channel":     "C123",
+		"_x_reason":   "message-pane/requestHistory",
+		"_x_mode":     "online",
+		"_x_sonic":    "true",
+		"_x_app_name": "client",
+	} {
+		if vals.Get(k) != want {
+			t.Errorf("body field %s = %q; want %q", k, vals.Get(k), want)
+		}
+	}
+}
+
+func TestEnvelopeBody_SetsContentLengthAndGetBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	client, recorder := newEnvelopeClient(t, NewEnvelope())
+
+	req, _ := http.NewRequest("POST", srv.URL+"/api/x",
+		strings.NewReader("token=xoxc-abc"))
+	req.Host = "rands-leadership.slack.com"
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+
+	sent, _ := io.ReadAll(recorder.last.Body)
+	if recorder.last.ContentLength != int64(len(sent)) {
+		t.Errorf("ContentLength = %d; want %d (body was rewritten)", recorder.last.ContentLength, len(sent))
+	}
+	// GetBody must be replayable for HTTP/2 retry and redirects.
+	if recorder.last.GetBody == nil {
+		t.Fatal("GetBody is nil after body rewrite; retries would send an empty body")
+	}
+	rc, err := recorder.last.GetBody()
+	if err != nil {
+		t.Fatalf("GetBody: %v", err)
+	}
+	replayed, _ := io.ReadAll(rc)
+	if string(replayed) != string(sent) {
+		t.Errorf("GetBody replay = %q; want %q", replayed, sent)
+	}
+}
+
+func TestEnvelopeBody_NoReasonOmitsField(t *testing.T) {
+	// 10 of 163 captured requests carry no _x_reason. Emitting an empty
+	// one would be wrong; the field should simply be absent.
+	got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
+		"/api/x", "application/x-www-form-urlencoded", "token=xoxc-abc", "")
+	if strings.Contains(got, "_x_reason") {
+		t.Errorf("body = %q; want no _x_reason when none is set", got)
+	}
+	// The always-present fields must still be there, still trailing.
+	if !strings.HasSuffix(got, "_x_mode=online&_x_sonic=true&_x_app_name=client") {
+		t.Errorf("body = %q; want _x_mode/_x_sonic/_x_app_name tail", got)
+	}
+}
+
+func TestEnvelopeBody_LeavesMultipartAlone(t *testing.T) {
+	// Two bodies, because the realistic one is not enough on its own:
+	// its Content-Disposition carries a ';', and Go's url.ParseQuery
+	// rejects ';' as a separator, so that body survives via the
+	// unparseable-form pass-through even with the content-type guard
+	// deleted. The semicolon-free body parses cleanly as a one-key
+	// form, so only the content-type guard keeps it intact.
+	bodies := map[string]string{
+		"realistic":      "--BOUNDARY\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nDATA\r\n--BOUNDARY--\r\n",
+		"form-parseable": "--BOUNDARY\r\nContent-Disposition: form-data\r\n\r\nDATA\r\n--BOUNDARY--\r\n",
+	}
+	for name, raw := range bodies {
+		t.Run(name, func(t *testing.T) {
+			got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
+				"/api/files.upload", "multipart/form-data; boundary=BOUNDARY", raw, "boot")
+			if got != raw {
+				t.Errorf("multipart body was rewritten:\ngot  %q\nwant %q", got, raw)
+			}
+		})
+	}
+}
+
+func TestEnvelopeBody_LeavesJSONAlone(t *testing.T) {
+	// A JSON object with no '&', ';' or '%' parses cleanly as a
+	// single-key form, so url.ParseQuery will NOT reject it. Only the
+	// content-type guard stops it being rewritten, and rewriting it
+	// would corrupt the request.
+	const raw = `{"token":"xoxc-abc","updated_ids":{"C123":1}}`
+
+	// edgeapi posts JSON with content-type text/plain. This one is
+	// doubly protected — the edgeapi host is excluded before
+	// content-type is even read — but it is the shape slk actually
+	// sends, so pin it.
+	got := doBodyReq(t, NewEnvelope(), "edgeapi.slack.com",
+		"/cache/T04/users/info", "text/plain;charset=UTF-8", raw, "boot")
+	if got != raw {
+		t.Errorf("edgeapi text/plain JSON body was rewritten:\ngot  %q\nwant %q", got, raw)
+	}
+
+	// A JSON POST to a workspace /api/ path has no host-based
+	// protection: the content-type guard is the only thing between it
+	// and a corrupted body.
+	got = doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
+		"/api/chat.postMessage", "application/json; charset=utf-8", raw, "boot")
+	if got != raw {
+		t.Errorf("workspace-API JSON body was rewritten:\ngot  %q\nwant %q", got, raw)
+	}
+}
+
+func TestEnvelopeBody_NoBodyIsSafe(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	client, _ := newEnvelopeClient(t, NewEnvelope())
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api/auth.test", nil)
+	req.Host = "rands-leadership.slack.com"
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do with nil body: %v", err)
+	}
+	resp.Body.Close()
+}
+
+func TestEnvelopeBody_PreservesCallerSetFields(t *testing.T) {
+	// A caller that already set _x_reason must win.
+	got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
+		"/api/x", "application/x-www-form-urlencoded",
+		"token=xoxc-abc&_x_reason=caller-wins", "transport-would-set-this")
+	vals, err := url.ParseQuery(got)
+	if err != nil {
+		t.Fatalf("ParseQuery: %v", err)
+	}
+	if v := vals["_x_reason"]; len(v) != 1 || v[0] != "caller-wins" {
+		t.Errorf("_x_reason = %v; want exactly [caller-wins]", v)
+	}
+}
+
+func TestBrowserTransport_NilURLDoesNotPanic(t *testing.T) {
+	// Only reachable by calling RoundTrip directly — http.Client.Do
+	// rejects a nil URL first. Both applyEnvelopeQuery and
+	// applyEnvelopeBody dereference req.URL.
+	bt := &BrowserTransport{
+		Inner: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+		}),
+		Env: NewEnvelope(),
+	}
+	req := &http.Request{
+		Method: "POST",
+		Host:   "rands-leadership.slack.com",
+		Header: http.Header{},
+		Body:   io.NopCloser(strings.NewReader("token=xoxc-abc")),
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := bt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip with nil URL: %v", err)
+	}
+	resp.Body.Close()
+}
+
+func TestEnvelopeBody_NotAppliedToNonAPIPaths(t *testing.T) {
+	got := doBodyReq(t, NewEnvelope(), "files.slack.com",
+		"/files-tmb/x.png", "application/x-www-form-urlencoded", "a=1", "boot")
+	if got != "a=1" {
+		t.Errorf("non-API path body was rewritten: %q", got)
 	}
 }

@@ -20,6 +20,7 @@ package slackhttp
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"runtime"
@@ -58,8 +59,16 @@ func (t *BrowserTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		for k, v := range browserHeaderPairs() {
 			setIfMissing(req.Header, k, v)
 		}
-		if t.Env != nil {
+		// applyEnvelopeQuery and applyEnvelopeBody both dereference
+		// req.URL. http.Client.Do rejects a nil URL before the
+		// transport sees it, but a caller invoking RoundTrip directly
+		// can reach here with one, and a panic is a poor answer to a
+		// malformed request.
+		if t.Env != nil && req.URL != nil {
 			applyEnvelopeQuery(req, t.Env)
+			if err := applyEnvelopeBody(req); err != nil {
+				return nil, err
+			}
 		}
 	}
 	inner := t.Inner
@@ -340,6 +349,77 @@ func applyEnvelopeQuery(req *http.Request, env *Envelope) {
 	add("_x_num_retries", "0")
 
 	req.URL.RawQuery = appendQuery(req.URL.RawQuery, out)
+}
+
+// applyEnvelopeBody appends Slack's client telemetry fields to a
+// form-encoded POST body, in the order the official client emits them.
+//
+// Order matters for the same reason it does in the query string: the
+// captured trailing sequence is _x_reason, _x_mode, _x_sonic,
+// _x_app_name (149/163 requests), with business params first.
+// url.Values.Encode() sorts alphabetically, which would put
+// _x_app_name first and token last — an order no real client produces.
+//
+// Only application/x-www-form-urlencoded bodies are touched. Multipart
+// bodies (file uploads) and the JSON bodies edgeapi takes as
+// text/plain pass through untouched; rewriting either would corrupt
+// them.
+//
+// Known residual divergence: all 163 captured bodies are
+// multipart/form-data while slk sends urlencoded. Converting is
+// deferred — see the spec's "Deliberately deferred" section. Getting
+// the field order right now means it carries over when it lands.
+func applyEnvelopeBody(req *http.Request) error {
+	if req.Body == nil {
+		return nil
+	}
+	if !isWorkspaceAPIPath(req.URL.Path) || isEdgeAPIHost(envelopeHost(req)) {
+		return nil
+	}
+	ct := req.Header.Get("Content-Type")
+	if !strings.HasPrefix(ct, "application/x-www-form-urlencoded") {
+		return nil
+	}
+
+	raw, err := io.ReadAll(req.Body)
+	req.Body.Close()
+	if err != nil {
+		return fmt.Errorf("slackhttp: reading request body: %w", err)
+	}
+
+	existing, err := url.ParseQuery(string(raw))
+	if err != nil {
+		// Not parseable as a form; pass it through rather than
+		// corrupting it.
+		setBody(req, string(raw))
+		return nil
+	}
+
+	var out []envelopeParam
+	add := func(key, value string) {
+		if value == "" || existing.Get(key) != "" {
+			return
+		}
+		out = append(out, envelopeParam{key, value})
+	}
+	add("_x_reason", ReasonFrom(req.Context()))
+	add("_x_mode", "online")
+	add("_x_sonic", "true")
+	add("_x_app_name", "client")
+
+	setBody(req, appendQuery(string(raw), out))
+	return nil
+}
+
+// setBody replaces req's body with s, keeping ContentLength and
+// GetBody consistent so net/http can replay it on redirect or HTTP/2
+// retry.
+func setBody(req *http.Request, s string) {
+	req.Body = io.NopCloser(strings.NewReader(s))
+	req.ContentLength = int64(len(s))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader(s)), nil
+	}
 }
 
 // appendQuery appends params to an existing raw query string without
