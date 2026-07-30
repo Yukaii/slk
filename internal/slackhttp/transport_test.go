@@ -578,6 +578,135 @@ func TestEnvelopeQuery_OmitsEmptyValues(t *testing.T) {
 	}
 }
 
+func TestEnvelopeQuery_ParamOrderMatchesCapture(t *testing.T) {
+	// 0 of 163 workspace-API requests in the captures had alphabetically
+	// sorted params. The client emits one canonical order with fp and
+	// _x_num_retries always last. url.Values.Encode() would sort them,
+	// which is why this package assembles the query by hand.
+	env := NewEnvelope()
+	env.SetTeamID("T04T4TH8W")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	client, recorder := newEnvelopeClient(t, env)
+	req, _ := http.NewRequest("POST", srv.URL+"/api/conversations.history", nil)
+	req.Host = "rands-leadership.slack.com"
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+
+	var keys []string
+	for _, kv := range strings.Split(recorder.last.URL.RawQuery, "&") {
+		keys = append(keys, strings.SplitN(kv, "=", 2)[0])
+	}
+	want := []string{
+		"_x_id", "_x_csid", "slack_route", "_x_version_ts", "_x_foreground",
+		"_x_frontend_build_type", "_x_desktop_ia", "_x_gantry",
+		"_x_b3_traceid", "_x_b3_spanid", "_x_b3_sampled",
+		"fp", "_x_num_retries",
+	}
+	if len(keys) != len(want) {
+		t.Fatalf("query keys = %v; want %v", keys, want)
+	}
+	for i := range want {
+		if keys[i] != want[i] {
+			t.Errorf("query key[%d] = %q; want %q (full order: %v)", i, keys[i], want[i], keys)
+		}
+	}
+
+	sorted := append([]string(nil), keys...)
+	sort.Strings(sorted)
+	same := true
+	for i := range keys {
+		if keys[i] != sorted[i] {
+			same = false
+			break
+		}
+	}
+	if same {
+		t.Error("query params are alphabetically sorted; the real client never emits that order")
+	}
+}
+
+func TestEnvelopeQuery_EdgeAPIParamOrder(t *testing.T) {
+	env := NewEnvelope()
+	env.SetTeamID("T04T4TH8W")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	client, recorder := newEnvelopeClient(t, env)
+	req, _ := http.NewRequest("POST", srv.URL+"/cache/T04T4TH8W/users/info", nil)
+	req.Host = "edgeapi.slack.com"
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+
+	var keys []string
+	for _, kv := range strings.Split(recorder.last.URL.RawQuery, "&") {
+		keys = append(keys, strings.SplitN(kv, "=", 2)[0])
+	}
+	want := []string{"_x_app_name", "_x_b3_traceid", "_x_b3_spanid", "_x_b3_sampled", "fp", "_x_num_retries"}
+	if len(keys) != len(want) {
+		t.Fatalf("edgeapi query keys = %v; want %v", keys, want)
+	}
+	for i := range want {
+		if keys[i] != want[i] {
+			t.Errorf("edgeapi key[%d] = %q; want %q", i, keys[i], want[i])
+		}
+	}
+}
+
+func TestEnvelopeQuery_CallerParamsKeepTheirOrder(t *testing.T) {
+	env := NewEnvelope()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	client, recorder := newEnvelopeClient(t, env)
+	// Deliberately not alphabetical.
+	req, _ := http.NewRequest("POST", srv.URL+"/api/conversations.history?limit=28&channel=C123", nil)
+	req.Host = "rands-leadership.slack.com"
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+
+	raw := recorder.last.URL.RawQuery
+	if !strings.HasPrefix(raw, "limit=28&channel=C123&") {
+		t.Errorf("caller params were reordered or re-encoded: %q", raw)
+	}
+	if !strings.HasSuffix(raw, "&fp=6e&_x_num_retries=0") {
+		t.Errorf("envelope tail wrong: %q", raw)
+	}
+}
+
+func TestEnvelopeQuery_NotAppliedToNonAPIPaths(t *testing.T) {
+	// files.slack.com downloads must not carry _x_id/slack_route even if
+	// an Envelope is attached to the client.
+	env := NewEnvelope()
+	env.SetTeamID("T04T4TH8W")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	client, recorder := newEnvelopeClient(t, env)
+	req, _ := http.NewRequest("GET", srv.URL+"/files-tmb/T04-F0A-abc/image_480.png", nil)
+	req.Host = "files.slack.com"
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+
+	if raw := recorder.last.URL.RawQuery; raw != "" {
+		t.Errorf("non-API Slack path got envelope params: %q", raw)
+	}
+	// Headers should still apply.
+	if recorder.last.Header.Get("Sec-Ch-Ua") == "" {
+		t.Error("browser headers missing on files.slack.com request")
+	}
+}
+
 func TestEnvelopeQuery_NotAddedToNonSlackHosts(t *testing.T) {
 	q := doEnvelopeReq(t, NewEnvelope(), "example.com", "/whatever")
 	if q.Get("fp") != "" {

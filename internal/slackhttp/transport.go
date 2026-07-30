@@ -37,7 +37,9 @@ type BrowserTransport struct {
 
 	// Env supplies the Slack client telemetry envelope (_x_id, _x_csid,
 	// slack_route, ...). If nil, no envelope params are added — asset
-	// fetches to CDN hosts carry no envelope.
+	// fetches to CDN hosts carry no envelope. Even when non-nil, the
+	// envelope is scoped to edgeapi and to /api/ paths, so a stray Env
+	// on a files.slack.com client cannot decorate download URLs.
 	Env *Envelope
 }
 
@@ -240,72 +242,123 @@ func envelopeHost(req *http.Request) string {
 	return ""
 }
 
-// applyEnvelopeQuery adds Slack's client telemetry params to req's URL,
-// never overwriting a param the caller already set.
+// isWorkspaceAPIPath reports whether path is a workspace API call, the
+// only place the workspace envelope belongs.
 //
-// The two Slack API hosts take DIFFERENT param sets — this is measured,
-// not assumed (see testdata/capture-evidence.json):
+// Without this scope check, any Slack host that isn't edgeapi gets the
+// workspace set — so an Envelope accidentally attached to the client
+// used for files.slack.com downloads would decorate every asset URL
+// with _x_id and slack_route. No real client does that, and "asset
+// clients pass Env: nil" is a convention nothing enforced.
+func isWorkspaceAPIPath(path string) bool {
+	return strings.HasPrefix(path, "/api/")
+}
+
+// envelopeParam is one query param in the order the official client
+// emits it.
+type envelopeParam struct{ key, value string }
+
+// applyEnvelopeQuery appends Slack's client telemetry params to req's
+// URL in the ORDER the official client emits them, never overwriting a
+// param the caller already set.
+//
+// Order matters. Across the 2026-07-30 captures, 0 of 163 workspace-API
+// requests carried alphabetically-sorted params; the client emits one
+// canonical sequence with optional members omitted in place, and fp /
+// _x_num_retries always last. url.Values.Encode() sorts keys, so using
+// it would give every slk request a perfectly alphabetized query
+// string — a stable distributional signature, which is exactly what
+// this package exists to remove.
+//
+// Host classes take different sets — measured, not assumed (see
+// testdata/capture-evidence.json):
 //
 //	workspace API (*.slack.com/api/*), 163 requests:
-//	  always: _x_id, _x_version_ts, _x_frontend_build_type,
-//	          _x_desktop_ia, _x_gantry, fp, _x_num_retries
-//	  post-boot only: slack_route (149/149), _x_csid
+//	  _x_id, _x_csid, slack_route, _x_version_ts, _x_foreground,
+//	  _x_frontend_build_type, _x_desktop_ia, _x_gantry,
+//	  _x_b3_traceid, _x_b3_spanid, _x_b3_sampled, fp, _x_num_retries
+//	  (_x_csid/slack_route/_x_b3_* are post-boot only)
 //
 //	edgeapi.slack.com, 116 requests:
-//	  only: _x_app_name, fp, _x_num_retries
+//	  _x_app_name, _x_b3_traceid, _x_b3_spanid, _x_b3_sampled,
+//	  fp, _x_num_retries
 //	  never: _x_id, _x_version_ts, slack_route, _x_csid, or any
 //	         _x_frontend_build_type/_x_desktop_ia/_x_gantry
 //
 // Sending the workspace set to edgeapi would be an slk-specific
-// signature, which is exactly what this package exists to avoid.
+// signature, as would sending it to a non-API path.
 func applyEnvelopeQuery(req *http.Request, env *Envelope) {
-	q := req.URL.Query()
-	host := envelopeHost(req)
+	existing := req.URL.Query()
+	var out []envelopeParam
 
-	// Universal on both hosts.
-	setQueryIfMissing(q, "fp", "6e")
-	setQueryIfMissing(q, "_x_num_retries", "0")
+	add := func(key, value string) {
+		if value == "" || existing.Get(key) != "" {
+			return
+		}
+		out = append(out, envelopeParam{key, value})
+	}
 
-	if isEdgeAPIHost(host) {
-		setQueryIfMissing(q, "_x_app_name", "client")
-	} else {
-		setQueryIfMissing(q, "_x_id", env.RequestID())
-		setQueryIfMissing(q, "_x_version_ts", env.VersionTS())
-		setQueryIfMissing(q, "_x_frontend_build_type", "current")
-		setQueryIfMissing(q, "_x_desktop_ia", "4")
-		setQueryIfMissing(q, "_x_gantry", "true")
+	postBoot := env.TeamID() != ""
+
+	switch {
+	case isEdgeAPIHost(envelopeHost(req)):
+		add("_x_app_name", "client")
+	case isWorkspaceAPIPath(req.URL.Path):
+		add("_x_id", env.RequestID())
+		if postBoot {
+			add("_x_csid", env.SessionID())
+			add("slack_route", env.TeamID())
+		}
+		add("_x_version_ts", env.VersionTS())
 		// The real client varies _x_foreground with browser tab focus
 		// (145/163 carry true). A TUI has no equivalent notion, and
 		// omitting a param present on 88% of traffic is the larger
 		// divergence, so always send true.
-		setQueryIfMissing(q, "_x_foreground", "true")
-
-		if teamID := env.TeamID(); teamID != "" {
-			setQueryIfMissing(q, "slack_route", teamID)
-			setQueryIfMissing(q, "_x_csid", env.SessionID())
-		}
+		add("_x_foreground", "true")
+		add("_x_frontend_build_type", "current")
+		add("_x_desktop_ia", "4")
+		add("_x_gantry", "true")
+	default:
+		// A Slack host that is neither edgeapi nor an API path —
+		// files.slack.com and the CDNs. Real clients send no envelope
+		// there, not even fp, so send nothing at all.
+		return
 	}
 
 	// B3 trace ids appear on only 14-18% of real requests, but they are
 	// per-request random values rather than constants, so over-sending
 	// is much less identifying than emitting a wrong fixed value.
-	if env.TeamID() != "" {
+	if postBoot {
 		trace, span := env.TraceIDs()
-		setQueryIfMissing(q, "_x_b3_traceid", trace)
-		setQueryIfMissing(q, "_x_b3_spanid", span)
-		setQueryIfMissing(q, "_x_b3_sampled", "1")
+		add("_x_b3_traceid", trace)
+		add("_x_b3_spanid", span)
+		add("_x_b3_sampled", "1")
 	}
 
-	req.URL.RawQuery = q.Encode()
+	// Always last, on both host classes.
+	add("fp", "6e")
+	add("_x_num_retries", "0")
+
+	req.URL.RawQuery = appendQuery(req.URL.RawQuery, out)
 }
 
-func setQueryIfMissing(q url.Values, key, value string) {
-	if value == "" {
-		return
+// appendQuery appends params to an existing raw query string without
+// reordering or re-encoding what is already there.
+func appendQuery(raw string, params []envelopeParam) string {
+	if len(params) == 0 {
+		return raw
 	}
-	if q.Get(key) == "" {
-		q.Set(key, value)
+	var b strings.Builder
+	b.WriteString(raw)
+	for _, p := range params {
+		if b.Len() > 0 {
+			b.WriteByte('&')
+		}
+		b.WriteString(url.QueryEscape(p.key))
+		b.WriteByte('=')
+		b.WriteString(url.QueryEscape(p.value))
 	}
+	return b.String()
 }
 
 func isSlackHost(host string) bool {
