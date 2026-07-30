@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"regexp"
-	"strconv"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -225,16 +225,26 @@ func TestUserAgentAndClientHintsShareMajorVersion(t *testing.T) {
 	}
 }
 
-func TestChromeMajorIsCurrent(t *testing.T) {
-	// Guards against the Chrome/120-in-2026 staleness that made slk
-	// separable. Bump chromeMajor (and this floor) at release time.
-	const floor = 150
-	n, err := strconv.Atoi(chromeMajor)
-	if err != nil {
-		t.Fatalf("chromeMajor = %q; not an integer", chromeMajor)
+func TestClientHintUAMatchesCapture(t *testing.T) {
+	// Verified value: 1032 requests across five HAR captures of the
+	// Slack web client, 2026-07-30, Chrome 150 on Linux. See
+	// docs/superpowers/specs/2026-07-30-enterprise-grid-bootstrap-design.md
+	// ("Verified impersonation values").
+	//
+	// Chrome permutes the GREASE token and the brand ordering between
+	// versions, so this is pinned verbatim rather than assembled from
+	// parts: bumping the version requires a fresh capture.
+	const want = `"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"`
+	if got := ClientHintUA(); got != want {
+		t.Errorf("ClientHintUA() = %q; want %q", got, want)
 	}
-	if n < floor {
-		t.Errorf("chromeMajor = %d; want >= %d (stale UA is itself an anomaly signal)", n, floor)
+}
+
+func TestUserAgentMatchesCapture(t *testing.T) {
+	// Verified: 1516 requests across five HAR captures, 2026-07-30.
+	const want = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+	if got := userAgentForGOOS("linux"); got != want {
+		t.Errorf("userAgentForGOOS(\"linux\") = %q; want %q", got, want)
 	}
 }
 
@@ -262,10 +272,14 @@ func TestClientHintPlatformForGOOS(t *testing.T) {
 	}
 }
 
-func TestClientHintPlatformIsQuoted(t *testing.T) {
-	// sec-ch-ua-platform is a structured-header string: the quotes are
-	// part of the value, not Go syntax. A bare Linux would be invalid.
+func TestClientHintPlatformDelegatesToGOOS(t *testing.T) {
+	want := clientHintPlatformForGOOS(runtime.GOOS)
 	got := ClientHintPlatform()
+	if got != want {
+		t.Errorf("ClientHintPlatform() = %q; want %q (must delegate to runtime.GOOS)", got, want)
+	}
+	// sec-ch-ua-platform is a structured-header string: the quotes are
+	// part of the value, not Go syntax.
 	if len(got) < 2 || got[0] != '"' || got[len(got)-1] != '"' {
 		t.Errorf("ClientHintPlatform() = %q; want a double-quoted value", got)
 	}

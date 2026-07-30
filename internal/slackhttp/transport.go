@@ -81,11 +81,26 @@ func BrowserHeaders() http.Header {
 	return h
 }
 
-// chromeMajor is the Chrome major version slk impersonates. The
-// User-Agent string and the sec-ch-ua client hints are both derived
-// from it so they can never disagree — a Chrome UA paired with absent
-// or mismatched client hints is a combination real Chrome never emits,
-// and is trivially detectable. Bump this at release time.
+// chromeMajor is the Chrome major version slk impersonates. Both the
+// User-Agent string and the sec-ch-ua client hints interpolate it, so
+// their *version numbers* cannot drift apart — a Chrome UA paired with
+// absent or mismatched client hints is a combination real Chrome never
+// emits, and is trivially detectable.
+//
+// Only the version number is derived from this constant. The rest of
+// the sec-ch-ua value — the GREASE brand token and the ordering of the
+// three brand entries — is hardcoded in ClientHintUA, and Chrome
+// permutes both between major versions. Chrome 147 sent
+// `"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"`;
+// Chrome 150 sends `"Not;A=Brand";v="8", "Chromium";v="150",
+// "Google Chrome";v="150"` — a different token and a different order.
+//
+// So do NOT bump this constant on its own. Doing so yields a correct
+// UA paired with a sec-ch-ua no real Chrome emits, which is a stable,
+// slk-specific fingerprint: worse than sending nothing. A bump
+// requires a fresh capture of the real client, with ClientHintUA
+// updated to match. See the "Verified impersonation values" section of
+// docs/superpowers/specs/2026-07-30-enterprise-grid-bootstrap-design.md.
 const chromeMajor = "150"
 
 // UserAgent returns a Chrome User-Agent appropriate for the host OS.
@@ -106,8 +121,14 @@ func userAgentForGOOS(goos string) string {
 	}
 }
 
-// ClientHintUA returns the sec-ch-ua header value matching UserAgent().
-// Format mirrors Chrome 150 exactly, including the GREASE brand.
+// ClientHintUA returns the sec-ch-ua header value paired with
+// UserAgent(). The brand list — the GREASE token, the three entries and
+// their order — reproduces what Chrome 150 was observed sending in
+// captures of the Slack web client taken 2026-07-30; only the version
+// number comes from chromeMajor. Because Chrome varies the GREASE token
+// and the ordering per major version, this string is correct for the
+// captured version only: see the chromeMajor doc comment before
+// changing either.
 func ClientHintUA() string {
 	return fmt.Sprintf(`"Not;A=Brand";v="8", "Chromium";v="%s", "Google Chrome";v="%s"`,
 		chromeMajor, chromeMajor)

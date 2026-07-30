@@ -97,6 +97,27 @@ stale, and a Chrome UA with no `sec-ch-ua` client hints is a combination real
 Chrome never produces. Adding a `referer` the real client omits makes slk
 separable with a single log predicate, before any behavioral analysis.
 
+### Verified impersonation values
+
+Captured 2026-07-30 from the Slack web client on Linux/Chrome 150. The
+`sec-ch-ua` value was byte-identical across 1032 requests in five separate
+captures; the User-Agent across 1516.
+
+```
+user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36
+sec-ch-ua: "Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"
+sec-ch-ua-mobile: ?0
+sec-ch-ua-platform: "Linux"
+```
+
+**Chrome permutes both the GREASE brand token and the brand ordering between
+major versions** — an earlier capture in this repo shows Chrome 147 sending
+`"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"`, a
+different token *and* a different order. Bumping the impersonated version
+therefore requires a fresh capture, not just incrementing a number. A
+plausible-but-wrong `sec-ch-ua` is worse than none: it is a stable,
+slk-specific signature no real Chrome emits.
+
 ### Approach
 
 Inject at the transport, not the call sites. slk issues API calls two ways —
