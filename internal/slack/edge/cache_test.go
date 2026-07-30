@@ -47,7 +47,30 @@ func (r capturedRequest) keys(t *testing.T) []string {
 	for k := range r.generic(t) {
 		ks = append(ks, k)
 	}
+	slices.Sort(ks)
 	return ks
+}
+
+// assertExactKeys pins the top-level key set of every captured
+// request, not just the first.
+//
+// The package's whole claim is that slk puts exactly the keys on the
+// wire that the official client puts there, and an extra key is as
+// much a fingerprint as a missing one. Checking only reqs[0] verifies
+// that for the first request of a call and nothing else, which leaves
+// "flags leak in from batch 2 onwards" completely uncovered — so this
+// runs over all of them.
+func assertExactKeys(t *testing.T, reqs []capturedRequest, want ...string) {
+	t.Helper()
+	if len(reqs) == 0 {
+		t.Fatal("no requests captured; an exact-key assertion over zero requests proves nothing")
+	}
+	slices.Sort(want)
+	for i, r := range reqs {
+		if got := r.keys(t); !slices.Equal(got, want) {
+			t.Errorf("request %d keys = %v; want exactly %v", i+1, got, want)
+		}
+	}
 }
 
 // recorder is an httptest server that records every request body and
@@ -141,10 +164,8 @@ func TestChannelsInfo_SendsUpdatedIDsAndDecodesResults(t *testing.T) {
 	// The captured request carries exactly three keys. An extra key is
 	// as much a divergence from the official client as a missing one —
 	// this is the whole point of the package.
+	assertExactKeys(t, reqs, "token", "check_membership", "updated_ids")
 	body := reqs[0].generic(t)
-	if len(body) != 3 {
-		t.Errorf("request keys = %v; want exactly token, check_membership, updated_ids", reqs[0].keys(t))
-	}
 	if body["check_membership"] != true {
 		t.Errorf("check_membership = %v; want true", body["check_membership"])
 	}
@@ -176,11 +197,28 @@ func TestChannelsInfo_SendsUpdatedIDsAndDecodesResults(t *testing.T) {
 	if ch.Version != 1783337533019 {
 		t.Errorf("Version = %d; want 1783337533019 (from the `updated` field)", ch.Version)
 	}
+	// Asserted one field at a time, never as an `||` chain: a chain
+	// cannot say which flag broke, and — because this fixture is a
+	// plain public channel and so has five of the six booleans false —
+	// it cannot tell "decoded false" from "never decoded". The flags
+	// with a true value live in TestChannel_DecodesEachBooleanFlagIndependently.
 	if !ch.IsChannel {
 		t.Error("IsChannel = false; want true")
 	}
-	if ch.IsGroup || ch.IsIM || ch.IsMPIM || ch.IsPrivate || ch.IsArchived {
-		t.Errorf("false flags decoded true: %+v", ch)
+	if ch.IsGroup {
+		t.Error("IsGroup = true; want false (is_group is false in the fixture)")
+	}
+	if ch.IsIM {
+		t.Error("IsIM = true; want false (is_im is false in the fixture)")
+	}
+	if ch.IsMPIM {
+		t.Error("IsMPIM = true; want false (is_mpim is false in the fixture)")
+	}
+	if ch.IsPrivate {
+		t.Error("IsPrivate = true; want false (is_private is false in the fixture)")
+	}
+	if ch.IsArchived {
+		t.Error("IsArchived = true; want false (is_archived is false in the fixture)")
 	}
 	if ch.ContextTeam != "T04T4TH8W" {
 		t.Errorf("ContextTeam = %q; want T04T4TH8W", ch.ContextTeam)
@@ -195,6 +233,126 @@ func TestChannelsInfo_SendsUpdatedIDsAndDecodesResults(t *testing.T) {
 	}
 	if len(got.FailedIDs) != 0 {
 		t.Errorf("FailedIDs = %v; want empty when the response omits failed_ids", got.FailedIDs)
+	}
+}
+
+// channelBooleanFlags is every boolean modelled on Channel, paired
+// with the wire key it must decode from.
+var channelBooleanFlags = []struct {
+	name string
+	key  string
+	get  func(Channel) bool
+}{
+	{"IsChannel", "is_channel", func(c Channel) bool { return c.IsChannel }},
+	{"IsGroup", "is_group", func(c Channel) bool { return c.IsGroup }},
+	{"IsIM", "is_im", func(c Channel) bool { return c.IsIM }},
+	{"IsMPIM", "is_mpim", func(c Channel) bool { return c.IsMPIM }},
+	{"IsPrivate", "is_private", func(c Channel) bool { return c.IsPrivate }},
+	{"IsArchived", "is_archived", func(c Channel) bool { return c.IsArchived }},
+}
+
+// TestChannel_DecodesEachBooleanFlagIndependently gives every boolean
+// on Channel a fixture where it is true.
+//
+// This exists because the rest of the suite could not distinguish a
+// decoded false from a field that was never decoded at all. Every
+// other fixture is a plain public channel, so five of these six
+// booleans are false everywhere, and a false-only fixture is satisfied
+// just as well by `json:"-"` as by the right tag. It is also satisfied
+// by any *permutation* of the tags, since all the permuted values are
+// identical.
+//
+// That is not a theoretical gap. is_archived is what a caller filters
+// on, and is_im/is_mpim/is_group is how a caller tells a DM from a
+// channel — a swapped tag pair there files DMs into the channel list.
+//
+// The fixtures are one-hot and constructed rather than captured: the
+// property being bought is discrimination, not realism. Exactly one
+// flag true per fixture means every field is true somewhere (so a
+// dropped tag reads false where the fixture says true) and every pair
+// of fields disagrees somewhere (so any swapped pair is caught). Each
+// field is then asserted on its own, never in an `||` chain, so a
+// failure names the flag that broke.
+func TestChannel_DecodesEachBooleanFlagIndependently(t *testing.T) {
+	for _, on := range channelBooleanFlags {
+		t.Run(on.name, func(t *testing.T) {
+			fields := make([]string, 0, len(channelBooleanFlags))
+			for _, f := range channelBooleanFlags {
+				fields = append(fields, fmt.Sprintf("%q:%t", f.key, f.key == on.key))
+			}
+			rec := newRecorder(t, func(int) (int, string) {
+				return 200, fmt.Sprintf(
+					`{"ok":true,"results":[{"id":"C2QPK1V44","name":"x","updated":1,%s}]}`,
+					strings.Join(fields, ","))
+			})
+
+			got, err := rec.client().ChannelsInfo(context.Background(), map[string]int64{"C2QPK1V44": 1})
+			if err != nil {
+				t.Fatalf("ChannelsInfo: %v", err)
+			}
+			if len(got.Channels) != 1 {
+				t.Fatalf("got %d channels; want 1", len(got.Channels))
+			}
+			ch := got.Channels[0]
+
+			for _, f := range channelBooleanFlags {
+				want := f.key == on.key
+				if got := f.get(ch); got != want {
+					t.Errorf("with only %q true on the wire: Channel.%s = %t; want %t "+
+						"(field is tagged json:%q)", on.key, f.name, got, want, f.key)
+				}
+			}
+		})
+	}
+}
+
+// userBooleanFlags is every boolean modelled on User, paired with the
+// wire key it must decode from.
+var userBooleanFlags = []struct {
+	name string
+	key  string
+	get  func(User) bool
+}{
+	{"Deleted", "deleted", func(u User) bool { return u.Deleted }},
+	{"IsBot", "is_bot", func(u User) bool { return u.IsBot }},
+}
+
+// TestUser_DecodesEachBooleanFlagIndependently is the users/info half
+// of TestChannel_DecodesEachBooleanFlagIndependently, and the stakes
+// are if anything higher: deleted is precisely what a caller filters
+// on before rendering a member list, and swapping it with is_bot hides
+// every deactivated account behind "it's a bot" and vice versa. Both
+// are false in every other fixture, so nothing else here could tell
+// the two tags apart or notice either going missing.
+func TestUser_DecodesEachBooleanFlagIndependently(t *testing.T) {
+	for _, on := range userBooleanFlags {
+		t.Run(on.name, func(t *testing.T) {
+			fields := make([]string, 0, len(userBooleanFlags))
+			for _, f := range userBooleanFlags {
+				fields = append(fields, fmt.Sprintf("%q:%t", f.key, f.key == on.key))
+			}
+			rec := newRecorder(t, func(int) (int, string) {
+				return 200, fmt.Sprintf(
+					`{"ok":true,"results":[{"id":"U04T4TH8Y","name":"grant","updated":1,%s}]}`,
+					strings.Join(fields, ","))
+			})
+
+			got, err := rec.client().UsersInfo(context.Background(), map[string]int64{"U04T4TH8Y": 1})
+			if err != nil {
+				t.Fatalf("UsersInfo: %v", err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("got %d users; want 1", len(got))
+			}
+
+			for _, f := range userBooleanFlags {
+				want := f.key == on.key
+				if gotFlag := f.get(got[0]); gotFlag != want {
+					t.Errorf("with only %q true on the wire: User.%s = %t; want %t "+
+						"(field is tagged json:%q)", on.key, f.name, gotFlag, want, f.key)
+				}
+			}
+		})
 	}
 }
 
@@ -224,10 +382,15 @@ func TestChannel_HasNoIsMemberField(t *testing.T) {
 }
 
 // TestChannelsInfo_MembershipArrivesWithNoResults is the common
-// real-world shape, not an edge case: 5 of the 6 observed responses
+// real-world shape, not an edge case: all 5 observed responses
 // carrying member_channels had `"results":[]`. Membership comes back
 // whether or not any channel record changed, which is exactly what
 // lets us stop enumerating.
+//
+// (This comment previously said "5 of the 6", contradicting cache.go's
+// "all 5" inside the same commit. Re-derived from the 8 raw captures:
+// 18 channels/info responses, 5 carrying member_channels, all 5 of
+// those with an empty results array. cache.go was right.)
 func TestChannelsInfo_MembershipArrivesWithNoResults(t *testing.T) {
 	rec := newRecorder(t, func(int) (int, string) {
 		return 200, `{"results":[],"ok":true,"member_channels":["C2QPK1V44","CL0AET1L0"]}`
@@ -372,12 +535,28 @@ func TestChannelsInfo_AccumulatesMembershipAcrossBatches(t *testing.T) {
 	}
 }
 
-// TestChannelsInfo_MembershipAccumulatesInOrder pins the ordering too:
-// a merge that kept only the first batch, or reversed them, would pass
-// the set-membership assertions above.
-func TestChannelsInfo_MembershipAccumulatesInOrder(t *testing.T) {
+// TestChannelsInfo_AllAccumulatorsPreserveRequestOrder pins ordering
+// for every accumulator on the channels path, not just one of them.
+//
+// Ordering was previously pinned for MemberChannels alone, which made
+// it ambiguous whether request order was a contract or an accident:
+// the same reversal applied to Channels or FailedIDs went unnoticed.
+// Resolved in favour of "it is a contract, for all of them". The
+// merge closure appends, appending is order-preserving, and a
+// prepend/reverse/keep-only-first bug passes every set-equality
+// assertion in this file — so it is worth a line each.
+//
+// Note what is *not* claimed: which ids ride in which batch. fetchInfo
+// ranges a Go map, so batch composition is deliberately
+// nondeterministic and nothing here depends on it. The contract is
+// only that batch N's contribution precedes batch N+1's, which is
+// well defined however the ids were partitioned — the recorder keys
+// its reply off the request number, not off the ids.
+func TestChannelsInfo_AllAccumulatorsPreserveRequestOrder(t *testing.T) {
 	rec := newRecorder(t, func(n int) (int, string) {
-		return 200, fmt.Sprintf(`{"ok":true,"results":[],"member_channels":["M%d"]}`, n)
+		return 200, fmt.Sprintf(
+			`{"ok":true,"results":[{"id":"C%d","updated":%d}],"member_channels":["M%d"],"failed_ids":["F%d"]}`,
+			n, n, n, n)
 	})
 	c := rec.client()
 
@@ -385,9 +564,42 @@ func TestChannelsInfo_MembershipAccumulatesInOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ChannelsInfo: %v", err)
 	}
-	want := []string{"M1", "M2", "M3"}
-	if !slices.Equal(got.MemberChannels, want) {
+
+	var gotChannels []string
+	for _, ch := range got.Channels {
+		gotChannels = append(gotChannels, ch.ID)
+	}
+	if want := []string{"C1", "C2", "C3"}; !slices.Equal(gotChannels, want) {
+		t.Errorf("Channels = %v; want %v in request order", gotChannels, want)
+	}
+	if want := []string{"M1", "M2", "M3"}; !slices.Equal(got.MemberChannels, want) {
 		t.Errorf("MemberChannels = %v; want %v in request order", got.MemberChannels, want)
+	}
+	if want := []string{"F1", "F2", "F3"}; !slices.Equal(got.FailedIDs, want) {
+		t.Errorf("FailedIDs = %v; want %v in request order", got.FailedIDs, want)
+	}
+}
+
+// TestUsersInfo_ResultsPreserveRequestOrder is the users/info half of
+// TestChannelsInfo_AllAccumulatorsPreserveRequestOrder. Same contract,
+// same reason: order was pinned on the channels path only, and an
+// asymmetry like that reads as an oversight rather than a decision.
+func TestUsersInfo_ResultsPreserveRequestOrder(t *testing.T) {
+	rec := newRecorder(t, func(n int) (int, string) {
+		return 200, fmt.Sprintf(`{"ok":true,"results":[{"id":"U%d","updated":%d}]}`, n, n)
+	})
+	c := rec.client()
+
+	got, err := c.UsersInfo(context.Background(), ids("U", usersInfoBatchSize*2+10))
+	if err != nil {
+		t.Fatalf("UsersInfo: %v", err)
+	}
+	var gotIDs []string
+	for _, u := range got {
+		gotIDs = append(gotIDs, u.ID)
+	}
+	if want := []string{"U1", "U2", "U3"}; !slices.Equal(gotIDs, want) {
+		t.Errorf("users = %v; want %v in request order", gotIDs, want)
 	}
 }
 
@@ -442,6 +654,13 @@ func TestChannelsInfo_SplitsLargeIDSets(t *testing.T) {
 		t.Fatalf("made %d requests for %d ids; want 3 (%d+%d+10)",
 			len(reqs), total, channelsInfoBatchSize, channelsInfoBatchSize)
 	}
+
+	// Every batch, not just the first. The single-request tests pin
+	// the key set for request 1 of a call and say nothing about 2..N,
+	// which leaves the package's central claim — we send exactly the
+	// keys the official client sends — unverified for every request
+	// after the first in a multi-batch revalidation.
+	assertExactKeys(t, reqs, "token", "check_membership", "updated_ids")
 
 	seen := map[string]int64{}
 	for i, r := range reqs {
@@ -633,11 +852,9 @@ func TestUsersInfo_SendsExpectedFlags(t *testing.T) {
 		t.Errorf("path = %q; want /cache/T04T4TH8W/users/info", reqs[0].path)
 	}
 
+	assertExactKeys(t, reqs,
+		"token", "check_interaction", "include_profile_only_users", "updated_ids")
 	body := reqs[0].generic(t)
-	if len(body) != 4 {
-		t.Errorf("request keys = %v; want exactly token, check_interaction, "+
-			"include_profile_only_users, updated_ids", reqs[0].keys(t))
-	}
 	if body["check_interaction"] != true {
 		t.Errorf("check_interaction = %v; want true", body["check_interaction"])
 	}
@@ -666,8 +883,16 @@ func TestUsersInfo_SendsExpectedFlags(t *testing.T) {
 	if u.TeamID != "T04T4TH8W" {
 		t.Errorf("TeamID = %q; want T04T4TH8W", u.TeamID)
 	}
-	if u.Deleted || u.IsBot {
-		t.Errorf("false flags decoded true: %+v", u)
+	// One field at a time, for the reason spelled out in
+	// TestUser_DecodesEachBooleanFlagIndependently: this fixture is a
+	// live human, so both booleans are false and neither a dropped tag
+	// nor a swapped pair could change the outcome here. The true-valued
+	// cases are over there.
+	if u.Deleted {
+		t.Error("Deleted = true; want false (deleted is false in the fixture)")
+	}
+	if u.IsBot {
+		t.Error("IsBot = true; want false (is_bot is false in the fixture)")
 	}
 	// users/info stamps `updated` in whole seconds, channels/info in
 	// milliseconds. Both are just opaque version stamps to us, but
@@ -731,6 +956,11 @@ func TestUsersInfo_SplitsLargeIDSets(t *testing.T) {
 	if len(reqs) != 3 {
 		t.Fatalf("made %d requests for %d ids; want 3", len(reqs), total)
 	}
+	// Every batch, not just the first — see the same assertion in
+	// TestChannelsInfo_SplitsLargeIDSets.
+	assertExactKeys(t, reqs,
+		"token", "check_interaction", "include_profile_only_users", "updated_ids")
+
 	seen := map[string]int64{}
 	for i, r := range reqs {
 		batch := r.updatedIDs(t)
@@ -831,6 +1061,60 @@ func TestUsersInfo_IgnoresUnknownResponseFieldsIncludingCanInteract(t *testing.T
 }
 
 // ---------------------------------------------------------------- batching
+
+// TestFetchInfo_DoesNotMergeAnErroredBatch pins the half of
+// fetchInfo's merge contract that the exported methods cannot see.
+//
+// ChannelsInfo and UsersInfo both return the zero value on any error,
+// so from outside the package a merge on a failed batch is
+// indistinguishable from no merge at all — every test that goes
+// through them passes either way. That equivalence is a property of
+// today's discard-on-error choice, not of fetchInfo, and the moment
+// anyone decides partial results are useful it becomes a live bug
+// with no coverage. So this drives fetchInfo directly.
+//
+// The failing batch here is not an ok:false, which would leave the
+// response struct untouched and prove nothing. It is a well-formed
+// results array followed by a type error, which is exactly what
+// call's final json.Unmarshal turns into "err != nil, and out is
+// partially populated": encoding/json records the first
+// UnmarshalTypeError and keeps going, so Results is already filled in
+// by the time the error comes back. Merging that batch would splice
+// C-LEAKED — a row from a response we could not fully decode — into
+// the accumulator.
+func TestFetchInfo_DoesNotMergeAnErroredBatch(t *testing.T) {
+	rec := newRecorder(t, func(n int) (int, string) {
+		if n == 2 {
+			// Decodes results, then fails on member_channels.
+			return 200, `{"ok":true,"results":[{"id":"C-LEAKED","updated":9}],` +
+				`"member_channels":"not-an-array"}`
+		}
+		return 200, fmt.Sprintf(`{"ok":true,"results":[{"id":"C%d","updated":%d}]}`, n, n)
+	})
+	c := rec.client()
+
+	var merged []channelsInfoResponse
+	err := fetchInfo(context.Background(), c, "channels/info",
+		map[string]any{"check_membership": true},
+		ids("C", channelsInfoBatchSize*2+10), channelsInfoBatchSize,
+		func(batch channelsInfoResponse) { merged = append(merged, batch) })
+	if err == nil {
+		t.Fatal("fetchInfo returned nil error when the second batch failed to decode")
+	}
+
+	if len(merged) != 1 {
+		t.Fatalf("merge ran %d times; want exactly 1 — only the first batch succeeded, "+
+			"and a batch that errored must never reach merge", len(merged))
+	}
+	for i, batch := range merged {
+		for _, ch := range batch.Results {
+			if ch.ID == "C-LEAKED" {
+				t.Errorf("merge %d received %+v; that row came from a response that failed "+
+					"to decode and must not be accumulated", i, ch)
+			}
+		}
+	}
+}
 
 // TestBatchSizes_StayWithinObservedShapes pins the constants against
 // the captures. Exceeding a batch size the official client has never

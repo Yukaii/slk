@@ -7,20 +7,36 @@ import (
 
 // Batch sizes for the conditional-revalidation endpoints.
 //
-// These are not documented limits; they are the shapes the official
-// web client has been observed sending, measured across 8 HAR captures
-// of a live Grid workspace:
+// These are not documented limits. They are caps chosen at or just
+// under the largest batch the official web client has been observed
+// sending, measured across 8 HAR captures of a live Grid workspace:
 //
 //	channels/info   18 requests, 1–63 ids per request
 //	users/info      30 requests, 1–80 ids per request
 //
-// Neither distribution shows a client-side cap — batch size just
-// tracks how many ids needed checking — so these are chosen at or just
-// under the observed maximum. Larger is better for our purposes:
-// revalidating a whole workspace in a handful of large requests looks
-// like a client warming its cache, while the same ids dribbled out in
-// small batches looks like enumeration, which is what we are trying to
-// stop doing.
+// Read that distribution honestly: neither endpoint shows any
+// client-side cap. Batch size there just tracks how many ids happened
+// to need checking, so 63 and 80 are demand, not contract — and that
+// cuts against us, not for us. A *fixed* batch size is itself a known
+// residual divergence: the official client emits ragged,
+// demand-driven sizes, while we emit a run of requests each carrying
+// exactly batchSize ids followed by one short tail. A cold
+// revalidation of a 10k-user workspace is 125 consecutive
+// exactly-80-id requests, which is a cleaner machine-detectable
+// signature than the ragged shape it is supposed to be imitating.
+//
+// Deliberately not "fixed" by jittering or randomising the size.
+// Nothing in the captures says what a jittered distribution should
+// look like, so inventing one is the Phase 1 failure mode again: a
+// plausible-but-wrong shape is worse than an honestly-declared
+// divergence, the same way a made-up sec-ch-ua is worse than none.
+//
+// The real fix is Phase 2b — scope revalidation to the ids that
+// actually need checking instead of sweeping the whole cache, which
+// makes our sizes demand-driven for the same reason the official
+// client's are. Until then these constants are a necessary upper
+// bound on request size, and the resulting uniformity is a divergence
+// that is known and accepted rather than solved.
 const (
 	channelsInfoBatchSize = 60
 	usersInfoBatchSize    = 80
@@ -28,7 +44,7 @@ const (
 
 // Channel is one entry in a channels/info response.
 //
-// This deliberately models a subset. A real result carries ~45 fields
+// This deliberately models a subset. A real result carries 43 fields
 // (enterprise_id, shared_team_ids, properties{}, channel_agent_status,
 // …); decoding ignores the rest, and must keep doing so — Slack adds
 // fields to this response without notice.
@@ -214,6 +230,16 @@ func (c *Client) UsersInfo(ctx context.Context, updatedIDs map[string]int64) ([]
 // a nil error would be indistinguishable from "only these entries
 // changed", so a caller would mark the unfetched ids current and never
 // revalidate them again.
+//
+// The "never after an error" half is unobservable through ChannelsInfo
+// and UsersInfo — both return the zero value on any error, so calling
+// merge with a half-decoded response would look identical from
+// outside. It is not harmless inside here: call's final
+// json.Unmarshal can populate part of resp before returning an error,
+// so a merge on a failed batch would splice fragments of a broken
+// response into the accumulator. That is why it is pinned directly,
+// against fetchInfo rather than through the exported methods — see
+// TestFetchInfo_DoesNotMergeAnErroredBatch.
 func fetchInfo[Resp any](
 	ctx context.Context,
 	c *Client,
