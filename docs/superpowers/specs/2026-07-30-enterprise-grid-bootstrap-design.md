@@ -28,7 +28,7 @@ Seven HAR captures of the official Slack web client on a busy workspace
 | `channel-switch-2` | 146 | 9 | 57 images / 3.8 MB | 43 |
 | `scroll` (1 page) | 246 | 5 | 124 images / 12 MB | 56 |
 | `quickswitch2` (finder) | 62 | 7 + 12 edgeapi | 4 emoji | — |
-| `reconnect` (90 s offline) | 109 | **3** + 12 edgeapi | 24 avatars | — |
+| `reconnect` (90 s offline) | 109 | **3** + 12 edgeapi | 62 avatars | — |
 
 Three findings reframe the problem:
 
@@ -213,14 +213,20 @@ separate cold-start strategy.
 
 ### Deletions
 
-- **`triggerBackfill` on first WS connect (`main.go:3712`) is removed.** This
-  is the single largest fingerprint change. The existing comment
-  (`main.go:3707`) rationalizes it as *"harmless — most `GetHistorySince`
-  calls return zero messages quickly."* True for bytes, false for request
-  count, and request count is what anomaly detection scores. Unread state
-  comes from `client.counts`; stale scrollback is validated lazily on channel
-  open via `cached_latest_updates`. The `BackfillCandidates` fan-out
-  (`reconnect_backfill.go:142`) ceases to run at boot.
+- **`triggerBackfill` is removed from *every* code path — not just boot.**
+  This is the single largest fingerprint change. It has two call sites: from
+  `OnConnect` (`main.go:3705`), which runs on first connect *and* on every
+  reconnect, and from the wake-from-sleep detector (`main.go:1812`). Both go,
+  along with the method itself (`main.go:3735`).
+  The `BackfillCandidates` fan-out (`reconnect_backfill.go:142`) stops
+  existing as a runtime behavior; the reconnect path is replaced by the
+  bounded handler in *Reconnect behavior* below.
+
+  The existing comment (`main.go:3707`) rationalizes the boot case as
+  *"harmless — most `GetHistorySince` calls return zero messages quickly."*
+  True for bytes, false for request count, and request count is what anomaly
+  detection scores. Unread state comes from `client.counts`; stale scrollback
+  is validated lazily on channel open via `cached_latest_updates`.
 - **`conversations.list`** (`main.go:2177`) — replaced by
   `channels/search` on demand.
 - **Boot-time `subscriptions.thread.getView`** — deferred to first open of
@@ -233,7 +239,7 @@ separate cold-start strategy.
 revalidation. It resumes over the WebSocket alone.
 
 slk currently runs its heaviest fan-out on exactly this path —
-`triggerBackfill` fires from `OnConnect` (`main.go:3712`), so every laptop
+`triggerBackfill` fires from `OnConnect` (`main.go:3705`), so every laptop
 sleep, wifi change, and VPN flap replays the full `BackfillCandidates` sweep.
 That is the scraper signature several times a day, not once at boot.
 
