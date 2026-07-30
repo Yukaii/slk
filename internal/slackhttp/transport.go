@@ -59,10 +59,14 @@ func NewBrowserHTTPClient(jar http.CookieJar) *http.Client {
 	}
 }
 
-// BrowserHeaders returns the full set of browser-like headers as an
-// http.Header value. Callers that can't use BrowserTransport (notably the
-// WebSocket dialer in gorilla/websocket, which takes raw upgrade headers
-// rather than a RoundTripper) consume this directly.
+// BrowserHeaders returns the full set of browser-like headers a Chrome
+// tab sends on an XHR to Slack, as an http.Header value, for callers
+// that can't go through BrowserTransport.
+//
+// This is NOT the WebSocket upgrade set — use WebSocketHeaders() for
+// that. Chrome sends strictly fewer headers on a WS handshake, so
+// reusing this one there produces a header combination no real browser
+// emits.
 func BrowserHeaders() http.Header {
 	h := http.Header{}
 	for k, v := range browserHeaderPairs() {
@@ -71,10 +75,35 @@ func BrowserHeaders() http.Header {
 	return h
 }
 
+// WebSocketHeaders returns the headers Chrome sends on a WebSocket
+// upgrade to Slack. This is deliberately a SMALLER set than
+// BrowserHeaders(): Chrome omits Accept, all Sec-Fetch-* headers, all
+// sec-ch-ua* client hints, and Priority on a WS handshake.
+//
+// Verified against the status-101 upgrade requests in the 2026-07-30
+// captures. See docs/superpowers/specs/2026-07-30-enterprise-grid-bootstrap-design.md.
+//
+// gorilla/websocket's Dialer owns Connection, Upgrade, Host, and the
+// Sec-WebSocket-* set, so those are absent here by design.
+func WebSocketHeaders() http.Header {
+	h := http.Header{}
+	h.Set("User-Agent", UserAgent())
+	h.Set("Accept-Language", "en-US,en;q=0.9")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Pragma", "no-cache")
+	h.Set("Origin", "https://app.slack.com")
+	return h
+}
+
 // browserHeaderPairs is the single source of truth for the headers a
 // Chrome tab sends on a same-site XHR to Slack. Both RoundTrip and
-// BrowserHeaders (the WebSocket dialer's path) consume it, so the API
-// and WS fingerprints cannot drift apart.
+// BrowserHeaders consume it, so slk's two HTTP-header exposures cannot
+// drift apart.
+//
+// The WebSocket upgrade deliberately does NOT consume this — see
+// WebSocketHeaders. Chrome's WS handshake omits Accept, Sec-Fetch-*,
+// sec-ch-ua*, and Priority, so sharing this set with the WS path would
+// make the socket separable rather than consistent.
 //
 // Deliberately contains NO Referer: the official web client sends none
 // on /api/ calls, and slk sending one made it separable. Verified

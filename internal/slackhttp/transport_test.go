@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -322,9 +323,11 @@ func TestBrowserTransport_HeaderParity(t *testing.T) {
 }
 
 func TestBrowserHeadersMatchesRoundTripHeaders(t *testing.T) {
-	// BrowserHeaders() feeds the WebSocket dialer, which cannot use a
-	// RoundTripper. It must produce exactly what RoundTrip sets, or the
-	// WS upgrade carries a different fingerprint than the API calls.
+	// BrowserHeaders() is the exported view of what RoundTrip puts on
+	// HTTP requests; the two must not drift. It does NOT feed the
+	// WebSocket dialer — that path uses WebSocketHeaders(), a
+	// deliberately smaller set, because real Chrome sends fewer headers
+	// on a WS upgrade than on an XHR.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer srv.Close()
 	client, recorder := newCaptureClient(t, srv)
@@ -356,5 +359,51 @@ func TestBrowserHeadersMatchesRoundTripHeaders(t *testing.T) {
 	}
 	if ws.Get("User-Agent") != recorder.last.Header.Get("User-Agent") {
 		t.Error("User-Agent differs between RoundTrip and BrowserHeaders")
+	}
+}
+
+func TestWebSocketHeadersMatchesCapture(t *testing.T) {
+	// Verified against the WS upgrade (status 101) in initial-load.har
+	// and coldboot.har, 2026-07-30, Chrome 150 on Linux. Chrome sends a
+	// SMALLER header set on a WebSocket upgrade than on an XHR: no
+	// Accept, no Sec-Fetch-*, no sec-ch-ua*, no Priority, no Referer.
+	h := WebSocketHeaders()
+
+	want := map[string]string{
+		"User-Agent":      UserAgent(),
+		"Accept-Language": "en-US,en;q=0.9",
+		"Cache-Control":   "no-cache",
+		"Pragma":          "no-cache",
+		"Origin":          "https://app.slack.com",
+	}
+	for k, v := range want {
+		if got := h.Get(k); got != v {
+			t.Errorf("WebSocketHeaders()[%s] = %q; want %q", k, got, v)
+		}
+	}
+
+	// Headers real Chrome does NOT send on a WS upgrade. Sending any of
+	// them is a slk-specific signature.
+	mustBeAbsent := []string{
+		"Accept",
+		"Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest",
+		"Sec-Ch-Ua", "Sec-Ch-Ua-Mobile", "Sec-Ch-Ua-Platform",
+		"Priority",
+		"Referer",
+	}
+	for _, k := range mustBeAbsent {
+		if got := h.Get(k); got != "" {
+			t.Errorf("WebSocketHeaders()[%s] = %q; want absent (real Chrome omits it on WS upgrade)", k, got)
+		}
+	}
+
+	// Exact key count guards against silently gaining a header later.
+	if len(h) != len(want) {
+		keys := make([]string, 0, len(h))
+		for k := range h {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		t.Errorf("WebSocketHeaders() has %d headers %v; want exactly %d", len(h), keys, len(want))
 	}
 }

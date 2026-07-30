@@ -237,19 +237,21 @@ func subdomainFromTeamURL(teamURL string) string {
 }
 
 // wsUpgradeHeaders returns the HTTP headers slk attaches to the WebSocket
-// upgrade request. These match the Chrome-like headers BrowserTransport
-// adds to ordinary HTTP requests, with Sec-Fetch-Dest narrowed to
-// "websocket" — the value a real browser sends when opening a WS to
-// app.slack.com.
+// upgrade request.
 //
-// gorilla/websocket's Dialer.Dial accepts arbitrary headers (except for
-// the protocol-managed Sec-WebSocket-* set, which it owns), so this is
-// the right injection point. We can't reuse BrowserTransport here because
+// This is NOT the same set BrowserTransport adds to ordinary HTTP
+// requests. Chrome sends a smaller set on a WS handshake: no Accept, no
+// Sec-Fetch-*, no sec-ch-ua* client hints, no Priority. An earlier
+// version of this function set Sec-Fetch-Dest: websocket on the belief
+// that browsers send it; the 2026-07-30 captures show they send no
+// Sec-Fetch-* header at all on an upgrade.
+//
+// gorilla/websocket's Dialer.Dial accepts arbitrary headers (except the
+// protocol-managed Sec-WebSocket-* set, which it owns), so this is the
+// right injection point. We can't reuse BrowserTransport here because
 // the dialer doesn't go through http.RoundTripper.
 func wsUpgradeHeaders() http.Header {
-	h := slackhttp.BrowserHeaders()
-	h.Set("Sec-Fetch-Dest", "websocket")
-	return h
+	return slackhttp.WebSocketHeaders()
 }
 
 // StartWebSocket connects to Slack's internal WebSocket using the xoxc token

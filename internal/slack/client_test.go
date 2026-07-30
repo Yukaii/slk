@@ -2051,7 +2051,13 @@ func TestNewClient_UsesBrowserTransport(t *testing.T) {
 	}
 }
 
-func TestStartWebSocket_SendsBrowserHeaders(t *testing.T) {
+// TestStartWebSocket_SendsChromeUpgradeHeaders checks what actually
+// reaches the wire on an upgrade, as opposed to
+// TestWSUpgradeHeaders_OmitsXHROnlyHeaders, which only inspects the map.
+// The name deliberately says "ChromeUpgrade" rather than "Browser": the
+// WS handshake carries a different, smaller set than the browser headers
+// BrowserTransport puts on ordinary HTTP requests.
+func TestStartWebSocket_SendsChromeUpgradeHeaders(t *testing.T) {
 	// Spin up an httptest server that completes the WS upgrade and
 	// captures the upgrade request's headers.
 	var gotHeaders http.Header
@@ -2094,8 +2100,12 @@ func TestStartWebSocket_SendsBrowserHeaders(t *testing.T) {
 	if got := gotHeaders.Get("Accept-Language"); got == "" {
 		t.Errorf("upgrade missing Accept-Language")
 	}
-	if got := gotHeaders.Get("Sec-Fetch-Dest"); got != "websocket" {
-		t.Errorf("upgrade Sec-Fetch-Dest = %q; want websocket", got)
+	// Real Chrome sends no Sec-Fetch-* header at all on a WS upgrade —
+	// verified against the status-101 upgrades in the 2026-07-30
+	// captures. This assertion used to require Sec-Fetch-Dest:
+	// websocket, which no browser sends; that made slk separable.
+	if got := gotHeaders.Get("Sec-Fetch-Dest"); got != "" {
+		t.Errorf("upgrade Sec-Fetch-Dest = %q; want absent (real Chrome omits it)", got)
 	}
 }
 
@@ -2549,5 +2559,27 @@ func TestGetHistoryAround_HonorsCancelledContext(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("expected 1 call before ctx check aborts, got %d", calls)
+	}
+}
+
+func TestWSUpgradeHeaders_OmitsXHROnlyHeaders(t *testing.T) {
+	h := wsUpgradeHeaders()
+	// Real Chrome omits all of these on a WebSocket upgrade. slk
+	// previously sent Sec-Fetch-Dest: websocket on the mistaken belief
+	// that browsers do; the 2026-07-30 captures show they send no
+	// Sec-Fetch-* header at all.
+	for _, k := range []string{
+		"Accept", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest",
+		"Sec-Ch-Ua", "Sec-Ch-Ua-Mobile", "Sec-Ch-Ua-Platform", "Priority", "Referer",
+	} {
+		if got := h.Get(k); got != "" {
+			t.Errorf("wsUpgradeHeaders()[%s] = %q; want absent", k, got)
+		}
+	}
+	if h.Get("User-Agent") == "" {
+		t.Error("wsUpgradeHeaders() missing User-Agent")
+	}
+	if h.Get("Origin") != "https://app.slack.com" {
+		t.Errorf("wsUpgradeHeaders() Origin = %q; want https://app.slack.com", h.Get("Origin"))
 	}
 }

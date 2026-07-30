@@ -118,6 +118,24 @@ therefore requires a fresh capture, not just incrementing a number. A
 plausible-but-wrong `sec-ch-ua` is worse than none: it is a stable,
 slk-specific signature no real Chrome emits.
 
+**The WebSocket upgrade uses a different, smaller header set.** Verified
+against the status-101 upgrade in `initial-load.har` and `coldboot.har`:
+
+```
+user-agent: Mozilla/5.0 (X11; Linux x86_64) ... Chrome/150.0.0.0 Safari/537.36
+accept-language: en-US,en;q=0.9
+cache-control: no-cache
+pragma: no-cache
+origin: https://app.slack.com
+```
+
+Chrome sends **no** `Accept`, **no** `Sec-Fetch-*`, **no** `sec-ch-ua*`, and
+**no** `Priority` on a WS handshake. slk previously sent
+`Sec-Fetch-Dest: websocket` believing browsers do — they do not. A long-lived
+socket carrying headers no real Chrome emits is a stable slk-specific
+signature, so `WebSocketHeaders()` is deliberately separate from
+`BrowserHeaders()`.
+
 ### Approach
 
 Inject at the transport, not the call sites. slk issues API calls two ways —
