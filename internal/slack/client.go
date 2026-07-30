@@ -182,6 +182,29 @@ func newCookieHTTPClient(dCookie string, env *slackhttp.Envelope) *http.Client {
 	}
 }
 
+// apiHTTPClient returns the HTTP client every outbound request from
+// this Client must go through.
+//
+// GetUnreadCounts, callChannelSectionsList and GetStarredChannels used
+// to call newCookieHTTPClient directly instead. That was invisible in
+// two ways. It made a dropped envelope argument undetectable — a
+// mutation replacing their env argument with nil survived the whole
+// suite — because no test could observe those three requests:
+// pointClientAtTestServer redirects c.httpClient's transport, and a
+// method that builds its own client ignores it and dials slack.com for
+// real. It also built a fresh cookie jar per call.
+//
+// The nil branch exists only for Clients constructed directly in tests
+// (&Client{api: mock}); NewClient always sets httpClient. It is pinned
+// by TestAPIHTTPClient_FallbackCarriesEnvelope so it cannot lose the
+// envelope either.
+func (c *Client) apiHTTPClient() *http.Client {
+	if c.httpClient != nil {
+		return c.httpClient
+	}
+	return newCookieHTTPClient(c.cookie, c.envelope)
+}
+
 // Envelope returns the client's Slack telemetry envelope, or nil for a
 // Client constructed directly (tests). Callers use it to read or update
 // session-scoped values such as the build timestamp; the same pointer is
@@ -936,8 +959,7 @@ func (c *Client) GetUnreadCounts() ([]UnreadInfo, ThreadsAggregate, error) {
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	httpClient := newCookieHTTPClient(c.cookie, c.envelope)
-	resp, err := httpClient.Do(req)
+	resp, err := c.apiHTTPClient().Do(req)
 	if err != nil {
 		return nil, ThreadsAggregate{}, fmt.Errorf("fetching unread counts: %w", err)
 	}
@@ -1470,11 +1492,7 @@ func (c *Client) postForm(ctx context.Context, method string, form url.Values) (
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	httpClient := c.httpClient
-	if httpClient == nil {
-		httpClient = newCookieHTTPClient(c.cookie, c.envelope)
-	}
-	resp, err := httpClient.Do(req)
+	resp, err := c.apiHTTPClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("calling %s: %w", method, err)
 	}
@@ -1527,8 +1545,7 @@ func (c *Client) callChannelSectionsList(ctx context.Context, cursor string) ([]
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	httpClient := newCookieHTTPClient(c.cookie, c.envelope)
-	resp, err := httpClient.Do(req)
+	resp, err := c.apiHTTPClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("calling channelSections API: %w", err)
 	}
@@ -1582,8 +1599,7 @@ func (c *Client) GetStarredChannels(ctx context.Context) ([]string, error) {
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	httpClient := newCookieHTTPClient(c.cookie, c.envelope)
-	resp, err := httpClient.Do(req)
+	resp, err := c.apiHTTPClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("calling stars.list: %w", err)
 	}

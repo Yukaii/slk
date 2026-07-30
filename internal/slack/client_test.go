@@ -2843,3 +2843,136 @@ func TestPostForm_NonOKStatusIsAnError(t *testing.T) {
 		t.Errorf("error = %v; want it to mention the 502 status", err)
 	}
 }
+
+// TestHandRolledEndpoints_RouteThroughSharedClient is the regression
+// guard for three endpoints that used to build their own http.Client
+// via newCookieHTTPClient instead of reusing c.httpClient:
+// client.counts (GetUnreadCounts), users.channelSections.list
+// (callChannelSectionsList) and stars.list (GetStarredChannels).
+//
+// Two things were wrong with that, and this test fails on both:
+//
+//   - Envelope loss was undetectable. Passing nil where c.envelope
+//     belongs stripped every _x_* param from three of slk's
+//     highest-traffic calls (client.counts runs on every boot and every
+//     reconnect) and no test in the suite noticed.
+//   - They were unreachable from the harness. pointClientAtTestServer
+//     redirects c.httpClient's transport; a method that ignores
+//     c.httpClient dials slack.com for real, so these endpoints made
+//     live outbound connections during `go test`.
+//
+// Driving them through pointClientAtTestServer covers both: a method
+// that bypasses c.httpClient never reaches this handler, so its
+// response never parses and the subtest fails before the param
+// assertions run.
+func TestHandRolledEndpoints_RouteThroughSharedClient(t *testing.T) {
+	cases := []struct {
+		name     string
+		respBody string
+		call     func(t *testing.T, c *Client)
+	}{
+		{
+			name:     "GetUnreadCounts",
+			respBody: `{"ok":true,"channels":[],"mpims":[],"ims":[],"threads":{"has_unreads":false}}`,
+			call: func(t *testing.T, c *Client) {
+				if _, _, err := c.GetUnreadCounts(); err != nil {
+					t.Fatalf("GetUnreadCounts: %v", err)
+				}
+			},
+		},
+		{
+			name:     "GetChannelSections",
+			respBody: `{"ok":true,"channel_sections":[],"count":0,"cursor":""}`,
+			call: func(t *testing.T, c *Client) {
+				if _, err := c.GetChannelSections(context.Background()); err != nil {
+					t.Fatalf("GetChannelSections: %v", err)
+				}
+			},
+		},
+		{
+			name:     "GetStarredChannels",
+			respBody: `{"ok":true,"items":[],"paging":{"count":0,"total":0}}`,
+			call: func(t *testing.T, c *Client) {
+				if _, err := c.GetStarredChannels(context.Background()); err != nil {
+					t.Fatalf("GetStarredChannels: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotQuery url.Values
+			var gotHost, gotUA string
+			var served bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				served = true
+				gotQuery = r.URL.Query()
+				gotHost = r.Host
+				gotUA = r.Header.Get("User-Agent")
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.respBody))
+			}))
+			defer srv.Close()
+
+			c := NewClient("xoxc-test", "d-cookie")
+			pointClientAtTestServer(t, c, srv)
+			c.Envelope().SetTeamID("T04T4TH8W")
+
+			tc.call(t, c)
+
+			if !served {
+				t.Fatal("request never reached the test server; the endpoint bypassed c.httpClient " +
+					"and dialed the network for real")
+			}
+			// req.URL.Host stays "slack.com" (only the dialer is
+			// redirected), so BrowserTransport's Slack-host gate runs
+			// exactly as it does in production.
+			if gotHost != "slack.com" {
+				t.Errorf("Host = %q; want slack.com — the request must look identical to production", gotHost)
+			}
+			for _, k := range []string{"_x_id", "_x_csid", "slack_route", "_x_version_ts", "fp", "_x_num_retries"} {
+				if gotQuery.Get(k) == "" {
+					t.Errorf("request missing envelope param %s (query: %v)", k, gotQuery)
+				}
+			}
+			if gotQuery.Get("slack_route") != "T04T4TH8W" {
+				t.Errorf("slack_route = %q; want T04T4TH8W", gotQuery.Get("slack_route"))
+			}
+			if gotUA == "" {
+				t.Error("request carries no browser User-Agent")
+			}
+		})
+	}
+}
+
+// TestAPIHTTPClient_FallbackCarriesEnvelope pins the one remaining
+// newCookieHTTPClient call site inside Client. It is reached only by
+// Clients constructed directly in tests (NewClient always sets
+// httpClient), so no wire-level test exercises it — and without this,
+// dropping the envelope there would again be a silent mutation.
+func TestAPIHTTPClient_FallbackCarriesEnvelope(t *testing.T) {
+	env := slackhttp.NewEnvelope()
+	c := &Client{cookie: "d-cookie", envelope: env}
+
+	got := c.apiHTTPClient()
+	bt, ok := got.Transport.(*slackhttp.BrowserTransport)
+	if !ok {
+		t.Fatalf("fallback transport is %T; want *slackhttp.BrowserTransport", got.Transport)
+	}
+	if bt.Env != env {
+		t.Errorf("fallback transport Env = %p; want the client's envelope %p", bt.Env, env)
+	}
+	if got.Jar == nil {
+		t.Error("fallback client has no cookie jar; the d cookie would not be sent")
+	}
+
+	// And when httpClient is set, that exact client is returned —
+	// never a fresh one, which is what made the three endpoints above
+	// unreachable from the test harness.
+	shared := &http.Client{}
+	c.httpClient = shared
+	if c.apiHTTPClient() != shared {
+		t.Error("apiHTTPClient() built a new client while c.httpClient was set")
+	}
+}
