@@ -2726,3 +2726,120 @@ func TestClient_RequestsCarryEnvelopeParams(t *testing.T) {
 		t.Errorf("browser headers missing: UA=%q sec-ch-ua=%q", gotUA, gotSecCHUA)
 	}
 }
+
+// --- client.shouldReload (Task 8) -----------------------------------
+
+func TestShouldReload_ReturnsBuildVersion(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("ParseForm: %v", err)
+		}
+		if got := r.FormValue("build_version_ts"); got == "" {
+			t.Error("build_version_ts not sent in body")
+		}
+		if got := r.FormValue("team_ids"); got != "T04T4TH8W" {
+			t.Errorf("team_ids = %q; want T04T4TH8W", got)
+		}
+		if got := r.FormValue("_x_reason"); got != "boot" {
+			t.Errorf("_x_reason = %q; want boot", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"should_reload":false,"recommended_build_version":1785403654,"build_manifest_last_modified":1785408685}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("xoxc-test", "d-cookie")
+	pointClientAtTestServer(t, c, srv)
+	c.teamID = "T04T4TH8W"
+	c.Envelope().SetTeamID("T04T4TH8W")
+
+	ts, err := c.ShouldReload(context.Background())
+	if err != nil {
+		t.Fatalf("ShouldReload: %v", err)
+	}
+	if ts != "1785403654" {
+		t.Errorf("ShouldReload = %q; want 1785403654", ts)
+	}
+}
+
+func TestShouldReload_DoesNotMutateEnvelope(t *testing.T) {
+	// ShouldReload returns a value; the caller decides whether to store
+	// it. A failed lookup must not be able to clobber a good value.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"recommended_build_version":1785403654}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("xoxc-test", "d-cookie")
+	pointClientAtTestServer(t, c, srv)
+	before := c.Envelope().VersionTS()
+	if _, err := c.ShouldReload(context.Background()); err != nil {
+		t.Fatalf("ShouldReload: %v", err)
+	}
+	if after := c.Envelope().VersionTS(); after != before {
+		t.Errorf("ShouldReload mutated the envelope: %q -> %q", before, after)
+	}
+}
+
+func TestShouldReload_ErrorCases(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"http error", 500, ``},
+		{"api error", 200, `{"ok":false,"error":"invalid_auth"}`},
+		// ok:false *with* a version present. Without an explicit ok
+		// check this parses fine and looks like a success, so this is
+		// the case that actually pins the check — the plain "api error"
+		// body above is caught by the missing-version check instead.
+		{"api error with version", 200, `{"ok":false,"error":"invalid_auth","recommended_build_version":1785403654}`},
+		{"missing version", 200, `{"ok":true}`},
+		{"malformed json", 200, `not json`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer srv.Close()
+
+			c := NewClient("xoxc-test", "d-cookie")
+			pointClientAtTestServer(t, c, srv)
+			before := c.Envelope().VersionTS()
+			if _, err := c.ShouldReload(context.Background()); err == nil {
+				t.Error("ShouldReload returned nil error")
+			}
+			if after := c.Envelope().VersionTS(); after != before {
+				t.Errorf("VersionTS changed on failure: %q -> %q", before, after)
+			}
+		})
+	}
+}
+
+// postForm must treat a non-2xx as a failure rather than handing the
+// caller whatever bytes came back. Slack's Web API answers 200 even for
+// {"ok":false}, so a 5xx here is a proxy/edge failure — and it can
+// still carry a body that parses cleanly, which is how it used to slip
+// through as an apparent success.
+func TestPostForm_NonOKStatusIsAnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("xoxc-test", "d-cookie")
+	pointClientAtTestServer(t, c, srv)
+
+	body, err := c.postForm(context.Background(), "users.prefs.get", nil)
+	if err == nil {
+		t.Fatalf("postForm returned nil error on HTTP 502 (body: %s)", body)
+	}
+	if !strings.Contains(err.Error(), "502") {
+		t.Errorf("error = %v; want it to mention the 502 status", err)
+	}
+}

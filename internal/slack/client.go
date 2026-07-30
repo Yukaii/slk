@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1373,6 +1374,76 @@ func (c *Client) GetMutedChannelsRaw(ctx context.Context) ([]byte, error) {
 	return c.postForm(ctx, "users.prefs.get", nil)
 }
 
+// shouldReloadResponse is the subset of client.shouldReload's response
+// slk reads. The full response also carries should_reload,
+// build_version_enabled, client_min_version,
+// build_manifest_last_modified and should_fetch_new_service_worker —
+// all about whether a browser tab needs to refresh its JS bundle, which
+// a TUI has no equivalent of.
+type shouldReloadResponse struct {
+	OK                      bool   `json:"ok"`
+	Error                   string `json:"error"`
+	RecommendedBuildVersion int64  `json:"recommended_build_version"`
+}
+
+// ShouldReload asks Slack which client build is current and returns
+// that build timestamp as a decimal string, suitable for
+// Envelope.SetVersionTS.
+//
+// _x_version_ts is Slack's build timestamp, and it moves: two captures
+// taken hours apart on 2026-07-30 carried 1785403052 and 1785403654.
+// A client that sends one hardcoded value forever is itself a signal —
+// it stays pinned to a build the fleet has moved off of — so slk learns
+// the current value the way the official client does.
+//
+// Why this endpoint rather than scraping the workspace page: slk used
+// to fetch that page, and commit da6a7e1 deliberately removed the
+// fetch. Issue #111 showed corporate proxies reject that navigation
+// with 403, breaking startup outright. client.shouldReload is a plain
+// form POST under /api/ — the same shape as every other call slk
+// already makes, through the same proxy-tolerant path — and it appears
+// in both official boot captures, so it is both safer and a closer
+// match to real client traffic.
+//
+// The envelope is deliberately NOT mutated here: the caller decides
+// whether to store the result, so a failed or nonsense lookup cannot
+// clobber a good value mid-session.
+func (c *Client) ShouldReload(ctx context.Context) (string, error) {
+	// The official client sends _x_reason=boot on this call;
+	// BrowserTransport reads it back off the context.
+	ctx = slackhttp.WithReason(ctx, "boot")
+
+	form := url.Values{}
+	if c.teamID != "" {
+		form.Set("team_ids", c.teamID)
+	}
+	if c.envelope != nil {
+		// The build slk currently believes is current. The official
+		// client sends the same, so the server can tell it whether to
+		// reload.
+		form.Set("build_version_ts", c.envelope.VersionTS())
+	}
+
+	raw, err := c.postForm(ctx, "client.shouldReload", form)
+	if err != nil {
+		return "", fmt.Errorf("client.shouldReload: %w", err)
+	}
+
+	var srr shouldReloadResponse
+	if err := json.Unmarshal(raw, &srr); err != nil {
+		return "", fmt.Errorf("client.shouldReload: parsing response: %w (body: %s)", err, truncateForLog(raw))
+	}
+	if !srr.OK {
+		return "", fmt.Errorf("client.shouldReload: API error: %s", srr.Error)
+	}
+	if srr.RecommendedBuildVersion <= 0 {
+		// Succeeding with a zero here would hand the caller "0" as a
+		// build timestamp, which is worse than the stale default.
+		return "", fmt.Errorf("client.shouldReload: no recommended_build_version in response (body: %s)", truncateForLog(raw))
+	}
+	return strconv.FormatInt(srr.RecommendedBuildVersion, 10), nil
+}
+
 // postForm performs a cookie-aware POST to an endpoint under
 // c.apiBaseURL with form values. The xoxc token is injected into the
 // form body — the same convention slack-go and the official browser
@@ -1408,7 +1479,21 @@ func (c *Client) postForm(ctx context.Context, method string, form url.Values) (
 		return nil, fmt.Errorf("calling %s: %w", method, err)
 	}
 	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+
+	raw, readErr := io.ReadAll(resp.Body)
+	// Status is checked before the read error so a truncated body on a
+	// 500 reports the 500, which is the useful half of the diagnosis.
+	// Slack's Web API answers 200 even for {"ok":false,...}, so any
+	// non-2xx here is a transport/proxy/edge failure whose body is HTML
+	// at best: reporting it as a JSON parse failure at the call site
+	// (as this used to) hides what actually happened.
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, fmt.Errorf("calling %s: HTTP %s: %s", method, resp.Status, truncateForLog(raw))
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("reading %s response: %w", method, readErr)
+	}
+	return raw, nil
 }
 
 // truncateForLog clips a response body to a length safe to splat into
