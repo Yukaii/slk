@@ -9,6 +9,7 @@ import (
 	"image"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -557,6 +558,18 @@ Docs:    https://github.com/gammons/slk
 `, version)
 }
 
+// newImageHTTPClient builds the HTTP client the avatar/thumbnail
+// fetcher uses.
+//
+// Split out of run() so a test can pin the wiring: the difference
+// between this and the XHR client is invisible at the call site but
+// changes every asset request on the wire.
+func newImageHTTPClient() *http.Client {
+	c := slackhttp.NewImageHTTPClient(nil)
+	c.Timeout = 10 * time.Second
+	return c
+}
+
 func run() error {
 	// Resolve XDG paths
 	configDir := xdgConfig()
@@ -705,9 +718,7 @@ func run() error {
 		})
 		log.Printf("image fetcher: registered team %q (%s) for file auth", t.TeamName, t.TeamID)
 	}
-	imageHTTPClient := slackhttp.NewBrowserHTTPClient(nil)
-	imageHTTPClient.Timeout = 10 * time.Second
-	imageFetcher := imgpkg.NewFetcher(imageCache, imageHTTPClient)
+	imageFetcher := imgpkg.NewFetcher(imageCache, newImageHTTPClient())
 	imageFetcher.SetAuths(auths)
 
 	// Migrate old avatar cache (one-time, idempotent).

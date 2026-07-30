@@ -425,6 +425,159 @@ func TestWebSocketHeadersMatchesCapture(t *testing.T) {
 	}
 }
 
+func TestImageHeaderPairsMatchesCapture(t *testing.T) {
+	// Every header a real Chrome 150 sends on an <img> load from
+	// Slack, with exact values. Measured across 40 files.slack.com
+	// 200-responses in the 2026-07-30 captures.
+	//
+	// Six of these differ from the XHR set: the image Accept list,
+	// Sec-Fetch-Dest: image, Sec-Fetch-Mode: no-cors, Priority: i, a
+	// PRESENT Referer (XHR sends none) and an ABSENT Origin (XHR sends
+	// one). Exact, like TestBrowserHeaderPairsMatchesCapture: a wrong
+	// value is as identifying as a missing header, and an extra header
+	// is a stable slk signature.
+	want := map[string]string{
+		"User-Agent":         UserAgent(),
+		"Accept":             "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+		"Accept-Language":    "en-US,en;q=0.9",
+		"Referer":            "https://app.slack.com/",
+		"Sec-Fetch-Site":     "same-site",
+		"Sec-Fetch-Mode":     "no-cors",
+		"Sec-Fetch-Dest":     "image",
+		"Sec-Ch-Ua":          ClientHintUA(),
+		"Sec-Ch-Ua-Mobile":   "?0",
+		"Sec-Ch-Ua-Platform": ClientHintPlatform(),
+		"Cache-Control":      "no-cache",
+		"Pragma":             "no-cache",
+		"Priority":           "i",
+	}
+	got := imageHeaderPairs()
+
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("imageHeaderPairs()[%q] = %q; want %q", k, got[k], v)
+		}
+	}
+	for k := range got {
+		if _, ok := want[k]; !ok {
+			t.Errorf("imageHeaderPairs() has unexpected header %q = %q; "+
+				"real Chrome does not send it on an image load, so it is an slk-specific signature",
+				k, got[k])
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("imageHeaderPairs() has %d headers; want exactly %d", len(got), len(want))
+	}
+	// Origin is the one header the XHR set has and this one must not:
+	// Chrome sends no Origin on a no-cors image fetch.
+	if v, ok := got["Origin"]; ok {
+		t.Errorf("imageHeaderPairs()[Origin] = %q; want absent (no-cors fetches carry no Origin)", v)
+	}
+}
+
+// doDestReq issues one GET through a BrowserTransport with the given
+// Dest and returns the request as the inner transport saw it.
+func doDestReq(t *testing.T, dest Dest, env *Envelope, host, path string) *http.Request {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	recorder := &captureRT{wrapped: http.DefaultTransport}
+	client := &http.Client{Transport: &BrowserTransport{Inner: recorder, Env: env, Dest: dest}}
+
+	req, err := http.NewRequest("GET", srv.URL+path, nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Host = host
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+	return recorder.last
+}
+
+func TestBrowserTransport_ImageDestSendsImageHeaders(t *testing.T) {
+	// Avatars and file thumbnails are the highest-volume path — 337
+	// CDN requests against 53 API calls on a single boot — so sending
+	// them the XHR set is the largest single divergence available.
+	got := doDestReq(t, DestImage, nil, "files.slack.com", "/files-tmb/T04-F0A-abc/image_480.png")
+
+	for k, want := range map[string]string{
+		"Accept":         "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+		"Sec-Fetch-Dest": "image",
+		"Sec-Fetch-Mode": "no-cors",
+		"Sec-Fetch-Site": "same-site",
+		"Priority":       "i",
+		"Referer":        "https://app.slack.com/",
+	} {
+		if v := got.Header.Get(k); v != want {
+			t.Errorf("image request %s = %q; want %q", k, v, want)
+		}
+	}
+	// Chrome sends no Origin on a no-cors image fetch.
+	if v := got.Header.Get("Origin"); v != "" {
+		t.Errorf("image request Origin = %q; want absent", v)
+	}
+}
+
+func TestBrowserTransport_DefaultDestIsUnchangedXHR(t *testing.T) {
+	// The zero value must stay XHR: every existing construction site
+	// omits Dest, and a silent change of their behaviour is exactly
+	// the class of regression this fix is repairing.
+	got := doDestReq(t, DestXHR, nil, "rands-leadership.slack.com", "/api/conversations.history")
+
+	for k, want := range map[string]string{
+		"Accept":         "*/*",
+		"Sec-Fetch-Dest": "empty",
+		"Sec-Fetch-Mode": "cors",
+		"Priority":       "u=1, i",
+		"Origin":         "https://app.slack.com",
+	} {
+		if v := got.Header.Get(k); v != want {
+			t.Errorf("XHR request %s = %q; want %q", k, v, want)
+		}
+	}
+	if v := got.Header.Get("Referer"); v != "" {
+		t.Errorf("XHR request Referer = %q; want absent (0 of 279 captured API requests carry one)", v)
+	}
+	// DestXHR is the zero value, so an unset Dest must behave
+	// identically.
+	var zero Dest
+	if zero != DestXHR {
+		t.Errorf("zero Dest = %v; want DestXHR so existing call sites are unaffected", zero)
+	}
+}
+
+func TestBrowserTransport_ImageDestCarriesNoEnvelope(t *testing.T) {
+	// Env: nil is the convention on the image path, but conventions
+	// are not enforcement. An image fetch must carry no _x_* params
+	// even if an Envelope is wired up by mistake — and the /api/ path
+	// here defeats the path-based scoping, so only the Dest check can
+	// stop it.
+	env := NewEnvelope()
+	env.SetTeamID("T04T4TH8W")
+	got := doDestReq(t, DestImage, env, "rands-leadership.slack.com", "/api/conversations.history")
+
+	if raw := got.URL.RawQuery; raw != "" {
+		t.Errorf("image-dest request got envelope params: %q", raw)
+	}
+}
+
+func TestNewImageHTTPClientUsesImageDest(t *testing.T) {
+	c := NewImageHTTPClient(nil)
+	bt, ok := c.Transport.(*BrowserTransport)
+	if !ok {
+		t.Fatalf("NewImageHTTPClient transport is %T; want *BrowserTransport", c.Transport)
+	}
+	if bt.Dest != DestImage {
+		t.Errorf("NewImageHTTPClient Dest = %v; want DestImage", bt.Dest)
+	}
+	if bt.Env != nil {
+		t.Errorf("NewImageHTTPClient Env = %v; want nil (asset fetches carry no envelope)", bt.Env)
+	}
+}
+
 func newEnvelopeClient(t *testing.T, env *Envelope) (*http.Client, *captureRT) {
 	t.Helper()
 	recorder := &captureRT{wrapped: http.DefaultTransport}

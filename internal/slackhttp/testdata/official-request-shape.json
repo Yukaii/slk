@@ -45,6 +45,28 @@
     ]
   },
 
+  "image_headers": {
+    "comment": "Headers Chrome sends on an <img> load from Slack — avatars, file thumbnails, emoji. Measured across 40 files.slack.com 200-responses in the 2026-07-30 captures. Six differ from http_headers: the Accept image list, sec-fetch-dest: image, sec-fetch-mode: no-cors, priority: i, a PRESENT Referer, and an ABSENT Origin. Volume makes this the dominant surface: 337 CDN requests against 53 workspace-API calls on a single boot.",
+    "present": [
+      "User-Agent",
+      "Accept",
+      "Accept-Language",
+      "Referer",
+      "Sec-Fetch-Site",
+      "Sec-Fetch-Mode",
+      "Sec-Fetch-Dest",
+      "Sec-Ch-Ua",
+      "Sec-Ch-Ua-Mobile",
+      "Sec-Ch-Ua-Platform",
+      "Cache-Control",
+      "Pragma",
+      "Priority"
+    ],
+    "absent": ["Origin", "DNT"],
+    "absent_evidence": "Origin: Chrome sends none on a no-cors fetch, so the XHR set's Origin would be an slk signature here. DNT: real Chrome DOES send `dnt: 1` in these captures, but it reflects a USER preference rather than the client's identity — most installs leave it off — so reproducing it would narrow slk to that subset instead of blending in.",
+    "accept_encoding_note": "Chrome sends `gzip, deflate, br, zstd`; slk sends none and lets net/http manage it, exactly as on the XHR path. Overriding it would leave response bodies in an encoding this process cannot decode."
+  },
+
   "workspace_api": {
     "comment": "*.slack.com/api/*, 163 captured requests. 0 of 163 carried alphabetically sorted params, so this ORDER is the contract, not just the set.",
     "query_param_order": [

@@ -42,6 +42,53 @@ type BrowserTransport struct {
 	// envelope is scoped to edgeapi and to /api/ paths, so a stray Env
 	// on a files.slack.com client cannot decorate download URLs.
 	Env *Envelope
+
+	// Dest selects which header set to apply. The zero value is
+	// DestXHR, so a BrowserTransport constructed without naming it
+	// keeps the fetch/XHR behaviour every existing call site relies
+	// on.
+	Dest Dest
+}
+
+// Dest is the browser fetch destination a transport is imitating.
+// Chrome sends materially different headers per destination, so a
+// single "browser-like" set is wrong for at least one of them: an
+// avatar sent with Sec-Fetch-Dest: empty and no Referer is no more
+// browser-like than a bare Go client, just differently wrong.
+//
+// This mirrors the split already made for the WebSocket handshake
+// (WebSocketHeaders), for the same reason.
+type Dest int
+
+const (
+	// DestXHR is the fetch/XHR destination: /api/ calls and edgeapi.
+	// It is the zero value deliberately — every pre-existing
+	// construction site omits Dest and must keep XHR behaviour.
+	DestXHR Dest = iota
+
+	// DestImage is an <img> load: avatars, file thumbnails, emoji.
+	DestImage
+)
+
+// String makes test failures name the destination rather than print an
+// integer.
+func (d Dest) String() string {
+	switch d {
+	case DestXHR:
+		return "DestXHR"
+	case DestImage:
+		return "DestImage"
+	default:
+		return fmt.Sprintf("Dest(%d)", int(d))
+	}
+}
+
+// headerPairs returns the header set for d.
+func (d Dest) headerPairs() map[string]string {
+	if d == DestImage {
+		return imageHeaderPairs()
+	}
+	return browserHeaderPairs()
 }
 
 // RoundTrip implements http.RoundTripper.
@@ -56,7 +103,7 @@ func (t *BrowserTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		if req.Header == nil {
 			req.Header = http.Header{}
 		}
-		for k, v := range browserHeaderPairs() {
+		for k, v := range t.Dest.headerPairs() {
 			setIfMissing(req.Header, k, v)
 		}
 		// applyEnvelopeQuery and applyEnvelopeBody both dereference
@@ -64,7 +111,13 @@ func (t *BrowserTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		// transport sees it, but a caller invoking RoundTrip directly
 		// can reach here with one, and a panic is a poor answer to a
 		// malformed request.
-		if t.Env != nil && req.URL != nil {
+		//
+		// DestImage is excluded outright rather than relying on the
+		// path scoping inside applyEnvelope*: an image load carries no
+		// _x_* params in any real client, whatever its URL looks like,
+		// and "the asset client passes Env: nil" is a convention
+		// nothing enforces.
+		if t.Env != nil && req.URL != nil && t.Dest != DestImage {
 			applyEnvelopeQuery(req, t.Env)
 			if err := applyEnvelopeBody(req); err != nil {
 				return nil, err
@@ -80,10 +133,29 @@ func (t *BrowserTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 
 // NewBrowserHTTPClient returns an *http.Client wired up with BrowserTransport
 // and an optional cookie jar. Use this anywhere an http.Client is needed for
-// Slack traffic.
+// Slack XHR traffic.
+//
+// NOT for avatars, thumbnails or emoji: those are image loads, and
+// Chrome's image headers differ from its XHR headers in six places.
+// Use NewImageHTTPClient.
 func NewBrowserHTTPClient(jar http.CookieJar) *http.Client {
 	return &http.Client{
 		Transport: &BrowserTransport{Inner: http.DefaultTransport},
+		Jar:       jar,
+	}
+}
+
+// NewImageHTTPClient returns an *http.Client for asset fetches —
+// avatars, file thumbnails, emoji — carrying Chrome's image header set
+// and no telemetry envelope.
+//
+// Asset traffic dominates by volume: a single boot of the official
+// client made 337 CDN requests against 53 workspace-API calls, so
+// getting this set wrong is a bigger divergence than getting the API
+// set wrong.
+func NewImageHTTPClient(jar http.CookieJar) *http.Client {
+	return &http.Client{
+		Transport: &BrowserTransport{Inner: http.DefaultTransport, Dest: DestImage},
 		Jar:       jar,
 	}
 }
@@ -147,6 +219,57 @@ func browserHeaderPairs() map[string]string {
 		"Cache-Control":      "no-cache",
 		"Pragma":             "no-cache",
 		"Priority":           "u=1, i",
+	}
+}
+
+// imageHeaderPairs is the set Chrome sends on an <img> load from
+// Slack — avatars, file thumbnails, emoji. Measured across 40
+// files.slack.com 200-responses in the 2026-07-30 captures.
+//
+// Six values differ from browserHeaderPairs, and each difference is
+// load-bearing:
+//
+//	Accept          the image list, not */*
+//	Sec-Fetch-Dest  image, not empty
+//	Sec-Fetch-Mode  no-cors, not cors
+//	Priority        i, not u=1, i
+//	Referer         PRESENT — https://app.slack.com/ — where the XHR
+//	                set deliberately has none
+//	Origin          ABSENT — a no-cors fetch carries no Origin, where
+//	                the XHR set sends one
+//
+// The Referer asymmetry is the easy one to get backwards. The
+// official client sends no Referer on /api/ calls, which is why
+// browserHeaderPairs omits it; Chrome DOES send one on image
+// requests. Applying the XHR set here therefore stripped a header
+// real browsers send, making asset fetches LESS browser-like than
+// before that removal.
+//
+// Chrome also sends `dnt: 1` on these requests in the captures. It is
+// deliberately not reproduced: DNT reflects a user's browser
+// preference, not the client's identity, and most Chrome installs
+// leave it off. Sending it would narrow slk to the subset of users who
+// enabled it, which is a signature rather than camouflage.
+//
+// Accept-Encoding is likewise absent, matching browserHeaderPairs:
+// net/http manages it and transparently decompresses the response.
+// Overriding it with Chrome's "gzip, deflate, br, zstd" would leave
+// bodies in an encoding this process cannot decode.
+func imageHeaderPairs() map[string]string {
+	return map[string]string{
+		"User-Agent":         UserAgent(),
+		"Accept":             "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+		"Accept-Language":    "en-US,en;q=0.9",
+		"Referer":            "https://app.slack.com/",
+		"Sec-Fetch-Site":     "same-site",
+		"Sec-Fetch-Mode":     "no-cors",
+		"Sec-Fetch-Dest":     "image",
+		"Sec-Ch-Ua":          ClientHintUA(),
+		"Sec-Ch-Ua-Mobile":   "?0",
+		"Sec-Ch-Ua-Platform": ClientHintPlatform(),
+		"Cache-Control":      "no-cache",
+		"Pragma":             "no-cache",
+		"Priority":           "i",
 	}
 }
 

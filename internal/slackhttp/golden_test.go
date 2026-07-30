@@ -36,6 +36,11 @@ type requestShape struct {
 		Absent  []string `json:"absent"`
 	} `json:"websocket_upgrade_headers"`
 
+	ImageHeaders struct {
+		Present []string `json:"present"`
+		Absent  []string `json:"absent"`
+	} `json:"image_headers"`
+
 	WorkspaceAPI struct {
 		QueryParamOrder []string `json:"query_param_order"`
 		PreBoot         struct {
@@ -73,6 +78,7 @@ func loadRequestShape(t *testing.T) requestShape {
 		len(s.EdgeAPI.QueryParamOrder) == 0 ||
 		len(s.HTTPHeaders.Present) == 0 ||
 		len(s.WebSocketUpgradeHeaders.Present) == 0 ||
+		len(s.ImageHeaders.Present) == 0 ||
 		len(s.WorkspaceAPI.BodyTrailingFieldOrder) == 0 {
 		t.Fatalf("golden fixture parsed but is missing sections: %+v", s)
 	}
@@ -316,6 +322,61 @@ func TestGolden_WebSocketUpgradeHeaders(t *testing.T) {
 		t.Errorf("WS header set (%d) is not smaller than the XHR set (%d); "+
 			"the captures show Chrome sending strictly fewer on an upgrade",
 			len(h), len(shape.HTTPHeaders.Present))
+	}
+}
+
+func TestGolden_ImageHeaders(t *testing.T) {
+	shape := loadRequestShape(t)
+	got := imageHeaderPairs()
+
+	for _, k := range shape.ImageHeaders.Present {
+		if got[k] == "" {
+			t.Errorf("imageHeaderPairs()[%s] absent; fixture requires it on every image fetch", k)
+		}
+	}
+	for _, k := range shape.ImageHeaders.Absent {
+		if v, ok := got[k]; ok {
+			t.Errorf("imageHeaderPairs()[%s] = %q; fixture requires it absent "+
+				"(real Chrome omits it on a no-cors image load, so sending it is an slk signature)", k, v)
+		}
+	}
+	// Exact count: an EXTRA header named in neither list is still a
+	// signature, and neither loop above would catch it.
+	if len(got) != len(shape.ImageHeaders.Present) {
+		keys := make([]string, 0, len(got))
+		for k := range got {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		t.Errorf("imageHeaderPairs() has %d headers %v; fixture requires exactly %d %v",
+			len(got), keys, len(shape.ImageHeaders.Present), shape.ImageHeaders.Present)
+	}
+
+	// And the set must actually reach the wire on the image path.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	recorder := &captureRT{wrapped: http.DefaultTransport}
+	client := &http.Client{Transport: &BrowserTransport{Inner: recorder, Dest: DestImage}}
+	req, err := http.NewRequest("GET", srv.URL+"/files-tmb/T04-F0A-abc/image_480.png", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Host = "files.slack.com"
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+
+	for _, k := range shape.ImageHeaders.Present {
+		if recorder.last.Header.Get(k) == "" {
+			t.Errorf("image request header %s absent on the wire; fixture requires it", k)
+		}
+	}
+	for _, k := range shape.ImageHeaders.Absent {
+		if v := recorder.last.Header.Get(k); v != "" {
+			t.Errorf("image request header %s = %q on the wire; fixture requires it absent", k, v)
+		}
 	}
 }
 
