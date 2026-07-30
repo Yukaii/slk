@@ -400,3 +400,210 @@ func TestWebSocketHeadersMatchesCapture(t *testing.T) {
 		t.Errorf("WebSocketHeaders() has %d headers %v; want exactly %d", len(h), keys, len(want))
 	}
 }
+
+func newEnvelopeClient(t *testing.T, env *Envelope) (*http.Client, *captureRT) {
+	t.Helper()
+	recorder := &captureRT{wrapped: http.DefaultTransport}
+	bt := &BrowserTransport{Inner: recorder, Env: env}
+	return &http.Client{Transport: bt}, recorder
+}
+
+// doEnvelopeReq issues one request through BrowserTransport with the
+// given Host and path, returning the decorated URL query.
+func doEnvelopeReq(t *testing.T, env *Envelope, host, path string) url.Values {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	client, recorder := newEnvelopeClient(t, env)
+
+	req, err := http.NewRequest("POST", srv.URL+path, nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Host = host
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+	return recorder.last.URL.Query()
+}
+
+func TestEnvelopeQuery_WorkspaceAPIPreBoot(t *testing.T) {
+	q := doEnvelopeReq(t, NewEnvelope(), "rands-leadership.slack.com", "/api/experiments.getByUser")
+
+	for k, want := range map[string]string{
+		"_x_frontend_build_type": "current",
+		"_x_desktop_ia":          "4",
+		"_x_gantry":              "true",
+		"fp":                     "6e",
+		"_x_num_retries":         "0",
+		"_x_version_ts":          DefaultVersionTS,
+		"_x_foreground":          "true",
+	} {
+		if q.Get(k) != want {
+			t.Errorf("query %s = %q; want %q", k, q.Get(k), want)
+		}
+	}
+	if !strings.HasPrefix(q.Get("_x_id"), "noversion-") {
+		t.Errorf("_x_id = %q; want noversion- prefix pre-boot", q.Get("_x_id"))
+	}
+	// Pre-boot: absent. Verified 0/14 pre-boot requests carry these.
+	for _, k := range []string{"slack_route", "_x_csid", "_x_b3_traceid", "_x_b3_spanid", "_x_b3_sampled"} {
+		if q.Get(k) != "" {
+			t.Errorf("query %s = %q; want absent pre-boot", k, q.Get(k))
+		}
+	}
+	// _x_app_name is an edgeapi param; it must not appear on workspace API URLs.
+	if q.Get("_x_app_name") != "" {
+		t.Errorf("_x_app_name = %q; want absent on workspace API (edgeapi-only param)", q.Get("_x_app_name"))
+	}
+}
+
+func TestEnvelopeQuery_WorkspaceAPIPostBoot(t *testing.T) {
+	env := NewEnvelope()
+	env.SetTeamID("T04T4TH8W")
+	q := doEnvelopeReq(t, env, "rands-leadership.slack.com", "/api/conversations.history")
+
+	if q.Get("slack_route") != "T04T4TH8W" {
+		t.Errorf("slack_route = %q; want T04T4TH8W", q.Get("slack_route"))
+	}
+	if q.Get("_x_csid") != env.SessionID() {
+		t.Errorf("_x_csid = %q; want %q", q.Get("_x_csid"), env.SessionID())
+	}
+	if len(q.Get("_x_b3_traceid")) != 32 {
+		t.Errorf("_x_b3_traceid = %q; want 32 hex chars", q.Get("_x_b3_traceid"))
+	}
+	if len(q.Get("_x_b3_spanid")) != 16 {
+		t.Errorf("_x_b3_spanid = %q; want 16 hex chars", q.Get("_x_b3_spanid"))
+	}
+	if q.Get("_x_b3_sampled") != "1" {
+		t.Errorf("_x_b3_sampled = %q; want 1", q.Get("_x_b3_sampled"))
+	}
+	if strings.HasPrefix(q.Get("_x_id"), "noversion-") {
+		t.Errorf("_x_id = %q; want 8-hex prefix post-boot", q.Get("_x_id"))
+	}
+}
+
+func TestEnvelopeQuery_EdgeAPIGetsDifferentParams(t *testing.T) {
+	// edgeapi carries ONLY _x_app_name, fp, _x_num_retries (+ b3).
+	// Verified: 116/116 edgeapi requests, none with _x_id, _x_version_ts,
+	// slack_route, _x_csid, _x_frontend_build_type, _x_desktop_ia or
+	// _x_gantry. See testdata/capture-evidence.json.
+	env := NewEnvelope()
+	env.SetTeamID("T04T4TH8W")
+	q := doEnvelopeReq(t, env, "edgeapi.slack.com", "/cache/T04T4TH8W/users/info")
+
+	for k, want := range map[string]string{
+		"_x_app_name":    "client",
+		"fp":             "6e",
+		"_x_num_retries": "0",
+	} {
+		if q.Get(k) != want {
+			t.Errorf("edgeapi query %s = %q; want %q", k, q.Get(k), want)
+		}
+	}
+	for _, k := range []string{
+		"_x_id", "_x_version_ts", "slack_route", "_x_csid",
+		"_x_frontend_build_type", "_x_desktop_ia", "_x_gantry", "_x_foreground",
+	} {
+		if q.Get(k) != "" {
+			t.Errorf("edgeapi query %s = %q; want absent (workspace-API-only param)", k, q.Get(k))
+		}
+	}
+}
+
+func TestEnvelopeQuery_PreservesCallerParams(t *testing.T) {
+	q := doEnvelopeReq(t, NewEnvelope(), "rands-leadership.slack.com",
+		"/api/conversations.history?channel=C123&limit=28")
+	if q.Get("channel") != "C123" || q.Get("limit") != "28" {
+		t.Errorf("caller params lost: channel=%q limit=%q", q.Get("channel"), q.Get("limit"))
+	}
+	if q.Get("fp") != "6e" {
+		t.Error("envelope params not added alongside caller params")
+	}
+}
+
+func TestEnvelopeQuery_DoesNotOverwriteCallerEnvelopeParams(t *testing.T) {
+	// A caller that already set an envelope param owns it. The live case
+	// is a retry: it sets _x_num_retries=1, and the transport must not
+	// report the retried request to Slack as a first attempt.
+	env := NewEnvelope()
+	env.SetTeamID("T04T4TH8W")
+	q := doEnvelopeReq(t, env, "rands-leadership.slack.com",
+		"/api/conversations.history?_x_num_retries=2&_x_id=caller-id&fp=zz"+
+			"&slack_route=T_CALLER&_x_version_ts=999&_x_foreground=false")
+
+	for k, want := range map[string]string{
+		"_x_num_retries": "2",
+		"_x_id":          "caller-id",
+		"fp":             "zz",
+		"slack_route":    "T_CALLER",
+		"_x_version_ts":  "999",
+		"_x_foreground":  "false",
+	} {
+		if got := q.Get(k); got != want {
+			t.Errorf("caller-set %s = %q; want %q (transport must not overwrite)", k, got, want)
+		}
+	}
+	// Each key must appear exactly once: appending rather than
+	// overwriting would send a duplicate query key, which is just as
+	// separable as the wrong value.
+	for k, v := range q {
+		if len(v) != 1 {
+			t.Errorf("query %s has %d values %v; want exactly 1", k, len(v), v)
+		}
+	}
+
+	// Same rule on edgeapi's one host-specific param.
+	eq := doEnvelopeReq(t, env, "edgeapi.slack.com",
+		"/cache/T04T4TH8W/users/info?_x_app_name=caller-app&_x_num_retries=3")
+	if eq.Get("_x_app_name") != "caller-app" {
+		t.Errorf("caller-set _x_app_name = %q; want caller-app", eq.Get("_x_app_name"))
+	}
+	if eq.Get("_x_num_retries") != "3" {
+		t.Errorf("caller-set _x_num_retries = %q; want 3", eq.Get("_x_num_retries"))
+	}
+}
+
+func TestEnvelopeQuery_OmitsEmptyValues(t *testing.T) {
+	// A zero-value Envelope has no version timestamp. Emitting
+	// "_x_version_ts=" is worse than emitting nothing: no real client
+	// ever sends the key empty.
+	q := doEnvelopeReq(t, &Envelope{}, "rands-leadership.slack.com", "/api/conversations.history")
+	for k, v := range q {
+		if v[0] == "" {
+			t.Errorf("query %s emitted with an empty value; want the key omitted", k)
+		}
+	}
+}
+
+func TestEnvelopeQuery_NotAddedToNonSlackHosts(t *testing.T) {
+	q := doEnvelopeReq(t, NewEnvelope(), "example.com", "/whatever")
+	if q.Get("fp") != "" {
+		t.Error("envelope params leaked to a non-Slack host")
+	}
+}
+
+func TestEnvelopeQuery_NilEnvelopeIsSafe(t *testing.T) {
+	// Asset fetches use a BrowserTransport with no Envelope.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	recorder := &captureRT{wrapped: http.DefaultTransport}
+	client := &http.Client{Transport: &BrowserTransport{Inner: recorder, Env: nil}}
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api/x", nil)
+	req.Host = "slack.com"
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do with nil Env: %v", err)
+	}
+	resp.Body.Close()
+	if recorder.last.URL.Query().Get("fp") != "" {
+		t.Error("params added despite nil Envelope")
+	}
+	// Headers must still be applied.
+	if recorder.last.Header.Get("Sec-Ch-Ua") == "" {
+		t.Error("nil Envelope suppressed browser headers")
+	}
+}

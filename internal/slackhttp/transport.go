@@ -21,6 +21,7 @@ package slackhttp
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"runtime"
 	"strings"
 )
@@ -33,6 +34,11 @@ type BrowserTransport struct {
 	// Inner is the underlying transport that actually performs the round
 	// trip. If nil, http.DefaultTransport is used.
 	Inner http.RoundTripper
+
+	// Env supplies the Slack client telemetry envelope (_x_id, _x_csid,
+	// slack_route, ...). If nil, no envelope params are added — asset
+	// fetches to CDN hosts carry no envelope.
+	Env *Envelope
 }
 
 // RoundTrip implements http.RoundTripper.
@@ -49,6 +55,9 @@ func (t *BrowserTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 		for k, v := range browserHeaderPairs() {
 			setIfMissing(req.Header, k, v)
+		}
+		if t.Env != nil {
+			applyEnvelopeQuery(req, t.Env)
 		}
 	}
 	inner := t.Inner
@@ -201,6 +210,101 @@ func clientHintPlatformForGOOS(goos string) string {
 	default:
 		// Linux and anything else (freebsd, openbsd, ...) → Linux.
 		return `"Linux"`
+	}
+}
+
+// isEdgeAPIHost reports whether host is Slack's edge cache API, which
+// takes a different (much smaller) envelope than the workspace API.
+func isEdgeAPIHost(host string) bool {
+	if i := strings.IndexByte(host, ':'); i >= 0 {
+		host = host[:i]
+	}
+	return host == "edgeapi.slack.com"
+}
+
+// envelopeHost returns the host req is logically addressed to.
+//
+// req.Host takes precedence over req.URL.Host because that is what the
+// server sees: net/http sends req.Host as the Host header whenever it
+// is non-empty, regardless of the address actually dialed. RoundTrip's
+// Slack-host gate accepts a match on either field, so classifying the
+// envelope on URL.Host alone would send the workspace param set to a
+// request whose Host header says edgeapi.
+func envelopeHost(req *http.Request) string {
+	if req.Host != "" {
+		return req.Host
+	}
+	if req.URL != nil {
+		return req.URL.Host
+	}
+	return ""
+}
+
+// applyEnvelopeQuery adds Slack's client telemetry params to req's URL,
+// never overwriting a param the caller already set.
+//
+// The two Slack API hosts take DIFFERENT param sets — this is measured,
+// not assumed (see testdata/capture-evidence.json):
+//
+//	workspace API (*.slack.com/api/*), 163 requests:
+//	  always: _x_id, _x_version_ts, _x_frontend_build_type,
+//	          _x_desktop_ia, _x_gantry, fp, _x_num_retries
+//	  post-boot only: slack_route (149/149), _x_csid
+//
+//	edgeapi.slack.com, 116 requests:
+//	  only: _x_app_name, fp, _x_num_retries
+//	  never: _x_id, _x_version_ts, slack_route, _x_csid, or any
+//	         _x_frontend_build_type/_x_desktop_ia/_x_gantry
+//
+// Sending the workspace set to edgeapi would be an slk-specific
+// signature, which is exactly what this package exists to avoid.
+func applyEnvelopeQuery(req *http.Request, env *Envelope) {
+	q := req.URL.Query()
+	host := envelopeHost(req)
+
+	// Universal on both hosts.
+	setQueryIfMissing(q, "fp", "6e")
+	setQueryIfMissing(q, "_x_num_retries", "0")
+
+	if isEdgeAPIHost(host) {
+		setQueryIfMissing(q, "_x_app_name", "client")
+	} else {
+		setQueryIfMissing(q, "_x_id", env.RequestID())
+		setQueryIfMissing(q, "_x_version_ts", env.VersionTS())
+		setQueryIfMissing(q, "_x_frontend_build_type", "current")
+		setQueryIfMissing(q, "_x_desktop_ia", "4")
+		setQueryIfMissing(q, "_x_gantry", "true")
+		// The real client varies _x_foreground with browser tab focus
+		// (145/163 carry true). A TUI has no equivalent notion, and
+		// omitting a param present on 88% of traffic is the larger
+		// divergence, so always send true.
+		setQueryIfMissing(q, "_x_foreground", "true")
+
+		if teamID := env.TeamID(); teamID != "" {
+			setQueryIfMissing(q, "slack_route", teamID)
+			setQueryIfMissing(q, "_x_csid", env.SessionID())
+		}
+	}
+
+	// B3 trace ids appear on only 14-18% of real requests, but they are
+	// per-request random values rather than constants, so over-sending
+	// is much less identifying than emitting a wrong fixed value.
+	if env.TeamID() != "" {
+		trace, span := env.TraceIDs()
+		setQueryIfMissing(q, "_x_b3_traceid", trace)
+		setQueryIfMissing(q, "_x_b3_spanid", span)
+		setQueryIfMissing(q, "_x_b3_sampled", "1")
+	}
+
+	req.URL.RawQuery = q.Encode()
+}
+
+func setQueryIfMissing(q url.Values, key, value string) {
+	if value == "" {
+		return
+	}
+	if q.Get(key) == "" {
+		q.Set(key, value)
 	}
 }
 
