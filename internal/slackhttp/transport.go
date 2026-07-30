@@ -490,6 +490,11 @@ func applyEnvelopeQuery(req *http.Request, env *Envelope) {
 // url.Values.Encode() sorts alphabetically, which would put
 // _x_app_name first and token last — an order no real client produces.
 //
+// The tail is not fixed-width: the other 14 of 163 bodies carry no
+// _x_mode, and on those the remaining three keep this relative order
+// (_x_reason, _x_sonic, _x_app_name). mode.go owns which endpoints
+// those are.
+//
 // Only application/x-www-form-urlencoded bodies are touched. Multipart
 // bodies (file uploads) and the JSON bodies edgeapi takes as
 // text/plain pass through untouched; rewriting either would corrupt
@@ -551,12 +556,19 @@ func applyEnvelopeBody(req *http.Request) error {
 	// produces on only 10 of 163 requests. Falling back to the
 	// endpoint's observed reason keeps slk inside the 94% instead of
 	// pinning it to the 6%. An explicit WithReason always wins.
+	method := methodFromPath(req.URL.Path)
 	reason := ReasonFrom(req.Context())
 	if reason == "" {
-		reason = defaultReason(methodFromPath(req.URL.Path))
+		reason = defaultReason(method)
 	}
 	add("_x_reason", reason)
-	add("_x_mode", "online")
+	// _x_mode is NOT universal: 14 of the 163 captured form bodies
+	// omit it, split cleanly across seven boot-phase endpoints. See
+	// mode.go, which owns that set and the caveat about what the
+	// captures cannot distinguish.
+	if sendsXMode(method) {
+		add("_x_mode", "online")
+	}
 	add("_x_sonic", "true")
 	add("_x_app_name", "client")
 

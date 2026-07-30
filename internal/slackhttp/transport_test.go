@@ -1047,9 +1047,20 @@ func TestEnvelopeBody_DefaultsReasonPerEndpoint(t *testing.T) {
 			if v := vals.Get("_x_reason"); v != want {
 				t.Errorf("_x_reason = %q; want %q (body %q)", v, want, got)
 			}
-			// The rest of the envelope tail is unchanged.
-			if !strings.HasSuffix(got, "_x_mode=online&_x_sonic=true&_x_app_name=client") {
-				t.Errorf("body = %q; want _x_mode/_x_sonic/_x_app_name tail", got)
+			// The rest of the envelope tail is unchanged — except that
+			// client.userBoot and client.shouldReload are two of the
+			// seven boot-phase endpoints the official client sends no
+			// _x_mode on (see mode.go), so their tail is this sequence
+			// minus that one field. Spelled out here rather than asked
+			// of sendsXMode: a test that derived it from the code under
+			// test would follow a wrong exclusion set instead of failing
+			// on it.
+			wantTail := "_x_mode=online&_x_sonic=true&_x_app_name=client"
+			if method == "client.userBoot" || method == "client.shouldReload" {
+				wantTail = "_x_sonic=true&_x_app_name=client"
+			}
+			if !strings.HasSuffix(got, wantTail) {
+				t.Errorf("body = %q; want tail %q", got, wantTail)
 			}
 		})
 	}
@@ -1228,5 +1239,129 @@ func TestEnvelopeBody_NotAppliedToNonAPIPaths(t *testing.T) {
 		"/files-tmb/x.png", "application/x-www-form-urlencoded", "a=1", "boot")
 	if got != "a=1" {
 		t.Errorf("non-API path body was rewritten: %q", got)
+	}
+}
+
+// The seven endpoints below are spelled out rather than read from
+// xModeExcludedMethods on purpose. A test that iterated the map it is
+// checking would pass on any set, including an empty one — it would
+// track the implementation instead of the captures.
+var xModeAbsentEndpoints = []string{
+	"api.features",
+	"client.getWebSocketURL",
+	"client.shouldReload",
+	"client.userBoot",
+	"conversations.view",
+	"experiments.getByUser",
+	"features.access.policies.list",
+}
+
+func TestEnvelopeBody_OmitsXModeOnBootPhaseEndpoints(t *testing.T) {
+	// _x_mode is not universal. Of the 163 captured form bodies, 14
+	// carry none, split cleanly across these seven boot-phase
+	// endpoints — zero endpoints are mixed. slk shipped the
+	// unconditional form, so it sent _x_mode on client.shouldReload,
+	// which Phase 1 calls on every startup, and would have done the
+	// same for client.userBoot and conversations.view.
+	for _, method := range xModeAbsentEndpoints {
+		t.Run(method, func(t *testing.T) {
+			got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
+				"/api/"+method, "application/x-www-form-urlencoded", "token=xoxc-abc", "")
+
+			vals, err := url.ParseQuery(got)
+			if err != nil {
+				t.Fatalf("ParseQuery(%q): %v", got, err)
+			}
+			if v, ok := vals["_x_mode"]; ok {
+				t.Errorf("body = %q has _x_mode=%v; the captures show %s sending none (n=2)",
+					got, v, method)
+			}
+			// The other three keep their captured relative order when
+			// _x_mode drops out — the tail shrinks, it does not
+			// reshuffle, and _x_reason is still mandatory.
+			if !strings.HasSuffix(got, "_x_sonic=true&_x_app_name=client") {
+				t.Errorf("body = %q; want a _x_sonic/_x_app_name tail", got)
+			}
+			if vals.Get("_x_reason") == "" {
+				t.Errorf("body = %q has no _x_reason; dropping _x_mode must not drop the reason", got)
+			}
+			keys := queryKeyOrder(got)
+			want := []string{"token", "_x_reason", "_x_sonic", "_x_app_name"}
+			if len(keys) != len(want) {
+				t.Fatalf("body keys = %v; want exactly %v", keys, want)
+			}
+			for i := range want {
+				if keys[i] != want[i] {
+					t.Errorf("body key[%d] = %q; want %q (full: %v)", i, keys[i], want[i], keys)
+				}
+			}
+		})
+	}
+}
+
+func TestEnvelopeBody_KeepsXModeOnEveryOtherEndpoint(t *testing.T) {
+	// The exclusion is by EXACT method name. A prefix or namespace
+	// match — the realistic way to get this wrong — would strip
+	// _x_mode from these, and the captures show every one of them
+	// sending it on every observation.
+	cases := []struct{ method, why string }{
+		{"client.counts", "shares the client. namespace with 3 excluded methods; sends _x_mode 6/6"},
+		{"conversations.history", "shares conversations. with conversations.view; 14/14"},
+		{"conversations.listPrefs", "shares conversations. with conversations.view; 7/7"},
+		{"conversations.bulkReacjiTriggers", "shares conversations. with conversations.view; 7/7"},
+		{"dnd.teamInfo", "highest-volume form body in the captures; 17/17"},
+		{"bookmarks.list", "8/8"},
+		{"users.prefs.get", "4/4"},
+		{"api.test", "shares the api. namespace with api.features"},
+		{"features.access.policies.listMore", "has an excluded method as a strict prefix"},
+		{"conversations.viewers", "has conversations.view as a strict prefix"},
+		{"client.userBootstrap", "has client.userBoot as a strict prefix"},
+		{"some.unmapped.method", "no capture entry at all; unknown endpoints join the 149/163 majority"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.method, func(t *testing.T) {
+			got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
+				"/api/"+tc.method, "application/x-www-form-urlencoded", "token=xoxc-abc", "")
+
+			vals, err := url.ParseQuery(got)
+			if err != nil {
+				t.Fatalf("ParseQuery(%q): %v", got, err)
+			}
+			if v := vals.Get("_x_mode"); v != "online" {
+				t.Errorf("body = %q has _x_mode=%q; want \"online\" (%s)", got, v, tc.why)
+			}
+			// And in the captured position: after _x_reason, before
+			// _x_sonic and _x_app_name.
+			if !strings.HasSuffix(got, "_x_mode=online&_x_sonic=true&_x_app_name=client") {
+				t.Errorf("body = %q; want the _x_mode/_x_sonic/_x_app_name tail", got)
+			}
+			keys := queryKeyOrder(got)
+			want := []string{"token", "_x_reason", "_x_mode", "_x_sonic", "_x_app_name"}
+			if len(keys) != len(want) {
+				t.Fatalf("body keys = %v; want exactly %v", keys, want)
+			}
+			for i := range want {
+				if keys[i] != want[i] {
+					t.Errorf("body key[%d] = %q; want %q (full: %v)", i, keys[i], want[i], keys)
+				}
+			}
+		})
+	}
+}
+
+func TestEnvelopeBody_XModeExclusionSetMatchesCaptures(t *testing.T) {
+	// Guards the SIZE of the set from both directions. Inverting the
+	// rule, or widening it to a prefix, changes how many endpoints are
+	// excluded, and the two tables above would still each pass if the
+	// other's endpoints leaked in — this one pins the boundary itself.
+	if len(xModeExcludedMethods) != len(xModeAbsentEndpoints) {
+		t.Errorf("xModeExcludedMethods has %d entries; the captures name exactly %d "+
+			"endpoints that never send _x_mode: %v",
+			len(xModeExcludedMethods), len(xModeAbsentEndpoints), xModeAbsentEndpoints)
+	}
+	for _, m := range xModeAbsentEndpoints {
+		if _, ok := xModeExcludedMethods[m]; !ok {
+			t.Errorf("xModeExcludedMethods is missing %q, which sends no _x_mode in 2 of 2 captures", m)
+		}
 	}
 }

@@ -48,6 +48,7 @@ type requestShape struct {
 			XIDPrefix    string   `json:"x_id_prefix"`
 		} `json:"pre_boot"`
 		BodyTrailingFieldOrder []string `json:"body_trailing_field_order"`
+		BodyXModeAbsentMethods []string `json:"body_x_mode_absent_methods"`
 		XReasonPlacement       string   `json:"x_reason_placement"`
 		XReasonAlwaysPresent   bool     `json:"x_reason_always_present"`
 	} `json:"workspace_api"`
@@ -79,7 +80,8 @@ func loadRequestShape(t *testing.T) requestShape {
 		len(s.HTTPHeaders.Present) == 0 ||
 		len(s.WebSocketUpgradeHeaders.Present) == 0 ||
 		len(s.ImageHeaders.Present) == 0 ||
-		len(s.WorkspaceAPI.BodyTrailingFieldOrder) == 0 {
+		len(s.WorkspaceAPI.BodyTrailingFieldOrder) == 0 ||
+		len(s.WorkspaceAPI.BodyXModeAbsentMethods) == 0 {
 		t.Fatalf("golden fixture parsed but is missing sections: %+v", s)
 	}
 	return s
@@ -435,4 +437,50 @@ func TestGolden_XReasonAlwaysPresentOnWorkspaceBodies(t *testing.T) {
 	tail = tail[len(tail)-len(shape.WorkspaceAPI.BodyTrailingFieldOrder):]
 	assertKeyOrder(t, "workspace API body tail (defaulted reason)",
 		tail, shape.WorkspaceAPI.BodyTrailingFieldOrder)
+}
+
+func TestGolden_BodyXModeAbsentOnBootPhaseEndpoints(t *testing.T) {
+	shape := loadRequestShape(t)
+
+	// The no-_x_mode tail is DERIVED from the canonical tail by
+	// removing _x_mode in place, the same way pre_boot's query order is
+	// derived. Restating it as a second literal list would let the two
+	// drift apart, and the point of this test is that the OTHER three
+	// fields keep their relative order when _x_mode drops out.
+	var want []string
+	for _, k := range shape.WorkspaceAPI.BodyTrailingFieldOrder {
+		if k != "_x_mode" {
+			want = append(want, k)
+		}
+	}
+	if len(want) == len(shape.WorkspaceAPI.BodyTrailingFieldOrder) {
+		t.Fatal("fixture's body_trailing_field_order contains no _x_mode; " +
+			"this test would then assert nothing")
+	}
+
+	for _, method := range shape.WorkspaceAPI.BodyXModeAbsentMethods {
+		t.Run(method, func(t *testing.T) {
+			env := NewEnvelope()
+			env.SetTeamID("T04T4TH8W")
+			req := goldenReq(t, env, "rands-leadership.slack.com", "/api/"+method,
+				"application/x-www-form-urlencoded", "token=xoxc-redacted", "")
+
+			raw, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			keys := queryKeyOrder(string(raw))
+			for _, k := range keys {
+				if k == "_x_mode" {
+					t.Fatalf("body = %q carries _x_mode; the captures show %s sending "+
+						"none (it is one of the %d boot-phase endpoints in the fixture's "+
+						"body_x_mode_absent_methods)", raw, method, len(shape.WorkspaceAPI.BodyXModeAbsentMethods))
+				}
+			}
+			if len(keys) < len(want) {
+				t.Fatalf("body keys = %v; fixture requires the %d-field tail %v", keys, len(want), want)
+			}
+			assertKeyOrder(t, method+" body tail (no _x_mode)", keys[len(keys)-len(want):], want)
+		})
+	}
 }

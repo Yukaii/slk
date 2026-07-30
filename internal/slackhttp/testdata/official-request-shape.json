@@ -104,6 +104,18 @@
       "_x_app_name"
     ],
     "body_trailing_evidence": "149 of 163 request bodies end in exactly this sequence, with business params (token, channel, …) first.",
+    "body_x_mode_absent_methods": [
+      "api.features",
+      "client.getWebSocketURL",
+      "client.shouldReload",
+      "client.userBoot",
+      "conversations.view",
+      "experiments.getByUser",
+      "features.access.policies.list"
+    ],
+    "body_x_mode_evidence": "The tail above is the 149-request MAJORITY, not a universal. The other 14 of 163 form bodies carry NO _x_mode, and the split is clean per-endpoint: zero endpoints are mixed. These seven account for all 14, at n=2 each. On them the remaining three fields keep their relative order (_x_reason, _x_sonic, _x_app_name), so body_trailing_field_order minus _x_mode is the expected shape — derived, never restated, so the two cannot drift. This is a SET, not an ordered list; the order here is alphabetical for reading only. Endpoints that always send _x_mode include dnd.teamInfo (17), conversations.history (14), bookmarks.list (8), conversations.listPrefs (7), conversations.bulkReacjiTriggers (7), client.counts (6), users.prefs.get (4) — note client.counts and the conversations.* trio, which share a name prefix with entries in this set and must NOT be caught by it.",
+    "body_x_mode_ambiguity": "WHAT THE CAPTURES CANNOT SETTLE. All seven are boot-phase calls and every observation of all seven is at boot time, so the data is equally consistent with (a) 'these endpoints never carry _x_mode' and (b) 'nothing carries _x_mode until some boot event fires, and these seven are merely the only endpoints called before it'. _x_mode=online reads as a liveness marker, which makes (b) the more plausible causal story, but no capture separates the two: that would need an endpoint observed both before AND after boot, and there is none. slk encodes (a) because it is what was measured, and because under (b) it still emits the right bytes for every endpoint there is evidence for. Do NOT restate this file as if the causal rule were known.",
+    "body_x_mode_shipped_bug": "slk shipped the unconditional form: every urlencoded body got _x_mode=online. Phase 1 added a client.shouldReload call (to source _x_version_ts), so slk sent _x_mode on an endpoint the real client never sends it on, on every startup. Phase 2a Tasks 7 and 8 add client.userBoot and conversations.view, two more from this set.",
     "x_reason_placement": "body",
     "x_reason_evidence": "153 occurrences as a form field, 0 in any query string, 48 distinct values.",
     "x_reason_always_present": true,
