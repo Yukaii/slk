@@ -10,6 +10,7 @@
 package slackhttp
 
 import (
+	"fmt"
 	"net/http"
 	"runtime"
 	"strings"
@@ -80,23 +81,47 @@ func BrowserHeaders() http.Header {
 	return h
 }
 
-// UserAgent returns a Chrome 120 User-Agent string appropriate for the host
-// OS. We intentionally pin a specific Chrome major version rather than
-// auto-bumping: this string only needs to be plausible, not bleeding-edge.
-// Update it manually every ~6 months if anomaly reports return.
+// chromeMajor is the Chrome major version slk impersonates. The
+// User-Agent string and the sec-ch-ua client hints are both derived
+// from it so they can never disagree — a Chrome UA paired with absent
+// or mismatched client hints is a combination real Chrome never emits,
+// and is trivially detectable. Bump this at release time.
+const chromeMajor = "150"
+
+// UserAgent returns a Chrome User-Agent appropriate for the host OS.
 func UserAgent() string {
 	return userAgentForGOOS(runtime.GOOS)
 }
 
 func userAgentForGOOS(goos string) string {
+	const tmpl = "Mozilla/5.0 (%s) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s.0.0.0 Safari/537.36"
 	switch goos {
 	case "darwin":
-		return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+		return fmt.Sprintf(tmpl, "Macintosh; Intel Mac OS X 10_15_7", chromeMajor)
 	case "windows":
-		return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+		return fmt.Sprintf(tmpl, "Windows NT 10.0; Win64; x64", chromeMajor)
 	default:
 		// Linux and anything else (freebsd, openbsd, ...) → Linux UA.
-		return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+		return fmt.Sprintf(tmpl, "X11; Linux x86_64", chromeMajor)
+	}
+}
+
+// ClientHintUA returns the sec-ch-ua header value matching UserAgent().
+// Format mirrors Chrome 150 exactly, including the GREASE brand.
+func ClientHintUA() string {
+	return fmt.Sprintf(`"Not;A=Brand";v="8", "Chromium";v="%s", "Google Chrome";v="%s"`,
+		chromeMajor, chromeMajor)
+}
+
+// ClientHintPlatform returns the sec-ch-ua-platform value for the host OS.
+func ClientHintPlatform() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return `"macOS"`
+	case "windows":
+		return `"Windows"`
+	default:
+		return `"Linux"`
 	}
 }
 

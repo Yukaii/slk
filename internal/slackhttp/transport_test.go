@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -202,5 +204,36 @@ func TestUserAgentForGOOS(t *testing.T) {
 				t.Errorf("userAgentForGOOS(%q) = %q; want Mozilla/5.0 prefix", tc.goos, got)
 			}
 		})
+	}
+}
+
+func TestUserAgentAndClientHintsShareMajorVersion(t *testing.T) {
+	ua := UserAgent()
+	// Extract "150" from ".../Chrome/150.0.0.0 Safari/..."
+	m := regexp.MustCompile(`Chrome/(\d+)\.`).FindStringSubmatch(ua)
+	if m == nil {
+		t.Fatalf("UserAgent() = %q; no Chrome/<major> found", ua)
+	}
+	uaMajor := m[1]
+
+	hint := ClientHintUA()
+	if !strings.Contains(hint, `"Chromium";v="`+uaMajor+`"`) {
+		t.Errorf("ClientHintUA() = %q; want it to contain Chromium v=%q", hint, uaMajor)
+	}
+	if !strings.Contains(hint, `"Google Chrome";v="`+uaMajor+`"`) {
+		t.Errorf("ClientHintUA() = %q; want it to contain Google Chrome v=%q", hint, uaMajor)
+	}
+}
+
+func TestChromeMajorIsCurrent(t *testing.T) {
+	// Guards against the Chrome/120-in-2026 staleness that made slk
+	// separable. Bump chromeMajor (and this floor) at release time.
+	const floor = 150
+	n, err := strconv.Atoi(chromeMajor)
+	if err != nil {
+		t.Fatalf("chromeMajor = %q; not an integer", chromeMajor)
+	}
+	if n < floor {
+		t.Errorf("chromeMajor = %d; want >= %d (stale UA is itself an anomaly signal)", n, floor)
 	}
 }
