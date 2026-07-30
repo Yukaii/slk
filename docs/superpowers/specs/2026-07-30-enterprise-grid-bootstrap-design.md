@@ -92,6 +92,11 @@ payoff, included because it shares the same code paths.
 | `referer` | **absent** in all five captures | **sent** (`transport.go:45`) |
 | User-Agent | `Chrome/150.0.0.0` | `Chrome/120.0.0.0` (`transport.go:94`) |
 
+The "Official" column above is the union across host classes, not what any
+single request carries: the workspace API and `edgeapi` take **different**
+envelopes, and `_x_app_name` is an `edgeapi` query param but a workspace-API
+*body* field. See the per-host breakdown under *Approach* below.
+
 Two of these are self-defeating: a Chrome/120 UA in 2026 is 30 major versions
 stale, and a Chrome UA with no `sec-ch-ua` client hints is a combination real
 Chrome never produces. Adding a `referer` the real client omits makes slk
@@ -153,13 +158,54 @@ forking slack-go's URL construction.
    derive the client-hint version from the same constant so they cannot
    drift.
 
-2. **Envelope params** (all **query** params, including the `_x_b3_*` trio —
-   the captures show them in the query string on `conversations.history`, not
-   as headers) on any `*.slack.com/api/*` or `edgeapi.slack.com/*` request:
-   `_x_id`, `_x_version_ts`, `_x_frontend_build_type=current`,
-   `_x_desktop_ia=4`, `_x_gantry=true`, `fp=6e`, `_x_num_retries=0`, plus
-   `slack_route=<teamID>`, `_x_csid`, and fresh
-   `_x_b3_traceid` / `_x_b3_spanid` / `_x_b3_sampled=1`.
+2. **Envelope params** — all **query** params, including the `_x_b3_*` trio
+   (the captures show them in the query string on `conversations.history`,
+   not as headers).
+
+   **The two host classes take different envelopes.** An earlier draft of
+   this section listed one set for both; that is wrong, and sending the
+   workspace set to `edgeapi` would itself be an slk-specific signature.
+   Measured, not assumed:
+
+   | | Workspace API (`*.slack.com/api/*`) | edgeapi (`edgeapi.slack.com/*`) |
+   |---|---|---|
+   | Requests measured | 163 | 116 |
+   | `_x_app_name` | — (body only) | `client` |
+   | `_x_id` | yes | **never** (0/116) |
+   | `_x_csid` | post-boot | **never** |
+   | `slack_route` | post-boot | **never** |
+   | `_x_version_ts` | yes | **never** |
+   | `_x_foreground` | yes | **never** |
+   | `_x_frontend_build_type` / `_x_desktop_ia` / `_x_gantry` | `current` / `4` / `true` | **never** |
+   | `_x_b3_traceid` / `_x_b3_spanid` / `_x_b3_sampled` | post-boot | yes |
+   | `fp` / `_x_num_retries` | `6e` / `0` | `6e` / `0` |
+
+   **Param order is part of the contract, not an implementation detail.**
+   0 of the 163 workspace-API requests carried alphabetically sorted params.
+   The client emits one canonical sequence, with optional members omitted
+   *in place* and `fp` / `_x_num_retries` always last. `url.Values.Encode()`
+   sorts keys, so using it would give every slk request a perfectly
+   alphabetized query string — a stable distributional signature, which is
+   exactly what this layer exists to remove. The transport therefore
+   assembles queries and bodies by hand.
+
+   Canonical workspace-API order (13 params, post-boot):
+
+   ```
+   _x_id, _x_csid, slack_route, _x_version_ts, _x_foreground,
+   _x_frontend_build_type, _x_desktop_ia, _x_gantry,
+   _x_b3_traceid, _x_b3_spanid, _x_b3_sampled, fp, _x_num_retries
+   ```
+
+   Canonical edgeapi order (6 params, 116/116 matching):
+
+   ```
+   _x_app_name, _x_b3_traceid, _x_b3_spanid, _x_b3_sampled, fp, _x_num_retries
+   ```
+
+   Both orders, and the pre-boot subset, are pinned in
+   `internal/slackhttp/testdata/official-request-shape.json` and asserted
+   against live `BrowserTransport` output by `golden_test.go`.
 
    **Identity has two phases**, and replicating the transition matters:
    before the team id is known, `_x_id` uses the literal prefix `noversion-`
@@ -184,6 +230,18 @@ forking slack-go's URL construction.
 
    Verified body-only: `_x_reason` occurs 153 times as a form field across the
    captures and **never** in a query string (48 distinct values observed).
+
+   **The body envelope is workspace-API-only.** edgeapi bodies are JSON sent
+   as `content-type: text/plain;charset=UTF-8` and carry **zero** `_x_*`
+   fields — 116/116. The transport must pass them through byte-for-byte;
+   injecting form fields would both corrupt the JSON and produce a body
+   shape no real client emits.
+
+   **Body field order is a contract too.** The captured trailing sequence is
+   `_x_reason, _x_mode, _x_sonic, _x_app_name` on 149/163 requests, with
+   business params (`token`, `channel`, …) first. `url.Values.Encode()`
+   would sort alphabetically, putting `_x_app_name` first and `token` last —
+   an order no real client produces.
 
 ### `_x_version_ts` sourcing
 
