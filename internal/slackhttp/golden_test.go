@@ -47,10 +47,11 @@ type requestShape struct {
 			AbsentParams []string `json:"absent_params"`
 			XIDPrefix    string   `json:"x_id_prefix"`
 		} `json:"pre_boot"`
-		BodyTrailingFieldOrder []string `json:"body_trailing_field_order"`
-		BodyXModeAbsentMethods []string `json:"body_x_mode_absent_methods"`
-		XReasonPlacement       string   `json:"x_reason_placement"`
-		XReasonAlwaysPresent   bool     `json:"x_reason_always_present"`
+		BodyTrailingFieldOrder   []string `json:"body_trailing_field_order"`
+		BodyXModeAbsentMethods   []string `json:"body_x_mode_absent_methods"`
+		BodyXReasonAbsentMethods []string `json:"body_x_reason_absent_methods"`
+		XReasonPlacement         string   `json:"x_reason_placement"`
+		XReasonPresentOutside    bool     `json:"x_reason_present_outside_absent_methods"`
 	} `json:"workspace_api"`
 
 	EdgeAPI struct {
@@ -81,7 +82,8 @@ func loadRequestShape(t *testing.T) requestShape {
 		len(s.WebSocketUpgradeHeaders.Present) == 0 ||
 		len(s.ImageHeaders.Present) == 0 ||
 		len(s.WorkspaceAPI.BodyTrailingFieldOrder) == 0 ||
-		len(s.WorkspaceAPI.BodyXModeAbsentMethods) == 0 {
+		len(s.WorkspaceAPI.BodyXModeAbsentMethods) == 0 ||
+		len(s.WorkspaceAPI.BodyXReasonAbsentMethods) == 0 {
 		t.Fatalf("golden fixture parsed but is missing sections: %+v", s)
 	}
 	return s
@@ -407,11 +409,20 @@ func TestGolden_XReasonIsBodyOnly(t *testing.T) {
 	}
 }
 
-func TestGolden_XReasonAlwaysPresentOnWorkspaceBodies(t *testing.T) {
+func TestGolden_XReasonPresentOnNonExcludedWorkspaceBodies(t *testing.T) {
 	shape := loadRequestShape(t)
-	if !shape.WorkspaceAPI.XReasonAlwaysPresent {
-		t.Fatal("fixture x_reason_always_present is false; slk must never emit a " +
-			"workspace-API body with _x_mode and no _x_reason")
+	if !shape.WorkspaceAPI.XReasonPresentOutside {
+		t.Fatal("fixture x_reason_present_outside_absent_methods is false; slk must never " +
+			"emit a workspace-API body with _x_mode and no _x_reason")
+	}
+	// conversations.history is deliberately not in
+	// body_x_reason_absent_methods; if it ever were, this test would be
+	// asserting the opposite of what it says.
+	for _, m := range shape.WorkspaceAPI.BodyXReasonAbsentMethods {
+		if m == "conversations.history" {
+			t.Fatal("fixture lists conversations.history as omitting _x_reason; " +
+				"this test drives that endpoint precisely because it does not")
+		}
 	}
 
 	env := NewEnvelope()
@@ -445,20 +456,34 @@ func TestGolden_BodyXModeAbsentOnBootPhaseEndpoints(t *testing.T) {
 	// The no-_x_mode tail is DERIVED from the canonical tail by
 	// removing _x_mode in place, the same way pre_boot's query order is
 	// derived. Restating it as a second literal list would let the two
-	// drift apart, and the point of this test is that the OTHER three
-	// fields keep their relative order when _x_mode drops out.
-	var want []string
-	for _, k := range shape.WorkspaceAPI.BodyTrailingFieldOrder {
-		if k != "_x_mode" {
-			want = append(want, k)
-		}
+	// drift apart, and the point of this test is that the OTHER fields
+	// keep their relative order when _x_mode drops out.
+	//
+	// Five of these seven are also in body_x_reason_absent_methods and
+	// lose _x_reason as well, so the removal set is per-endpoint —
+	// still derived, never restated.
+	reasonAbsent := make(map[string]struct{}, len(shape.WorkspaceAPI.BodyXReasonAbsentMethods))
+	for _, m := range shape.WorkspaceAPI.BodyXReasonAbsentMethods {
+		reasonAbsent[m] = struct{}{}
 	}
-	if len(want) == len(shape.WorkspaceAPI.BodyTrailingFieldOrder) {
+	derive := func(method string) []string {
+		var out []string
+		_, alsoNoReason := reasonAbsent[method]
+		for _, k := range shape.WorkspaceAPI.BodyTrailingFieldOrder {
+			if k == "_x_mode" || (alsoNoReason && k == "_x_reason") {
+				continue
+			}
+			out = append(out, k)
+		}
+		return out
+	}
+	if len(derive("client.userBoot")) == len(shape.WorkspaceAPI.BodyTrailingFieldOrder) {
 		t.Fatal("fixture's body_trailing_field_order contains no _x_mode; " +
 			"this test would then assert nothing")
 	}
 
 	for _, method := range shape.WorkspaceAPI.BodyXModeAbsentMethods {
+		want := derive(method)
 		t.Run(method, func(t *testing.T) {
 			env := NewEnvelope()
 			env.SetTeamID("T04T4TH8W")
@@ -482,5 +507,77 @@ func TestGolden_BodyXModeAbsentOnBootPhaseEndpoints(t *testing.T) {
 			}
 			assertKeyOrder(t, method+" body tail (no _x_mode)", keys[len(keys)-len(want):], want)
 		})
+	}
+}
+
+func TestGolden_BodyXReasonAbsentOnNeitherFlagEndpoints(t *testing.T) {
+	shape := loadRequestShape(t)
+
+	// Same derivation discipline as the _x_mode test: the two-field
+	// tail comes out of body_trailing_field_order by removing both
+	// leading fields in place, never restated as a literal.
+	var want []string
+	for _, k := range shape.WorkspaceAPI.BodyTrailingFieldOrder {
+		if k != "_x_reason" && k != "_x_mode" {
+			want = append(want, k)
+		}
+	}
+	if len(want) != len(shape.WorkspaceAPI.BodyTrailingFieldOrder)-2 {
+		t.Fatalf("fixture's body_trailing_field_order %v does not contain both "+
+			"_x_reason and _x_mode; this test would then assert the wrong tail",
+			shape.WorkspaceAPI.BodyTrailingFieldOrder)
+	}
+
+	for _, method := range shape.WorkspaceAPI.BodyXReasonAbsentMethods {
+		t.Run(method, func(t *testing.T) {
+			env := NewEnvelope()
+			env.SetTeamID("T04T4TH8W")
+			req := goldenReq(t, env, "rands-leadership.slack.com", "/api/"+method,
+				"application/x-www-form-urlencoded", "token=xoxc-redacted", "")
+
+			raw, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			keys := queryKeyOrder(string(raw))
+			for _, k := range keys {
+				if k == "_x_reason" {
+					t.Fatalf("body = %q carries _x_reason; the captures show %s sending "+
+						"none (it is one of the %d endpoints in the fixture's "+
+						"body_x_reason_absent_methods)", raw, method,
+						len(shape.WorkspaceAPI.BodyXReasonAbsentMethods))
+				}
+			}
+			if len(keys) < len(want) {
+				t.Fatalf("body keys = %v; fixture requires the %d-field tail %v", keys, len(want), want)
+			}
+			assertKeyOrder(t, method+" body tail (neither flag)", keys[len(keys)-len(want):], want)
+		})
+	}
+}
+
+func TestGolden_XReasonAbsentMethodsAreASubsetOfXModeAbsentMethods(t *testing.T) {
+	// The fixture's own statement of the hierarchy, checked against
+	// itself. body_x_reason_invariant records that the captures hold
+	// zero requests carrying _x_mode without _x_reason; if these two
+	// lists ever stopped nesting, the fixture would be describing a
+	// wire shape the official client never produces.
+	shape := loadRequestShape(t)
+	modeAbsent := make(map[string]struct{}, len(shape.WorkspaceAPI.BodyXModeAbsentMethods))
+	for _, m := range shape.WorkspaceAPI.BodyXModeAbsentMethods {
+		modeAbsent[m] = struct{}{}
+	}
+	for _, m := range shape.WorkspaceAPI.BodyXReasonAbsentMethods {
+		if _, ok := modeAbsent[m]; !ok {
+			t.Errorf("fixture: %q is in body_x_reason_absent_methods but not in "+
+				"body_x_mode_absent_methods; that is the (_x_reason=false, _x_mode=true) "+
+				"combination the captures show 0 times in 163", m)
+		}
+	}
+	if len(shape.WorkspaceAPI.BodyXReasonAbsentMethods) >= len(shape.WorkspaceAPI.BodyXModeAbsentMethods) {
+		t.Errorf("fixture: body_x_reason_absent_methods (%d) is not a STRICT subset of "+
+			"body_x_mode_absent_methods (%d); the captures show a 2-endpoint middle tier",
+			len(shape.WorkspaceAPI.BodyXReasonAbsentMethods),
+			len(shape.WorkspaceAPI.BodyXModeAbsentMethods))
 	}
 }

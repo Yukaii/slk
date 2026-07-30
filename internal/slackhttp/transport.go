@@ -552,16 +552,25 @@ func applyEnvelopeBody(req *http.Request) error {
 		out = append(out, envelopeParam{key, value})
 	}
 	// _x_reason is caller intent, but almost no caller supplies it, and
-	// a body with _x_mode and no _x_reason is a shape the real client
-	// produces on only 10 of 163 requests. Falling back to the
-	// endpoint's observed reason keeps slk inside the 94% instead of
-	// pinning it to the 6%. An explicit WithReason always wins.
+	// a body carrying _x_mode with no _x_reason is a shape the real
+	// client produces on 0 of 163 requests. Falling back to the
+	// endpoint's observed reason keeps slk inside the 153/163 majority
+	// instead of pinning it to a shape the client never emits. An
+	// explicit WithReason beats the fallback.
+	//
+	// _x_reason is NOT universal either: 10 of the 163 captured bodies
+	// omit it, split cleanly across five boot-phase endpoints that also
+	// omit _x_mode. On those, no reason is emitted at all — not the
+	// endpoint default and not an explicit WithReason. reason.go owns
+	// that set and explains why the exclusion outranks caller intent.
 	method := methodFromPath(req.URL.Path)
-	reason := ReasonFrom(req.Context())
-	if reason == "" {
-		reason = defaultReason(method)
+	if sendsXReason(method) {
+		reason := ReasonFrom(req.Context())
+		if reason == "" {
+			reason = defaultReason(method)
+		}
+		add("_x_reason", reason)
 	}
-	add("_x_reason", reason)
 	// _x_mode is NOT universal: 14 of the 163 captured form bodies
 	// omit it, split cleanly across seven boot-phase endpoints. See
 	// mode.go, which owns that set and the caveat about what the

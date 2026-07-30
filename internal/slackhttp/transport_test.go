@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -1098,37 +1099,48 @@ func TestEnvelopeBody_ExplicitReasonBeatsDefault(t *testing.T) {
 }
 
 func TestEnvelopeBody_NeverSendsXModeWithoutXReason(t *testing.T) {
-	// The exact predicate this default exists to eliminate. A
-	// workspace-API body that carries _x_mode must carry _x_reason,
-	// whatever the endpoint and whether or not the caller set one.
-	paths := []string{
-		"/api/conversations.history",
-		"/api/client.counts",
-		"/api/some.unmapped.method",
-		"/api/chat.postMessage",
+	// The exact predicate the reason default exists to eliminate, now
+	// swept over every endpoint tier rather than four always-both ones.
+	// Of the 163 captured form bodies the joint distribution is
+	// (_x_reason, _x_mode) = (t,t) 149, (t,f) 4, (f,f) 10, (f,t) ZERO.
+	// So on ANY workspace-API body slk builds: _x_mode present implies
+	// _x_reason present. Whether the caller supplied a reason must not
+	// change that.
+	methods := []string{
+		"conversations.history", "client.counts", "some.unmapped.method",
+		"chat.postMessage", "conversations.viewers",
 	}
-	for _, path := range paths {
+	methods = append(methods, xModeAbsentEndpoints...)   // includes the middle tier
+	methods = append(methods, xReasonAbsentEndpoints...) // the neither-flag tier
+	var sawXMode int
+	for _, method := range methods {
 		for _, reason := range []string{"", "boot"} {
-			name := path
+			name := method
 			if reason != "" {
 				name += "+reason"
 			}
 			t.Run(name, func(t *testing.T) {
 				got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
-					path, "application/x-www-form-urlencoded", "token=xoxc-abc", reason)
-				if !strings.Contains(got, "_x_mode") {
-					t.Fatalf("body = %q; expected the envelope tail on a workspace API body", got)
-				}
+					"/api/"+method, "application/x-www-form-urlencoded", "token=xoxc-abc", reason)
 				vals, err := url.ParseQuery(got)
 				if err != nil {
 					t.Fatalf("ParseQuery(%q): %v", got, err)
 				}
+				if _, ok := vals["_x_mode"]; !ok {
+					return
+				}
+				sawXMode++
 				if vals.Get("_x_reason") == "" {
 					t.Errorf("body = %q carries _x_mode without _x_reason; that pair is a "+
-						"single-predicate separator matching ~6%% of official traffic", got)
+						"single-predicate separator matching 0 of 163 official requests", got)
 				}
 			})
 		}
+	}
+	// Without this the sweep goes vacuous the moment something makes
+	// every body drop _x_mode.
+	if sawXMode == 0 {
+		t.Error("no body in the sweep carried _x_mode at all; this test asserted nothing")
 	}
 }
 
@@ -1276,17 +1288,30 @@ func TestEnvelopeBody_OmitsXModeOnBootPhaseEndpoints(t *testing.T) {
 				t.Errorf("body = %q has _x_mode=%v; the captures show %s sending none (n=2)",
 					got, v, method)
 			}
-			// The other three keep their captured relative order when
-			// _x_mode drops out — the tail shrinks, it does not
-			// reshuffle, and _x_reason is still mandatory.
+			// The remaining fields keep their captured relative order
+			// when _x_mode drops out — the tail shrinks, it does not
+			// reshuffle.
 			if !strings.HasSuffix(got, "_x_sonic=true&_x_app_name=client") {
 				t.Errorf("body = %q; want a _x_sonic/_x_app_name tail", got)
 			}
-			if vals.Get("_x_reason") == "" {
-				t.Errorf("body = %q has no _x_reason; dropping _x_mode must not drop the reason", got)
+			// These seven are NOT one tier. Five of them also send no
+			// _x_reason (see xReasonAbsentEndpoints); the other two,
+			// client.shouldReload and client.userBoot, do send one.
+			// This test originally asserted "dropping _x_mode must not
+			// drop the reason" for all seven, which was true of the
+			// captures for only two of them.
+			want := []string{"token", "_x_reason", "_x_sonic", "_x_app_name"}
+			if slices.Contains(xReasonAbsentEndpoints, method) {
+				if v, ok := vals["_x_reason"]; ok {
+					t.Errorf("body = %q has _x_reason=%v; %s sends neither flag (n=2)",
+						got, v, method)
+				}
+				want = []string{"token", "_x_sonic", "_x_app_name"}
+			} else if vals.Get("_x_reason") == "" {
+				t.Errorf("body = %q has no _x_reason; %s is in the middle tier — it drops "+
+					"_x_mode but keeps the reason (4 of 163 requests)", got, method)
 			}
 			keys := queryKeyOrder(got)
-			want := []string{"token", "_x_reason", "_x_sonic", "_x_app_name"}
 			if len(keys) != len(want) {
 				t.Fatalf("body keys = %v; want exactly %v", keys, want)
 			}
@@ -1362,6 +1387,273 @@ func TestEnvelopeBody_XModeExclusionSetMatchesCaptures(t *testing.T) {
 	for _, m := range xModeAbsentEndpoints {
 		if _, ok := xModeExcludedMethods[m]; !ok {
 			t.Errorf("xModeExcludedMethods is missing %q, which sends no _x_mode in 2 of 2 captures", m)
+		}
+	}
+}
+
+// The five endpoints below are spelled out rather than read from
+// xReasonExcludedMethods, for the same reason xModeAbsentEndpoints is:
+// a test that iterated the map it checks would pass on any set,
+// including an empty one.
+//
+// Measured across the 2026-07-30 captures: of 163 form-body API
+// requests, 153 carry _x_reason and 10 do not, split cleanly
+// per-endpoint at n=2 each. These five are a strict SUBSET of
+// xModeAbsentEndpoints — they send neither flag.
+var xReasonAbsentEndpoints = []string{
+	"api.features",
+	"client.getWebSocketURL",
+	"conversations.view",
+	"experiments.getByUser",
+	"features.access.policies.list",
+}
+
+func TestEnvelopeBody_OmitsXReasonOnNeitherFlagEndpoints(t *testing.T) {
+	// slk shipped _x_reason unconditionally, falling back to
+	// defaultReason and ultimately to genericReason. On these five
+	// that emits a field the real client never sends on them — and
+	// none of the five has a defaultReasons entry, so all five would
+	// carry the generic fallback, a value no captured request on those
+	// endpoints holds.
+	for _, method := range xReasonAbsentEndpoints {
+		t.Run(method, func(t *testing.T) {
+			got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
+				"/api/"+method, "application/x-www-form-urlencoded", "token=xoxc-abc", "")
+
+			vals, err := url.ParseQuery(got)
+			if err != nil {
+				t.Fatalf("ParseQuery(%q): %v", got, err)
+			}
+			if v, ok := vals["_x_reason"]; ok {
+				t.Errorf("body = %q has _x_reason=%v; the captures show %s sending none (n=2)",
+					got, v, method)
+			}
+			if v, ok := vals["_x_mode"]; ok {
+				t.Errorf("body = %q has _x_mode=%v; %s is in the _x_mode exclusion set too",
+					got, v, method)
+			}
+			// With both dropped the remaining two keep their captured
+			// relative order: the tail shrinks, it does not reshuffle.
+			keys := queryKeyOrder(got)
+			want := []string{"token", "_x_sonic", "_x_app_name"}
+			if len(keys) != len(want) {
+				t.Fatalf("body keys = %v; want exactly %v", keys, want)
+			}
+			for i := range want {
+				if keys[i] != want[i] {
+					t.Errorf("body key[%d] = %q; want %q (full: %v)", i, keys[i], want[i], keys)
+				}
+			}
+		})
+	}
+}
+
+func TestEnvelopeBody_KeepsXReasonOnEveryOtherEndpoint(t *testing.T) {
+	// The exclusion is by EXACT method name. A prefix match — the
+	// realistic way to get this wrong, and the trap the _x_mode work
+	// already has a case for — would silently strip _x_reason from
+	// every method below whose name starts with one of the five.
+	cases := []struct{ method, why string }{
+		{"client.userBoot", "middle tier: no _x_mode, but DOES send _x_reason=initial-data"},
+		{"client.shouldReload", "middle tier: no _x_mode, but DOES send _x_reason=boot"},
+		{"conversations.viewers", "has conversations.view as a strict prefix"},
+		{"client.getWebSocketURLv2", "has client.getWebSocketURL as a strict prefix"},
+		{"api.featuresList", "has api.features as a strict prefix"},
+		{"experiments.getByUserID", "has experiments.getByUser as a strict prefix"},
+		{"features.access.policies.listMore", "has features.access.policies.list as a strict prefix"},
+		{"conversations.history", "shares conversations. with conversations.view; sends both flags"},
+		{"client.counts", "shares client. with two excluded methods; sends both flags"},
+		{"api.test", "shares api. with api.features"},
+		{"some.unmapped.method", "no capture entry; unknown endpoints join the 153/163 majority"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.method, func(t *testing.T) {
+			got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
+				"/api/"+tc.method, "application/x-www-form-urlencoded", "token=xoxc-abc", "")
+
+			vals, err := url.ParseQuery(got)
+			if err != nil {
+				t.Fatalf("ParseQuery(%q): %v", got, err)
+			}
+			if vals.Get("_x_reason") == "" {
+				t.Errorf("body = %q has no _x_reason; want one (%s)", got, tc.why)
+			}
+			// And in the captured position: first field of the tail.
+			keys := queryKeyOrder(got)
+			if len(keys) < 2 || keys[1] != "_x_reason" {
+				t.Errorf("body keys = %v; want _x_reason immediately after the business params", keys)
+			}
+		})
+	}
+}
+
+func TestEnvelopeBody_ExplicitReasonDoesNotResurrectOnExcludedEndpoints(t *testing.T) {
+	// DECISION, deliberately different from how the defaultReasons
+	// table behaves. defaultReasons is consulted only when the caller
+	// supplied nothing, so an explicit WithReason beats it. This set
+	// is not like that: it is a statement about the WIRE SHAPE the
+	// official client produces on these endpoints, not about caller
+	// intent. Honouring a caller's reason here would reintroduce
+	// exactly the divergence the set exists to remove, and would do so
+	// silently, from whichever call site happened to pass one.
+	for _, method := range xReasonAbsentEndpoints {
+		t.Run(method, func(t *testing.T) {
+			got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
+				"/api/"+method, "application/x-www-form-urlencoded", "token=xoxc-abc",
+				"caller-supplied-reason")
+			vals, err := url.ParseQuery(got)
+			if err != nil {
+				t.Fatalf("ParseQuery(%q): %v", got, err)
+			}
+			if v, ok := vals["_x_reason"]; ok {
+				t.Errorf("body = %q has _x_reason=%v; an explicit WithReason must NOT "+
+					"put the field back on %s — the exclusion describes the wire shape, "+
+					"not caller intent", got, v, method)
+			}
+		})
+	}
+}
+
+func TestEnvelopeBody_BodySuppliedReasonSurvivesOnExcludedEndpoints(t *testing.T) {
+	// The other half of the decision above, and a deliberate seam. The
+	// transport only ever APPENDS to a caller-built body; it does not
+	// strip fields the caller put there. So a caller that writes
+	// _x_reason into the form itself still gets it on the wire, even on
+	// an excluded endpoint. Pinned so the boundary is a documented
+	// choice rather than a surprise: the ctx-carried reason is the one
+	// this package owns and the one it declines to emit.
+	got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
+		"/api/conversations.view", "application/x-www-form-urlencoded",
+		"token=xoxc-abc&_x_reason=caller-wrote-this-into-the-body", "")
+	vals, err := url.ParseQuery(got)
+	if err != nil {
+		t.Fatalf("ParseQuery(%q): %v", got, err)
+	}
+	if v := vals["_x_reason"]; len(v) != 1 || v[0] != "caller-wrote-this-into-the-body" {
+		t.Errorf("_x_reason = %v; want exactly [caller-wrote-this-into-the-body] — the "+
+			"transport must neither duplicate nor remove a body param the caller supplied", v)
+	}
+}
+
+func TestXReasonExclusionSetMatchesCaptures(t *testing.T) {
+	// Guards the SIZE of the set from both directions, the same way
+	// TestEnvelopeBody_XModeExclusionSetMatchesCaptures does: the two
+	// wire-level tables above would each still pass if the other's
+	// endpoints leaked in. This pins the boundary itself.
+	if len(xReasonExcludedMethods) != len(xReasonAbsentEndpoints) {
+		t.Errorf("xReasonExcludedMethods has %d entries; the captures name exactly %d "+
+			"endpoints that never send _x_reason: %v",
+			len(xReasonExcludedMethods), len(xReasonAbsentEndpoints), xReasonAbsentEndpoints)
+	}
+	for _, m := range xReasonAbsentEndpoints {
+		if _, ok := xReasonExcludedMethods[m]; !ok {
+			t.Errorf("xReasonExcludedMethods is missing %q, which sends no _x_reason in 2 of 2 captures", m)
+		}
+	}
+}
+
+func TestXReasonExclusionIsSubsetOfXModeExclusion(t *testing.T) {
+	// The strict hierarchy the captures show, asserted on the tables
+	// rather than only on the wire. Of 163 form bodies the joint
+	// distribution of the two flags is (reason, mode) = (t,t) 149,
+	// (t,f) 4, (f,f) 10, (f,t) ZERO. So "omits _x_reason" implies
+	// "omits _x_mode": the five are a subset of the seven.
+	for _, m := range xReasonAbsentEndpoints {
+		if _, ok := xModeExcludedMethods[m]; !ok {
+			t.Errorf("%q omits _x_reason but is not in xModeExcludedMethods; the captures "+
+				"contain zero requests carrying _x_mode without _x_reason", m)
+		}
+	}
+	// And the middle tier is non-empty — otherwise the two sets are
+	// identical and this test, plus the tier distinction itself, would
+	// be asserting nothing.
+	reasonAbsent := make(map[string]struct{}, len(xReasonAbsentEndpoints))
+	for _, m := range xReasonAbsentEndpoints {
+		reasonAbsent[m] = struct{}{}
+	}
+	var middle []string
+	for _, m := range xModeAbsentEndpoints {
+		if _, ok := reasonAbsent[m]; !ok {
+			middle = append(middle, m)
+		}
+	}
+	if len(middle) != 2 {
+		t.Errorf("middle tier (no _x_mode but yes _x_reason) = %v; the captures show "+
+			"exactly 2, client.shouldReload and client.userBoot, at 4 of 163 requests", middle)
+	}
+}
+
+func TestSendsXModeImpliesSendsXReason(t *testing.T) {
+	// The invariant asserted at the accessor level, where it is meant
+	// to hold BY CONSTRUCTION rather than by the two tables happening
+	// to agree. sendsXMode must never return true for a method
+	// sendsXReason returns false for, whatever a future edit does to
+	// either table.
+	corpus := []string{"", "api.features", "api.test", "chat.postMessage",
+		"client.counts", "client.getWebSocketURL", "client.getWebSocketURLv2",
+		"client.shouldReload", "client.userBoot", "client.userBootstrap",
+		"conversations.history", "conversations.view", "conversations.viewers",
+		"dnd.info", "experiments.getByUser", "features.access.policies.list",
+		"features.access.policies.listMore", "some.unmapped.method", "users.prefs.get"}
+	corpus = append(corpus, xModeAbsentEndpoints...)
+	corpus = append(corpus, xReasonAbsentEndpoints...)
+	for _, m := range corpus {
+		if sendsXMode(m) && !sendsXReason(m) {
+			t.Errorf("sendsXMode(%q) is true but sendsXReason(%q) is false; the captures "+
+				"contain zero of the 163 form bodies carrying _x_mode without _x_reason", m, m)
+		}
+	}
+}
+
+func TestSendsXModeGuardHoldsWhenTheTablesStopNesting(t *testing.T) {
+	// The test above cannot distinguish "sendsXMode enforces the
+	// invariant" from "the two tables happen to nest, so the guard
+	// never runs". Today they DO nest, so deleting the guard entirely
+	// leaves the whole suite green — a surviving mutation, and the
+	// exact failure mode this project keeps finding.
+	//
+	// So: break the nesting on purpose. Adding an endpoint to the
+	// _x_reason exclusion and forgetting the _x_mode one is the
+	// realistic future edit, and it must not be able to put
+	// (_x_mode present, _x_reason absent) on the wire — a shape 0 of
+	// the 163 captured requests have.
+	//
+	// White-box, and deliberately so: the guard has no other seam.
+	// Package-level mutation is safe here because nothing in this
+	// package's tests runs in parallel; the defer restores it either
+	// way.
+	const synthetic = "synthetic.notInEitherTable"
+	if _, ok := xModeExcludedMethods[synthetic]; ok {
+		t.Fatalf("%q is in xModeExcludedMethods; pick a name that is in neither table", synthetic)
+	}
+	if !sendsXMode(synthetic) {
+		t.Fatalf("sendsXMode(%q) is already false before the edit; this test would assert nothing", synthetic)
+	}
+
+	xReasonExcludedMethods[synthetic] = struct{}{}
+	defer delete(xReasonExcludedMethods, synthetic)
+
+	if sendsXReason(synthetic) {
+		t.Fatalf("sendsXReason(%q) is true after adding it to xReasonExcludedMethods; "+
+			"the setup did not take effect", synthetic)
+	}
+	if sendsXMode(synthetic) {
+		t.Errorf("sendsXMode(%q) is true while sendsXReason(%q) is false. The two tables "+
+			"no longer nest and nothing stopped it: sendsXMode must refuse _x_mode "+
+			"whenever _x_reason is suppressed, by construction rather than by the "+
+			"tables agreeing", synthetic, synthetic)
+	}
+
+	// And at the wire level, not just the accessor.
+	got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
+		"/api/"+synthetic, "application/x-www-form-urlencoded", "token=xoxc-abc", "")
+	vals, err := url.ParseQuery(got)
+	if err != nil {
+		t.Fatalf("ParseQuery(%q): %v", got, err)
+	}
+	if _, hasMode := vals["_x_mode"]; hasMode {
+		if vals.Get("_x_reason") == "" {
+			t.Errorf("body = %q carries _x_mode without _x_reason", got)
 		}
 	}
 }

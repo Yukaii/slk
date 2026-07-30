@@ -60,7 +60,22 @@ var xModeExcludedMethods = map[string]struct{}{
 // methodFromPath — the same key defaultReason is looked up by.
 //
 // An unknown method sends _x_mode, matching the 149/163 majority.
+//
+// The sendsXReason guard makes the captures' one empty cell
+// unreachable BY CONSTRUCTION rather than by the two tables happening
+// to nest: 0 of the 163 captured form bodies carry _x_mode without
+// _x_reason, and "has _x_mode, lacks _x_reason" is the single-predicate
+// separator reason.go's defaultReasons table exists to close. Today
+// xReasonExcludedMethods is a strict subset of the map above, so the
+// guard never fires and is pure redundancy — which is the point. It is
+// here so that an edit adding an endpoint to one table and forgetting
+// the other cannot put that shape on the wire. Pinned by
+// TestSendsXModeImpliesSendsXReason and, at the wire level, by
+// TestEnvelopeBody_NeverSendsXModeWithoutXReason.
 func sendsXMode(method string) bool {
+	if !sendsXReason(method) {
+		return false
+	}
 	_, excluded := xModeExcludedMethods[method]
 	return !excluded
 }

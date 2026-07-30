@@ -105,6 +105,86 @@ func defaultReason(method string) string {
 	return genericReason
 }
 
+// xReasonExcludedMethods is the set of API methods whose form bodies
+// the official web client sends WITHOUT _x_reason at all. Sibling of
+// mode.go's xModeExcludedMethods, and deliberately a second small
+// table rather than a merged one: mode.go's entry carries a long
+// evidence-and-caveat comment that a restructure would have to rewrite
+// wholesale, for no gain the subset test below does not already give.
+//
+// Measured across the 2026-07-30 captures: of 163 form-body API
+// requests, 153 carry _x_reason and 10 do not. The split is clean
+// per-endpoint — zero endpoints are mixed — and these five account for
+// all 10, at n=2 each.
+//
+// The two tables nest. The full joint distribution of the flags is:
+//
+//	(_x_reason, _x_mode) -> count
+//	  (true,  true)  -> 149
+//	  (true,  false) ->   4
+//	  (false, false) ->  10
+//	  (false, true)  ->   0   <-- never observed
+//
+// So there are three tiers, not four: these five send neither flag;
+// client.shouldReload and client.userBoot send _x_reason but no
+// _x_mode; everything else sends both. This set is therefore a strict
+// SUBSET of xModeExcludedMethods, pinned by
+// TestXReasonExclusionIsSubsetOfXModeExclusion.
+//
+// The empty cell matters on its own. "Carries _x_mode, carries no
+// _x_reason" is the exact single-predicate separator the defaultReasons
+// table above was introduced to close, and it must stay closed no
+// matter what a future edit does to either table — see sendsXMode,
+// which enforces it structurally rather than trusting the two sets to
+// keep agreeing.
+//
+// SAME CAVEAT AS mode.go, and it applies with equal force here: all
+// five are boot-phase calls and every observation of all five is at
+// boot time, so the captures cannot separate "these endpoints never
+// carry _x_reason" from "nothing carries one until some boot event
+// fires". This table encodes the former because it is what was
+// measured, and because it emits the right bytes for every endpoint
+// there is evidence for either way.
+//
+// Lookup is by exact method name, as in mode.go, and a prefix match
+// would be wrong in the same concrete ways: "conversations.view" would
+// swallow conversations.viewers, "client.getWebSocketURL" would
+// swallow a hypothetical client.getWebSocketURLv2, and
+// "features.access.policies.list" would swallow
+// features.access.policies.listMore.
+var xReasonExcludedMethods = map[string]struct{}{
+	"api.features":                  {},
+	"client.getWebSocketURL":        {},
+	"conversations.view":            {},
+	"experiments.getByUser":         {},
+	"features.access.policies.list": {},
+}
+
+// sendsXReason reports whether a workspace-API form body for the given
+// API method should carry _x_reason. method is the name produced by
+// methodFromPath.
+//
+// An unknown method sends _x_reason, matching the 153/163 majority.
+//
+// DELIBERATELY NOT ctx-aware, unlike defaultReason. defaultReasons is
+// a fallback — it fills in a value the caller did not supply, so an
+// explicit WithReason beats it. This set is not a fallback: it is a
+// statement about the shape the official client puts on the wire for
+// these five endpoints, and the client puts no _x_reason there for any
+// caller intent. Honouring a WithReason here would reintroduce exactly
+// the divergence the set removes, silently, from whichever call site
+// passed one. So the exclusion wins over an explicit reason. Pinned by
+// TestEnvelopeBody_ExplicitReasonDoesNotResurrectOnExcludedEndpoints.
+//
+// This does not reach a caller that writes _x_reason into the form
+// body itself: applyEnvelopeBody only ever appends, and never removes
+// a param the caller supplied. That seam is pinned by
+// TestEnvelopeBody_BodySuppliedReasonSurvivesOnExcludedEndpoints.
+func sendsXReason(method string) bool {
+	_, excluded := xReasonExcludedMethods[method]
+	return !excluded
+}
+
 // methodFromPath extracts the Slack API method name from a request
 // path — the segment after /api/. Returns "" for a non-API path, which
 // defaultReason then answers with the generic fallback.
