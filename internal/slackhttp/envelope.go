@@ -35,10 +35,6 @@ type Envelope struct {
 	sessionID string // 11 base64url chars, stable for the process
 	teamID    atomic.Value
 	versionTS atomic.Value
-
-	// lastMillis is the last epoch-millisecond handed out by RequestID.
-	// See nextMillis for why _x_id needs a counter and not just a clock.
-	lastMillis atomic.Int64
 }
 
 // NewEnvelope returns an Envelope in the pre-boot phase.
@@ -92,48 +88,22 @@ func (e *Envelope) SessionID() string {
 	return e.sessionID
 }
 
-// RequestID returns a fresh _x_id for one request. The value is unique
-// for the life of the process; see nextMillis.
+// RequestID returns a fresh _x_id for one request.
+//
+// Deliberately NOT guaranteed unique. The official client timestamps
+// _x_id at call-composition time with no uniqueness clamp: in
+// initial-load.har, 53 requests produced 52 distinct values, with
+// 741e4b14-1785407067.503 sent twice 68 ms apart. Forcing uniqueness
+// would give slk a perfectly monotonic sequence where real Chrome
+// shows occasional same-millisecond collisions — a distributional
+// difference, and this package exists to remove those.
 func (e *Envelope) RequestID() string {
 	prefix := "noversion"
 	if e.TeamID() != "" {
 		prefix = e.clientID
 	}
-	ms := e.nextMillis()
-	return fmt.Sprintf("%s-%d.%03d", prefix, ms/1000, ms%1000)
-}
-
-// nextMillis returns a strictly increasing epoch-millisecond value: the
-// current time, or one past the previous value when the clock has not
-// advanced. It is lock-free so request goroutines never contend.
-//
-// _x_id's wire format is <prefix>-<unix>.<millis> — three decimal places,
-// pinned by the captures — so a bare clock read collides whenever two
-// requests are built in the same millisecond. That is not hypothetical:
-// slk issues several calls back-to-back at boot, and a plain time.Now()
-// implementation duplicated on the *second* consecutive call.
-//
-// Note the official client does NOT guarantee uniqueness here. In
-// initial-load.har, users.prefs.get and teams.trials.info both carry
-// _x_id=741e4b14-1785407067.503. So duplicates are within observed
-// behaviour and are not themselves a fingerprint. We avoid them anyway
-// because _x_id exists to correlate a single call, and a collision
-// makes slk's own traffic ambiguous for no benefit.
-//
-// The clamp only ever moves the value forward, and only under bursts
-// exceeding one request per millisecond, so the timestamp stays within
-// a few milliseconds of the wall clock in any realistic TUI workload.
-func (e *Envelope) nextMillis() int64 {
-	for {
-		last := e.lastMillis.Load()
-		next := time.Now().UnixMilli()
-		if next <= last {
-			next = last + 1
-		}
-		if e.lastMillis.CompareAndSwap(last, next) {
-			return next
-		}
-	}
+	now := time.Now()
+	return fmt.Sprintf("%s-%d.%03d", prefix, now.Unix(), now.Nanosecond()/1e6)
 }
 
 // TraceIDs returns a fresh (traceID, spanID) pair for one request,

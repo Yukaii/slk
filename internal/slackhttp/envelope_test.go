@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestEnvelope_PreBootIdentity(t *testing.T) {
@@ -48,18 +49,31 @@ func TestEnvelope_PostBootIdentity(t *testing.T) {
 	}
 }
 
-func TestEnvelope_RequestIDIsUnique(t *testing.T) {
-	// _x_id must differ per request; Slack uses it to correlate a single
-	// call. A constant value would be its own signature.
+func TestEnvelope_RequestIDFormat(t *testing.T) {
+	// _x_id is deliberately NOT unique — see RequestID's doc comment.
+	// What matters is the shape: <prefix>-<unix-seconds>.<millis>, with
+	// exactly three digits of millisecond precision.
 	e := NewEnvelope()
 	e.SetTeamID("T04T4TH8W")
-	seen := make(map[string]bool, 100)
-	for i := 0; i < 100; i++ {
+
+	re := regexp.MustCompile(`^([0-9a-f]{8})-(\d{10})\.(\d{3})$`)
+	for i := 0; i < 20; i++ {
 		id := e.RequestID()
-		if seen[id] {
-			t.Fatalf("RequestID() returned duplicate %q after %d calls", id, i)
+		m := re.FindStringSubmatch(id)
+		if m == nil {
+			t.Fatalf("RequestID() = %q; want <8-hex>-<10-digit-unix>.<3-digit-millis>", id)
 		}
-		seen[id] = true
+		if m[1] != e.clientID {
+			t.Errorf("RequestID() client id = %q; want %q (must be stable)", m[1], e.clientID)
+		}
+	}
+
+	// The timestamp must actually track the clock, not be frozen at
+	// construction — a constant _x_id would be its own signature.
+	first := e.RequestID()
+	time.Sleep(3 * time.Millisecond)
+	if second := e.RequestID(); first == second {
+		t.Errorf("RequestID() returned %q twice across a 3ms gap; timestamp is not advancing", first)
 	}
 }
 

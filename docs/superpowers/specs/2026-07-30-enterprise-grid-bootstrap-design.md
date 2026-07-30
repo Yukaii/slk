@@ -170,11 +170,20 @@ forking slack-go's URL construction.
    t+4.6 s has `_x_id=741e4b14-…&slack_route=T04T4TH8W`. Note `_x_id`'s prefix
    and `_x_csid` are *different* values (`741e4b14` vs `U4129EELrMo`).
 
+   `_x_id` is **not** unique per request. In `initial-load.har`, 53 requests
+   produced 52 distinct values — `741e4b14-1785407067.503` appears twice, sent
+   68 ms apart. The client timestamps at call-composition time with no
+   uniqueness clamp, so slk must not add one: an always-unique sequence where
+   Chrome shows occasional collisions is itself a distributional signal.
+
 3. **Body extras:** `_x_sonic=true`, `_x_app_name=client`, `_x_mode=online`,
    and `_x_reason`. `_x_reason` encodes caller intent, so it rides a context
    value — `slackhttp.WithReason(ctx, "message-pane/requestHistory")` — that
    the transport reads. Endpoints without an explicit reason get a
    per-endpoint default.
+
+   Verified body-only: `_x_reason` occurs 153 times as a form field across the
+   captures and **never** in a query string (48 distinct values observed).
 
 ### `_x_version_ts` sourcing
 
