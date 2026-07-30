@@ -114,13 +114,22 @@ forking slack-go's URL construction.
    derive the client-hint version from the same constant so they cannot
    drift.
 
-2. **Envelope params** on any `*.slack.com/api/*` or `edgeapi.slack.com/*`
-   request: `_x_id` (format `<csid>-<unix>.<micros>`, matching the observed
-   `741e4b14-1785407132.989`), `_x_csid` (random per process, stable for its
-   lifetime), `_x_version_ts`, `_x_app_name=client`,
-   `_x_frontend_build_type=current`, `_x_desktop_ia=4`, `_x_gantry=true`,
-   `fp=6e`, `_x_num_retries=0`, `slack_route=<teamID>`, and fresh
-   `_x_b3_traceid` / `_x_b3_spanid` / `_x_b3_sampled=1` per request.
+2. **Envelope params** (all **query** params, including the `_x_b3_*` trio —
+   the captures show them in the query string on `conversations.history`, not
+   as headers) on any `*.slack.com/api/*` or `edgeapi.slack.com/*` request:
+   `_x_id`, `_x_version_ts`, `_x_frontend_build_type=current`,
+   `_x_desktop_ia=4`, `_x_gantry=true`, `fp=6e`, `_x_num_retries=0`, plus
+   `slack_route=<teamID>`, `_x_csid`, and fresh
+   `_x_b3_traceid` / `_x_b3_spanid` / `_x_b3_sampled=1`.
+
+   **Identity has two phases**, and replicating the transition matters:
+   before the team id is known, `_x_id` uses the literal prefix `noversion-`
+   and *neither* `slack_route` nor `_x_csid` nor the `_x_b3_*` trio is sent;
+   afterwards `_x_id` uses an 8-hex client id and all of them appear. Verified
+   in `initial-load.har`: `experiments.getByUser` at t+3.0 s has
+   `_x_id=noversion-…` with no `slack_route`; `sfdc.integration.listOrgs` at
+   t+4.6 s has `_x_id=741e4b14-…&slack_route=T04T4TH8W`. Note `_x_id`'s prefix
+   and `_x_csid` are *different* values (`741e4b14` vs `U4129EELrMo`).
 
 3. **Body extras:** `_x_sonic=true`, `_x_app_name=client`, `_x_mode=online`,
    and `_x_reason`. `_x_reason` encodes caller intent, so it rides a context
@@ -130,10 +139,28 @@ forking slack-go's URL construction.
 
 ### `_x_version_ts` sourcing
 
-`_x_version_ts` is a real Slack build timestamp (`1785403052` observed). slk
-scrapes it once per workspace from the workspace page, caches it in the
-workspace config, and falls back to a pinned constant if the scrape fails.
-A hardcoded value that never moves is itself an anomaly signal.
+`_x_version_ts` is a real Slack build timestamp (`1785403052` and `1785403654`
+observed in two captures hours apart, so it moves). A hardcoded value that
+never changes is itself an anomaly signal.
+
+**Source it from `client.shouldReload`**, whose response carries
+`recommended_build_version` — exactly the value in use as `_x_version_ts`:
+
+```
+POST /api/client.shouldReload   → 292 bytes
+{"ok":true,"should_reload":false,"recommended_build_version":1785403654, …}
+```
+
+An earlier draft of this spec said to scrape the workspace page. That is
+wrong and would regress a shipped fix: commit `da6a7e1` deliberately removed
+slk's workspace-page fetch, and #111 showed corporate proxies reject that
+navigation with 403. `client.shouldReload` is a plain `/api/` POST with no
+navigation surface, and it appears in **both** boot captures — so calling it
+is also *more* faithful, not less.
+
+slk seeds from the per-workspace cached value, refreshes in the background
+after connect, and persists the result. A failed lookup leaves the previous
+value intact.
 
 ### Deliberately deferred
 
