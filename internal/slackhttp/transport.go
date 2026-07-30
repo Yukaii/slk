@@ -402,7 +402,16 @@ func applyEnvelopeBody(req *http.Request) error {
 		}
 		out = append(out, envelopeParam{key, value})
 	}
-	add("_x_reason", ReasonFrom(req.Context()))
+	// _x_reason is caller intent, but almost no caller supplies it, and
+	// a body with _x_mode and no _x_reason is a shape the real client
+	// produces on only 10 of 163 requests. Falling back to the
+	// endpoint's observed reason keeps slk inside the 94% instead of
+	// pinning it to the 6%. An explicit WithReason always wins.
+	reason := ReasonFrom(req.Context())
+	if reason == "" {
+		reason = defaultReason(methodFromPath(req.URL.Path))
+	}
+	add("_x_reason", reason)
 	add("_x_mode", "online")
 	add("_x_sonic", "true")
 	add("_x_app_name", "client")

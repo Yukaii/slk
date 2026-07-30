@@ -82,7 +82,9 @@
     ],
     "body_trailing_evidence": "149 of 163 request bodies end in exactly this sequence, with business params (token, channel, …) first.",
     "x_reason_placement": "body",
-    "x_reason_evidence": "153 occurrences as a form field, 0 in any query string, 48 distinct values."
+    "x_reason_evidence": "153 occurrences as a form field, 0 in any query string, 48 distinct values.",
+    "x_reason_always_present": true,
+    "x_reason_always_present_rationale": "The official client omits _x_reason on 10 of 163 requests, so 'always present' is NOT a property of the captures — it is a requirement slk imposes on ITSELF. slk's callers almost never supply a reason, so 'omit when unset' meant omitting it on ~100% of requests, making 'has _x_mode, lacks _x_reason' a single predicate that separates slk from the client it is imitating. Emitting the endpoint's observed reason (or a plausible fallback for unmapped endpoints) puts every slk request inside the 94% majority instead."
   },
 
   "edgeapi": {

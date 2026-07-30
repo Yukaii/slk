@@ -865,17 +865,106 @@ func TestEnvelopeBody_SetsContentLengthAndGetBody(t *testing.T) {
 	}
 }
 
-func TestEnvelopeBody_NoReasonOmitsField(t *testing.T) {
-	// 10 of 163 captured requests carry no _x_reason. Emitting an empty
-	// one would be wrong; the field should simply be absent.
-	got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
-		"/api/x", "application/x-www-form-urlencoded", "token=xoxc-abc", "")
-	if strings.Contains(got, "_x_reason") {
-		t.Errorf("body = %q; want no _x_reason when none is set", got)
+func TestEnvelopeBody_DefaultsReasonPerEndpoint(t *testing.T) {
+	// WithReason has one production call site, so nearly every request
+	// arrives with no reason on its context. Without a default those
+	// requests emit _x_mode/_x_sonic/_x_app_name and no _x_reason — a
+	// shape the real client produces on 10 of 163 requests and slk
+	// would produce on all of them. Each value below is the one the
+	// official client tags that endpoint with.
+	cases := map[string]string{
+		"client.userBoot":            "initial-data",
+		"client.shouldReload":        "boot",
+		"client.counts":              "fetchClientCountsOnConnect",
+		"conversations.history":      "message-pane/requestHistory",
+		"conversations.mark":         "viewed",
+		"conversations.genericInfo":  "fallback:fetchAndUpsertChannelsById",
+		"users.prefs.get":            "fetch-frecency-prefs",
+		"users.channelSections.list": "conditional-fetch-manager",
+		"dnd.info":                   "fetchAndUpsertDndForUsers-getDndTimesFor:self",
 	}
-	// The always-present fields must still be there, still trailing.
-	if !strings.HasSuffix(got, "_x_mode=online&_x_sonic=true&_x_app_name=client") {
-		t.Errorf("body = %q; want _x_mode/_x_sonic/_x_app_name tail", got)
+	for method, want := range cases {
+		t.Run(method, func(t *testing.T) {
+			got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
+				"/api/"+method, "application/x-www-form-urlencoded", "token=xoxc-abc", "")
+			vals, err := url.ParseQuery(got)
+			if err != nil {
+				t.Fatalf("ParseQuery(%q): %v", got, err)
+			}
+			if v := vals.Get("_x_reason"); v != want {
+				t.Errorf("_x_reason = %q; want %q (body %q)", v, want, got)
+			}
+			// The rest of the envelope tail is unchanged.
+			if !strings.HasSuffix(got, "_x_mode=online&_x_sonic=true&_x_app_name=client") {
+				t.Errorf("body = %q; want _x_mode/_x_sonic/_x_app_name tail", got)
+			}
+		})
+	}
+}
+
+func TestEnvelopeBody_UnmappedEndpointStillSendsReason(t *testing.T) {
+	// An endpoint with no captured reason still gets one. Sending a
+	// plausible-but-unverified value is better than sending none:
+	// "has _x_mode, lacks _x_reason" is a single-predicate separator.
+	got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
+		"/api/some.unmapped.method", "application/x-www-form-urlencoded", "token=xoxc-abc", "")
+	vals, err := url.ParseQuery(got)
+	if err != nil {
+		t.Fatalf("ParseQuery(%q): %v", got, err)
+	}
+	if vals.Get("_x_reason") == "" {
+		t.Errorf("body = %q; want a non-empty _x_reason on an unmapped endpoint", got)
+	}
+}
+
+func TestEnvelopeBody_ExplicitReasonBeatsDefault(t *testing.T) {
+	// conversations.history has a mapped default, but the caller knows
+	// which UI action it is serving — a refresh around the unread
+	// marker sends a different reason on the same endpoint.
+	got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
+		"/api/conversations.history", "application/x-www-form-urlencoded",
+		"token=xoxc-abc", "unread-counts/onLastReadUpdated")
+	vals, err := url.ParseQuery(got)
+	if err != nil {
+		t.Fatalf("ParseQuery(%q): %v", got, err)
+	}
+	if v := vals["_x_reason"]; len(v) != 1 || v[0] != "unread-counts/onLastReadUpdated" {
+		t.Errorf("_x_reason = %v; want exactly [unread-counts/onLastReadUpdated]", v)
+	}
+}
+
+func TestEnvelopeBody_NeverSendsXModeWithoutXReason(t *testing.T) {
+	// The exact predicate this default exists to eliminate. A
+	// workspace-API body that carries _x_mode must carry _x_reason,
+	// whatever the endpoint and whether or not the caller set one.
+	paths := []string{
+		"/api/conversations.history",
+		"/api/client.counts",
+		"/api/some.unmapped.method",
+		"/api/chat.postMessage",
+	}
+	for _, path := range paths {
+		for _, reason := range []string{"", "boot"} {
+			name := path
+			if reason != "" {
+				name += "+reason"
+			}
+			t.Run(name, func(t *testing.T) {
+				got := doBodyReq(t, NewEnvelope(), "rands-leadership.slack.com",
+					path, "application/x-www-form-urlencoded", "token=xoxc-abc", reason)
+				if !strings.Contains(got, "_x_mode") {
+					t.Fatalf("body = %q; expected the envelope tail on a workspace API body", got)
+				}
+				vals, err := url.ParseQuery(got)
+				if err != nil {
+					t.Fatalf("ParseQuery(%q): %v", got, err)
+				}
+				if vals.Get("_x_reason") == "" {
+					t.Errorf("body = %q carries _x_mode without _x_reason; that pair is a "+
+						"single-predicate separator matching ~6%% of official traffic", got)
+				}
+			})
+		}
 	}
 }
 

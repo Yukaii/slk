@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -43,6 +44,7 @@ type requestShape struct {
 		} `json:"pre_boot"`
 		BodyTrailingFieldOrder []string `json:"body_trailing_field_order"`
 		XReasonPlacement       string   `json:"x_reason_placement"`
+		XReasonAlwaysPresent   bool     `json:"x_reason_always_present"`
 	} `json:"workspace_api"`
 
 	EdgeAPI struct {
@@ -340,4 +342,36 @@ func TestGolden_XReasonIsBodyOnly(t *testing.T) {
 	if !strings.Contains(string(raw), "_x_reason=message-pane") {
 		t.Errorf("body = %q; want _x_reason carried in the body", raw)
 	}
+}
+
+func TestGolden_XReasonAlwaysPresentOnWorkspaceBodies(t *testing.T) {
+	shape := loadRequestShape(t)
+	if !shape.WorkspaceAPI.XReasonAlwaysPresent {
+		t.Fatal("fixture x_reason_always_present is false; slk must never emit a " +
+			"workspace-API body with _x_mode and no _x_reason")
+	}
+
+	env := NewEnvelope()
+	env.SetTeamID("T04T4TH8W")
+	// No WithReason on the context — the state nearly every slk call
+	// site is in.
+	req := goldenReq(t, env, "rands-leadership.slack.com", "/api/conversations.history",
+		"application/x-www-form-urlencoded", "token=xoxc-redacted", "")
+
+	raw, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	vals, err := url.ParseQuery(string(raw))
+	if err != nil {
+		t.Fatalf("ParseQuery(%q): %v", raw, err)
+	}
+	if vals.Get("_x_reason") == "" {
+		t.Errorf("body = %q has no _x_reason; fixture requires it on every workspace-API body", raw)
+	}
+	// The fields are still in the captured order, reason included.
+	tail := queryKeyOrder(string(raw))
+	tail = tail[len(tail)-len(shape.WorkspaceAPI.BodyTrailingFieldOrder):]
+	assertKeyOrder(t, "workspace API body tail (defaulted reason)",
+		tail, shape.WorkspaceAPI.BodyTrailingFieldOrder)
 }
