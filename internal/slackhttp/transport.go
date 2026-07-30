@@ -115,12 +115,21 @@ func ClientHintUA() string {
 
 // ClientHintPlatform returns the sec-ch-ua-platform value for the host OS.
 func ClientHintPlatform() string {
-	switch runtime.GOOS {
+	return clientHintPlatformForGOOS(runtime.GOOS)
+}
+
+// clientHintPlatformForGOOS is split out so every branch is testable on
+// any host, matching the userAgentForGOOS pattern. The quotes are part
+// of the header value: sec-ch-ua-platform is a structured-header
+// string, so Chrome sends `"Linux"`, not bare Linux.
+func clientHintPlatformForGOOS(goos string) string {
+	switch goos {
 	case "darwin":
 		return `"macOS"`
 	case "windows":
 		return `"Windows"`
 	default:
+		// Linux and anything else (freebsd, openbsd, ...) → Linux.
 		return `"Linux"`
 	}
 }

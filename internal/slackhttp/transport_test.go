@@ -237,3 +237,36 @@ func TestChromeMajorIsCurrent(t *testing.T) {
 		t.Errorf("chromeMajor = %d; want >= %d (stale UA is itself an anomaly signal)", n, floor)
 	}
 }
+
+func TestClientHintPlatformForGOOS(t *testing.T) {
+	tests := []struct {
+		goos string
+		want string
+	}{
+		// Values must match exactly what Chrome sends in
+		// sec-ch-ua-platform. Chrome uses "macOS" (not "Mac OS X"),
+		// "Windows", and "Linux", each including the double quotes as
+		// part of the header value.
+		{"darwin", `"macOS"`},
+		{"windows", `"Windows"`},
+		{"linux", `"Linux"`},
+		{"freebsd", `"Linux"`},
+		{"openbsd", `"Linux"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.goos, func(t *testing.T) {
+			if got := clientHintPlatformForGOOS(tt.goos); got != tt.want {
+				t.Errorf("clientHintPlatformForGOOS(%q) = %q; want %q", tt.goos, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClientHintPlatformIsQuoted(t *testing.T) {
+	// sec-ch-ua-platform is a structured-header string: the quotes are
+	// part of the value, not Go syntax. A bare Linux would be invalid.
+	got := ClientHintPlatform()
+	if len(got) < 2 || got[0] != '"' || got[len(got)-1] != '"' {
+		t.Errorf("ClientHintPlatform() = %q; want a double-quoted value", got)
+	}
+}
