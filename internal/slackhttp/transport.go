@@ -38,14 +38,9 @@ func (t *BrowserTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		if req.Header == nil {
 			req.Header = http.Header{}
 		}
-		setIfMissing(req.Header, "User-Agent", UserAgent())
-		setIfMissing(req.Header, "Accept", "*/*")
-		setIfMissing(req.Header, "Accept-Language", "en-US,en;q=0.9")
-		setIfMissing(req.Header, "Origin", "https://app.slack.com")
-		setIfMissing(req.Header, "Referer", "https://app.slack.com/")
-		setIfMissing(req.Header, "Sec-Fetch-Site", "same-site")
-		setIfMissing(req.Header, "Sec-Fetch-Mode", "cors")
-		setIfMissing(req.Header, "Sec-Fetch-Dest", "empty")
+		for k, v := range browserHeaderPairs() {
+			setIfMissing(req.Header, k, v)
+		}
 	}
 	inner := t.Inner
 	if inner == nil {
@@ -70,15 +65,37 @@ func NewBrowserHTTPClient(jar http.CookieJar) *http.Client {
 // rather than a RoundTripper) consume this directly.
 func BrowserHeaders() http.Header {
 	h := http.Header{}
-	h.Set("User-Agent", UserAgent())
-	h.Set("Accept", "*/*")
-	h.Set("Accept-Language", "en-US,en;q=0.9")
-	h.Set("Origin", "https://app.slack.com")
-	h.Set("Referer", "https://app.slack.com/")
-	h.Set("Sec-Fetch-Site", "same-site")
-	h.Set("Sec-Fetch-Mode", "cors")
-	h.Set("Sec-Fetch-Dest", "empty")
+	for k, v := range browserHeaderPairs() {
+		h.Set(k, v)
+	}
 	return h
+}
+
+// browserHeaderPairs is the single source of truth for the headers a
+// Chrome tab sends on a same-site XHR to Slack. Both RoundTrip and
+// BrowserHeaders (the WebSocket dialer's path) consume it, so the API
+// and WS fingerprints cannot drift apart.
+//
+// Deliberately contains NO Referer: the official web client sends none
+// on /api/ calls, and slk sending one made it separable. Verified
+// across all seven 2026-07-30 HAR captures. See
+// docs/superpowers/specs/2026-07-30-enterprise-grid-bootstrap-design.md.
+func browserHeaderPairs() map[string]string {
+	return map[string]string{
+		"User-Agent":         UserAgent(),
+		"Accept":             "*/*",
+		"Accept-Language":    "en-US,en;q=0.9",
+		"Origin":             "https://app.slack.com",
+		"Sec-Fetch-Site":     "same-site",
+		"Sec-Fetch-Mode":     "cors",
+		"Sec-Fetch-Dest":     "empty",
+		"Sec-Ch-Ua":          ClientHintUA(),
+		"Sec-Ch-Ua-Mobile":   "?0",
+		"Sec-Ch-Ua-Platform": ClientHintPlatform(),
+		"Cache-Control":      "no-cache",
+		"Pragma":             "no-cache",
+		"Priority":           "u=1, i",
+	}
 }
 
 // chromeMajor is the Chrome major version slk impersonates. Both the

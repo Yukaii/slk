@@ -54,9 +54,6 @@ func TestBrowserTransport_AddsHeadersToSlackHosts(t *testing.T) {
 	if got.Header.Get("Origin") != "https://app.slack.com" {
 		t.Errorf("Origin = %q; want https://app.slack.com", got.Header.Get("Origin"))
 	}
-	if got.Header.Get("Referer") != "https://app.slack.com/" {
-		t.Errorf("Referer = %q; want https://app.slack.com/", got.Header.Get("Referer"))
-	}
 	for _, h := range []string{"Accept", "Accept-Language", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest"} {
 		if got.Header.Get(h) == "" {
 			t.Errorf("header %s is empty; expected a value", h)
@@ -177,7 +174,9 @@ func TestBrowserTransport_HandlesNilHeader(t *testing.T) {
 
 func TestBrowserHeaders_ContainsAllRequiredKeys(t *testing.T) {
 	h := BrowserHeaders()
-	for _, key := range []string{"User-Agent", "Accept", "Accept-Language", "Origin", "Referer", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest"} {
+	// No Referer: the official web client sends none on /api/ calls, so
+	// neither does the WebSocket upgrade path this feeds.
+	for _, key := range []string{"User-Agent", "Accept", "Accept-Language", "Origin", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest", "Sec-Ch-Ua", "Sec-Ch-Ua-Mobile", "Sec-Ch-Ua-Platform", "Cache-Control", "Pragma", "Priority"} {
 		if h.Get(key) == "" {
 			t.Errorf("BrowserHeaders missing %s", key)
 		}
@@ -282,5 +281,80 @@ func TestClientHintPlatformDelegatesToGOOS(t *testing.T) {
 	// part of the value, not Go syntax.
 	if len(got) < 2 || got[0] != '"' || got[len(got)-1] != '"' {
 		t.Errorf("ClientHintPlatform() = %q; want a double-quoted value", got)
+	}
+}
+
+func TestBrowserTransport_HeaderParity(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	client, recorder := newCaptureClient(t, srv)
+
+	req, _ := http.NewRequest("GET", srv.URL, nil)
+	req.Host = "slack.com"
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+	got := recorder.last
+
+	// Present, matching the official client.
+	want := map[string]string{
+		"Sec-Ch-Ua":          ClientHintUA(),
+		"Sec-Ch-Ua-Mobile":   "?0",
+		"Sec-Ch-Ua-Platform": ClientHintPlatform(),
+		"Cache-Control":      "no-cache",
+		"Pragma":             "no-cache",
+		"Priority":           "u=1, i",
+	}
+	for k, v := range want {
+		if got.Header.Get(k) != v {
+			t.Errorf("header %s = %q; want %q", k, got.Header.Get(k), v)
+		}
+	}
+
+	// Absent: the official client sends no Referer on API calls.
+	if r := got.Header.Get("Referer"); r != "" {
+		t.Errorf("Referer = %q; want absent (official client sends none)", r)
+	}
+}
+
+func TestBrowserHeadersMatchesRoundTripHeaders(t *testing.T) {
+	// BrowserHeaders() feeds the WebSocket dialer, which cannot use a
+	// RoundTripper. It must produce exactly what RoundTrip sets, or the
+	// WS upgrade carries a different fingerprint than the API calls.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	client, recorder := newCaptureClient(t, srv)
+
+	req, _ := http.NewRequest("GET", srv.URL, nil)
+	req.Host = "slack.com"
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+
+	ws := BrowserHeaders()
+	for k := range ws {
+		if got, want := recorder.last.Header.Get(k), ws.Get(k); got != want {
+			t.Errorf("header %s: RoundTrip set %q, BrowserHeaders has %q", k, got, want)
+		}
+	}
+	// And the reverse: nothing RoundTrip sets should be missing from
+	// BrowserHeaders (ignoring headers net/http adds itself).
+	for k := range recorder.last.Header {
+		switch k {
+		case "Accept-Encoding", "Content-Length", "Host", "User-Agent":
+			continue // net/http or checked above
+		}
+		if ws.Get(k) == "" {
+			t.Errorf("RoundTrip sets %s but BrowserHeaders does not", k)
+		}
+	}
+	if ws.Get("User-Agent") != recorder.last.Header.Get("User-Agent") {
+		t.Error("User-Agent differs between RoundTrip and BrowserHeaders")
 	}
 }
