@@ -2399,7 +2399,93 @@
             "ok": "bool"
           }
         }
-      ]
+      ],
+      "measured": {
+        "responses_observed": 18,
+        "top_level_key_frequency": {
+          "results": 18,
+          "ok": 18,
+          "member_channels": 5,
+          "failed_ids": 4
+        },
+        "response_shape_combinations": {
+          "results=False member_channels=False failed_ids=False": 5,
+          "results=True member_channels=False failed_ids=False": 7,
+          "results=False member_channels=True failed_ids=False": 2,
+          "results=False member_channels=False failed_ids=True": 1,
+          "results=False member_channels=True failed_ids=True": 3
+        },
+        "result_objects_observed": 36,
+        "result_object_field_counts": [
+          43
+        ],
+        "result_object_fields": [
+          "channel_agent_status",
+          "connected_limited_team_ids",
+          "connected_team_ids",
+          "context_team_id",
+          "conversation_host_id",
+          "created",
+          "creator",
+          "enterprise_id",
+          "frozen_reason",
+          "id",
+          "internal_team_ids",
+          "is_archived",
+          "is_channel",
+          "is_ext_shared",
+          "is_ext_ws_shared",
+          "is_file",
+          "is_frozen",
+          "is_general",
+          "is_global_shared",
+          "is_group",
+          "is_im",
+          "is_moved",
+          "is_mpim",
+          "is_org_default",
+          "is_org_mandatory",
+          "is_org_shared",
+          "is_pending_ext_shared",
+          "is_private",
+          "is_record_channel",
+          "is_shared",
+          "name",
+          "name_normalized",
+          "parent_conversation",
+          "pending_connected_team_ids",
+          "pending_shared",
+          "previous_names",
+          "properties",
+          "purpose",
+          "shared_team_ids",
+          "topic",
+          "unlinked",
+          "updated",
+          "use_case"
+        ],
+        "updated_ids_batch_sizes": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          3,
+          4,
+          6,
+          11,
+          20,
+          20,
+          26,
+          31,
+          63
+        ]
+      },
+      "note": "check_membership:true does NOT add is_member to the result objects (0 of 36 observed results carry it). It adds the top-level member_channels array, which is returned even when results is empty - all 5 observed responses carrying member_channels had results:[]. failed_ids lists ids the server could not resolve; absence from results otherwise means \"unchanged\", so ignoring failed_ids would mark a failed id fresh and keep its stale record forever."
     },
     "edge:users/info": {
       "observed_count": 30,
@@ -2562,7 +2648,79 @@
             "ok": "bool"
           }
         }
-      ]
+      ],
+      "measured": {
+        "responses_observed": 30,
+        "top_level_key_frequency": {
+          "results": 30,
+          "ok": 30,
+          "can_interact": 12
+        },
+        "response_shape_combinations": {
+          "results=False member_channels=False failed_ids=False": 15,
+          "results=True member_channels=False failed_ids=False": 15
+        },
+        "result_objects_observed": 291,
+        "result_object_field_counts": [
+          6,
+          8,
+          20
+        ],
+        "result_object_fields": [
+          "color",
+          "deleted",
+          "id",
+          "is_admin",
+          "is_app_user",
+          "is_bot",
+          "is_email_confirmed",
+          "is_owner",
+          "is_primary_owner",
+          "is_restricted",
+          "is_ultra_restricted",
+          "name",
+          "profile",
+          "real_name",
+          "team_id",
+          "tz",
+          "tz_label",
+          "tz_offset",
+          "updated",
+          "who_can_share_contact_card"
+        ],
+        "updated_ids_batch_sizes": [
+          1,
+          1,
+          1,
+          3,
+          3,
+          6,
+          6,
+          8,
+          8,
+          13,
+          13,
+          14,
+          14,
+          14,
+          14,
+          15,
+          21,
+          21,
+          28,
+          29,
+          30,
+          30,
+          34,
+          34,
+          40,
+          40,
+          57,
+          57,
+          80,
+          80
+        ]
+      }
     },
     "edge:channels/search": {
       "observed_count": 2,
