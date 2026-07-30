@@ -2922,7 +2922,35 @@
             "ok": "bool"
           }
         }
-      ]
+      ],
+      "measured": {
+        "requests_observed": 2,
+        "request_key_frequency": {
+          "token": 2,
+          "query": 2,
+          "count": 2,
+          "fuzz": 2,
+          "include_record_channels": 2,
+          "top_channels": 2,
+          "default_workspace": 2,
+          "check_membership": 2
+        },
+        "response_key_frequency": {
+          "results": 2,
+          "ok": 2,
+          "member_channels": 1
+        },
+        "request_top_channels_lengths": [
+          22,
+          22
+        ],
+        "request_count_values": {
+          "30": 2
+        },
+        "request_fuzz_values": {
+          "1": 2
+        }
+      }
     },
     "edge:users/search": {
       "observed_count": 2,
@@ -3063,7 +3091,36 @@
             "ok": "bool"
           }
         }
-      ]
+      ],
+      "measured": {
+        "requests_observed": 2,
+        "request_key_frequency": {
+          "token": 2,
+          "include_profile_only_users": 2,
+          "query": 2,
+          "count": 2,
+          "fuzz": 2,
+          "enable_workspace_ranking": 2,
+          "search_email": 2,
+          "top_users": 2,
+          "current_channel": 2,
+          "default_workspace": 2
+        },
+        "response_key_frequency": {
+          "results": 2,
+          "ok": 2
+        },
+        "request_top_users_lengths": [
+          50,
+          50
+        ],
+        "request_count_values": {
+          "30": 2
+        },
+        "request_fuzz_values": {
+          "1": 2
+        }
+      }
     },
     "edge:users/list": {
       "observed_count": 4,
@@ -3258,7 +3315,42 @@
             "ok": "bool"
           }
         }
-      ]
+      ],
+      "measured": {
+        "requests_observed": 4,
+        "request_key_frequency": {
+          "token": 4,
+          "channels": 4,
+          "present_first": 4,
+          "filter": 4,
+          "count": 4
+        },
+        "response_key_frequency": {
+          "results": 4,
+          "ok": 4,
+          "next_marker": 3
+        },
+        "request_channels_lengths": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "request_count_values": {
+          "30": 3,
+          "20": 1
+        },
+        "request_present_first_values": {
+          "true": 4
+        },
+        "request_filter_values": {
+          "\"everyone AND NOT bots AND NOT apps\"": 4
+        },
+        "response_results_lengths": {
+          "4": 1,
+          "30": 3
+        }
+      }
     },
     "edge:channels/membership": {
       "observed_count": 10,
@@ -3330,7 +3422,38 @@
             "ok": "bool"
           }
         }
-      ]
+      ],
+      "measured": {
+        "requests_observed": 10,
+        "request_key_frequency": {
+          "token": 10,
+          "channel": 10,
+          "users": 10,
+          "as_admin": 10
+        },
+        "response_key_frequency": {
+          "channel": 10,
+          "ok": 10,
+          "members": 9,
+          "non_members": 5
+        },
+        "request_users_lengths": [
+          1,
+          2,
+          3,
+          3,
+          3,
+          22,
+          48,
+          51,
+          54,
+          66
+        ],
+        "request_as_admin_values": {
+          "false": 10
+        },
+        "members_plus_non_members_equals_users_sent": "10/10"
+      }
     },
     "edge:users/counts": {
       "observed_count": 7,
@@ -3417,7 +3540,23 @@
             "ok": "bool"
           }
         }
-      ]
+      ],
+      "measured": {
+        "requests_observed": 7,
+        "request_key_frequency": {
+          "token": 7,
+          "channel": 7,
+          "as_admin": 7
+        },
+        "response_key_frequency": {
+          "channel": 7,
+          "counts": 7,
+          "ok": 7
+        },
+        "request_as_admin_values": {
+          "false": 7
+        }
+      }
     }
   },
   "boot_sequences": {
