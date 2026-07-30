@@ -17,20 +17,44 @@ Both problems trace to what slk *does* on the wire, not how it authenticates.
 
 ## Evidence
 
-Seven HAR captures of the official Slack web client on a busy workspace
-(`rands-leadership.slack.com`, 10k+ users), taken 2026-07-30:
+**Eight** HAR captures of the official Slack web client on a busy workspace
+(`rands-leadership.slack.com`, 10k+ users), taken 2026-07-30.
 
-| Capture | Requests | API calls | Assets | Max concurrent |
-|---|---|---|---|---|
-| `initial-load` (warm cache) | 521 | 53 workspace + 24 edgeapi | 337 CDN / 68 MB | 80 |
-| `coldboot` (fresh profile) | 746 | 49 workspace + 20 edgeapi | 469 bundles / 60 MB | 55 |
-| `channel-switch` | 84 | 12 | 5 images | 39 |
-| `channel-switch-2` | 146 | 9 | 57 images / 3.8 MB | 43 |
-| `scroll` (1 page) | 246 | 5 | 124 images / 12 MB | 56 |
-| `quickswitch2` (finder) | 62 | 7 + 12 edgeapi | 4 emoji | — |
-| `reconnect` (90 s offline) | 109 | **3** + 12 edgeapi | 62 avatars | — |
+The **API requests** column is the committed, reconcilable figure: it comes
+from `internal/slackhttp/testdata/capture-evidence.json`, counts requests to
+`*.slack.com/api/*` **and** `edgeapi.slack.com`, and sums to the 279 every
+other claim in this document is measured against. The remaining columns come
+from the original manual pass over the HARs and are **not** in the digest —
+the raw captures are not in the repo, so nothing can re-derive them. Treat
+them as indicative.
 
-Three findings reframe the problem:
+| Capture | API requests | of which workspace API (original pass) | Total requests | Assets | Max concurrent |
+|---|---|---|---|---|---|
+| `initial-load` (warm cache) | 77 | 53 (+24 edgeapi) | 521 | 337 CDN / 68 MB | 80 |
+| `coldboot` (fresh profile) | 70 | 49 (+20 edgeapi) † | 746 | 469 bundles / 60 MB | 55 |
+| `channel-switch` | 24 | 12 | 84 | 5 images | 39 |
+| `channel-switch-2` | 19 | 9 | 146 | 57 images / 3.8 MB | 43 |
+| `scroll` (1 page) | 12 | 5 | 246 | 124 images / 12 MB | 56 |
+| `quickswitch` (finder) | 15 | — | — | — | — |
+| `quickswitch2` (finder) | 37 | 7 (+12 edgeapi) † | 62 | 4 emoji | — |
+| `reconnect` (90 s offline) | 25 | **3** (+12 edgeapi) † | 109 | 62 avatars | — |
+| **Total** | **279** | **163 workspace + 116 edgeapi** | | | |
+
+† The original pass's workspace/edgeapi split does not add up to the digest
+figure for these three rows (69 vs 70, 19 vs 37, 15 vs 25), and the third
+column does not sum to the total beneath it. The digest is authoritative; the
+split is not. The total row is digest-derived too, not a column sum: 163 is
+`x_id_total` (workspace-API only — `_x_id` is never sent to edgeapi), and 116
+is the remainder of the 279. What the split is reliably good for is the
+*shape* of the finding — a handful of workspace-API calls per interaction,
+never an enumeration — and that survives either reading. Anything in Layer 2
+that depends on an exact per-capture split needs a fresh measurement.
+
+`quickswitch` was missing from this table entirely in an earlier revision,
+which is where the "seven captures" figure came from. There are eight, and
+they carry 279 API requests between them.
+
+Four findings reframe the problem:
 
 1. **The official client is not conservative about assets.** 68 MB and 80
    concurrent connections at boot. slk fetches thumbnails only, capped at 4
@@ -39,7 +63,7 @@ Three findings reframe the problem:
    trigger.*
 
 2. **The official client never enumerates.** Zero `users.list` and zero
-   `conversations.list` across all seven captures, warm *or* cold. It
+   `conversations.list` across all eight captures, warm *or* cold. It
    maintains a local cache and revalidates it conditionally. A cold boot on a
    fresh browser profile issues 49 API calls — four *fewer* than a warm boot,
    because cold and warm follow the same path.
@@ -89,7 +113,7 @@ payoff, included because it shares the same code paths.
 | Content-Type (`/api/`) | `multipart/form-data` | `application/x-www-form-urlencoded` |
 | `sec-ch-ua`, `sec-ch-ua-mobile`, `sec-ch-ua-platform` | always present | **absent** |
 | `cache-control`, `pragma`, `priority` | `no-cache`, `no-cache`, `u=1, i` | absent |
-| `referer` | **absent** in all five captures | **sent** (`transport.go:45`) |
+| `referer` | **absent** on 279/279 API requests, all 8 captures | **sent** (`transport.go:45`) |
 | User-Agent | `Chrome/150.0.0.0` | `Chrome/120.0.0.0` (`transport.go:94`) |
 
 The "Official" column above is the union across host classes, not what any
@@ -104,9 +128,16 @@ separable with a single log predicate, before any behavioral analysis.
 
 ### Verified impersonation values
 
-Captured 2026-07-30 from the Slack web client on Linux/Chrome 150. The
-`sec-ch-ua` value was byte-identical across 1032 requests in five separate
-captures; the User-Agent across 1516.
+Captured 2026-07-30 from the Slack web client on Linux/Chrome 150. Both the
+`sec-ch-ua` and the User-Agent value were byte-identical on **all 279 API
+requests across all eight captures** — a single distinct value each, per
+`capture-evidence.json`'s `sec_ch_ua_values` and `user_agent_values`.
+
+(An earlier revision cited 1032 and 1516. Those counted header occurrences
+over *every* request including assets and bundles, across a five-capture
+subset, and named neither the population nor the subset. The digest does not
+record that population, so the figures are not reproducible from anything in
+the repo; the 279 above is.)
 
 ```
 user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36
@@ -139,7 +170,10 @@ Chrome sends **no** `Accept`, **no** `Sec-Fetch-*`, **no** `sec-ch-ua*`, and
 `Sec-Fetch-Dest: websocket` believing browsers do — they do not. A long-lived
 socket carrying headers no real Chrome emits is a stable slk-specific
 signature, so `WebSocketHeaders()` is deliberately separate from
-`BrowserHeaders()`.
+`browserHeaderPairs()`, the unexported XHR set inside
+`internal/slackhttp`. (`BrowserHeaders()` was its exported predecessor and
+no longer exists — `RoundTrip` is the only consumer, so there was nothing
+for an exported accessor to serve.)
 
 ### Approach
 
@@ -556,7 +590,7 @@ stay as-is.
 ## Testing Strategy
 
 **Golden fixtures from the captures.** Sanitized request/response pairs are
-extracted from the five HARs into `testdata/`. Parsers are tested against real
+extracted from the eight HARs into `testdata/`. Parsers are tested against real
 payloads, and a shape-diff test asserts slk's generated requests match the
 captured ones field-for-field. The captures become a permanent regression
 harness rather than a one-time analysis.
@@ -588,8 +622,18 @@ requests — the regression guard for the layer.
    within a few calls of each other, as the official client does.
 2. A WS reconnect issues a constant number of calls independent of how many
    channels the user has visited — O(1), not O(channels).
-3. Every slk request carries the full `_x_*` envelope and browser client
-   hints, and sends no `Referer`.
+3. Every slk request carries the envelope and headers its **destination**
+   calls for, matching what the official client sends to that destination:
+   the 13-param workspace envelope plus the XHR header set on
+   `*.slack.com/api/*` with no `Referer`; the 6-param edgeapi envelope on
+   `edgeapi.slack.com`; no envelope at all and Chrome's image header set —
+   which *does* include a `Referer` — on asset fetches; and the smaller
+   upgrade set, with no envelope, on the WebSocket.
+
+   Stated as "every request carries the full `_x_*` envelope and sends no
+   `Referer`", this criterion was unmeetable by design on three counts, and
+   meeting it literally would have made slk *more* separable, not less: a
+   uniform envelope is a shape the official client never produces.
 4. Opening a channel fetches assets for approximately one screen, not the
    whole buffer.
 5. An Enterprise Grid tester completes add-workspace, boot, and channel
