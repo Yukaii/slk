@@ -1,0 +1,429 @@
+# Enterprise Grid Bootstrap Parity Design
+
+## Problem
+
+Enterprise Grid orgs sign slk users out and email them a security notice
+naming *"data scraping, excessive file downloads, connecting to Slack from a
+Tor exit node, or using a third-party client."* This has survived three prior
+mitigation attempts (issues #5, #111): browser-like headers (#22), network
+token minting (#106), and `localConfig_v2` token reads (#115). In #111 a
+tester was signed out **twice** while using the desktop app's own token and
+cookie — proving the detection is not credential-related.
+
+Separately, on busy workspaces slk saturates the user's network and the UI
+crawls.
+
+Both problems trace to what slk *does* on the wire, not how it authenticates.
+
+## Evidence
+
+Five HAR captures of the official Slack web client on a busy workspace
+(`rands-leadership.slack.com`, 10k+ users), taken 2026-07-30:
+
+| Capture | Requests | API calls | Assets | Max concurrent |
+|---|---|---|---|---|
+| `initial-load` | 521 | 53 workspace + 24 edgeapi | 337 CDN / 68 MB | 80 |
+| `channel-switch` | 84 | 12 | 5 images | 39 |
+| `channel-switch-2` | 146 | 9 | 57 images / 3.8 MB | 43 |
+| `scroll` (1 page) | 246 | 5 | 124 images / 12 MB | 56 |
+| `quickswitch2` (finder) | 62 | 7 + 12 edgeapi | 4 emoji | — |
+
+Three findings reframe the problem:
+
+1. **The official client is not conservative about assets.** 68 MB and 80
+   concurrent connections at boot. slk fetches thumbnails only, capped at 4
+   (`internal/image/fetcher.go:117`). On assets slk is already an order of
+   magnitude politer than the real client. *Asset volume is not the detection
+   trigger.*
+
+2. **The official client never enumerates.** Zero `conversations.history` at
+   boot, zero `users.list`, zero `conversations.list` across all five
+   captures. It maintains a local cache and revalidates it conditionally.
+
+3. **slk enumerates on every start.** `users.list` (~50 pages),
+   `conversations.list` (all public channels), then
+   `conversations.history` for *every channel ever visited* plus
+   `conversations.replies` for every thread found. That is a textbook scraper
+   signature, and it is the one thing the official client provably never
+   emits.
+
+The captures live outside the repo (they contain live `xoxc` tokens and
+message content). Sanitized request/response pairs are extracted into
+`testdata/` fixtures — see Testing Strategy.
+
+## Key Insight
+
+slk's problem is not authentication and not bandwidth. It is that slk's
+traffic is **separable** from official-client traffic at three independent
+layers, and the middle layer reads as data scraping. Prior fixes addressed
+credentials; this design addresses request shape, call pattern, and fetch
+scope.
+
+## Scope
+
+Three layers, phased. Layer 1 is independently shippable and may alone
+resolve the sign-outs. Layer 3 is a performance fix with no detection
+payoff, included because it shares the same code paths.
+
+---
+
+## Layer 1 — Request Envelope Parity
+
+### Divergence
+
+| | Official | slk |
+|---|---|---|
+| Query params | `_x_id`, `_x_csid`, `_x_version_ts`, `_x_app_name=client`, `_x_frontend_build_type=current`, `_x_desktop_ia=4`, `_x_gantry=true`, `slack_route`, `fp=6e`, `_x_num_retries=0`, `_x_b3_traceid`, `_x_b3_spanid`, `_x_b3_sampled=1` | none |
+| POST body extras | `_x_sonic=true`, `_x_app_name=client`, `_x_reason=<ui-trigger>`, `_x_mode=online` | none |
+| Content-Type (`/api/`) | `multipart/form-data` | `application/x-www-form-urlencoded` |
+| `sec-ch-ua`, `sec-ch-ua-mobile`, `sec-ch-ua-platform` | always present | **absent** |
+| `cache-control`, `pragma`, `priority` | `no-cache`, `no-cache`, `u=1, i` | absent |
+| `referer` | **absent** in all five captures | **sent** (`transport.go:45`) |
+| User-Agent | `Chrome/150.0.0.0` | `Chrome/120.0.0.0` (`transport.go:94`) |
+
+Two of these are self-defeating: a Chrome/120 UA in 2026 is 30 major versions
+stale, and a Chrome UA with no `sec-ch-ua` client hints is a combination real
+Chrome never produces. Adding a `referer` the real client omits makes slk
+separable with a single log predicate, before any behavioral analysis.
+
+### Approach
+
+Inject at the transport, not the call sites. slk issues API calls two ways —
+slack-go (`internal/slack/client.go:101`) and hand-rolled `postForm`
+(`client.go:1320`). `BrowserTransport.RoundTrip`
+(`internal/slackhttp/transport.go:29`) already sits beneath both, so it is the
+single chokepoint. Patching call sites would mean touching ~50 methods and
+forking slack-go's URL construction.
+
+**Changes to `internal/slackhttp`:**
+
+1. **Headers.** Add `sec-ch-ua`, `sec-ch-ua-mobile`, `sec-ch-ua-platform`,
+   `cache-control: no-cache`, `pragma: no-cache`, `priority: u=1, i`. Remove
+   the `Referer` set at `transport.go:45`. Bump the UA to Chrome/150 and
+   derive the client-hint version from the same constant so they cannot
+   drift.
+
+2. **Envelope params** on any `*.slack.com/api/*` or `edgeapi.slack.com/*`
+   request: `_x_id` (format `<csid>-<unix>.<micros>`, matching the observed
+   `741e4b14-1785407132.989`), `_x_csid` (random per process, stable for its
+   lifetime), `_x_version_ts`, `_x_app_name=client`,
+   `_x_frontend_build_type=current`, `_x_desktop_ia=4`, `_x_gantry=true`,
+   `fp=6e`, `_x_num_retries=0`, `slack_route=<teamID>`, and fresh
+   `_x_b3_traceid` / `_x_b3_spanid` / `_x_b3_sampled=1` per request.
+
+3. **Body extras:** `_x_sonic=true`, `_x_app_name=client`, `_x_mode=online`,
+   and `_x_reason`. `_x_reason` encodes caller intent, so it rides a context
+   value — `slackhttp.WithReason(ctx, "message-pane/requestHistory")` — that
+   the transport reads. Endpoints without an explicit reason get a
+   per-endpoint default.
+
+### `_x_version_ts` sourcing
+
+`_x_version_ts` is a real Slack build timestamp (`1785403052` observed). slk
+scrapes it once per workspace from the workspace page, caches it in the
+workspace config, and falls back to a pinned constant if the scrape fails.
+A hardcoded value that never moves is itself an anomaly signal.
+
+### Deliberately deferred
+
+**Multipart bodies.** The real client posts `multipart/form-data`; slk posts
+`x-www-form-urlencoded`. Re-encoding at the transport means parsing and
+rebuilding every body across ~50 endpoints — real regression risk for a
+signal weaker than the header and param gaps. Recorded as a known residual
+difference, revisited after Layers 1–3 land.
+
+---
+
+## Layer 2 — Bootstrap Rewrite
+
+Replace *enumeration* with *conditional revalidation*, and *fan-out* with
+*lazy per-view fetch*.
+
+### Boot sequence: 6 calls instead of ~400
+
+Five phases below plus the retained `auth.test` (see Phase A), for six calls
+in steady state.
+
+| Phase | Call | Replaces |
+|---|---|---|
+| A | `client.userBoot` | `users.conversations`, `users.prefs.get`, `stars.list`, `usergroups.list`, `dnd.info` — 5 → 1 |
+| B | `client.counts` | unchanged; already the unread source of truth |
+| C | `conversations.view` | initial `conversations.history` + per-author `users.info` fan-out + `emoji.list` |
+| D | `edgeapi/cache/{team}/channels/info` + `users/info` | `conversations.list` + `users.list` |
+| E | — | **deleted:** startup backfill, `conversations.list`, boot-time `subscriptions.thread.getView` |
+
+**Phase A — `client.userBoot`.** POST with `_x_reason=initial-data`,
+`version_all_channels=false`, `return_all_relevant_mpdms=true`,
+`omit_extras=feature_usage_data,plan_info,salesforce_features`. Response
+carries `self`, `team`, `channels` (joined), `ims`, `is_open`, `prefs` (702
+keys, including muted channels), `starred`, `subteams` (usergroups), `dnd`,
+`channels_priority`, `read_only_channels`, `emoji_cache_ts`, `workspaces`.
+
+`auth.test` is **retained** for Grid API host discovery
+(`client.go:172`). The captures are from a non-Grid workspace, so whether
+`userBoot` covers the `*.enterprise.slack.com` redirect seen in #111's
+diagnostic is unverified. It is one low-signal call, and removing it risks
+breaking exactly the accounts this design targets.
+
+**Phase C — `conversations.view`.** Returns `history.messages` (`count=28`),
+`users`, `bots`, `channels`, and `emojis` in one response.
+
+**Phase D — conditional revalidation.** The mechanism that replaces
+enumeration:
+
+```
+POST edgeapi.slack.com/cache/{team}/channels/info
+{"check_membership":true,"updated_ids":{"CL0AET1L0":1783337533019, …}}
+→ 290 bytes, results=0            (nothing changed)
+
+{"updated_ids":{"C6M7U8DFF":0,"C092E63RUUC":0}}
+→ 14.8 KB, results=2              (unknown IDs, fully hydrated)
+```
+
+Hundreds of channel IDs with version stamps per request; a sub-KB response
+when nothing changed. Identical pattern for `users/info` with
+`{userID: mtime}`, batched 30–34 IDs per call as observed. Unknown rows send
+`:0`.
+
+Steady-state boot: two sub-KB requests replace ~55 paginated enumeration
+calls.
+
+### Deletions
+
+- **`triggerBackfill` on first WS connect (`main.go:3712`) is removed.** This
+  is the single largest fingerprint change. The existing comment
+  (`main.go:3707`) rationalizes it as *"harmless — most `GetHistorySince`
+  calls return zero messages quickly."* True for bytes, false for request
+  count, and request count is what anomaly detection scores. Unread state
+  comes from `client.counts`; stale scrollback is validated lazily on channel
+  open via `cached_latest_updates`. The `BackfillCandidates` fan-out
+  (`reconnect_backfill.go:142`) ceases to run at boot.
+- **`conversations.list`** (`main.go:2177`) — replaced by
+  `channels/search` on demand.
+- **Boot-time `subscriptions.thread.getView`** — deferred to first open of
+  the Threads view.
+
+### Reconnect behavior
+
+On a genuine WS reconnect: refresh `client.counts`, refresh the **active
+channel only**, and mark other channels stale for lazy revalidation on next
+open. No 300-channel sweep.
+
+*No reconnect capture exists.* This is designed from principle rather than
+observation, and is the weakest-evidence part of this design. It is
+nonetheless strictly less traffic than today's behavior.
+
+### Incremental sync as the core primitive
+
+```
+conversations.history: limit=28, inclusive=true, ignore_replies=true,
+  no_user_profile=true, include_pin_count=true, include_stories=true,
+  include_free_team_extra_messages=true, include_date_joined=<bool>,
+  latest=<ts> | oldest=<ts>,
+  cached_latest_updates={"<ts>":"<version>", …}
+→ {messages:[…], unchanged_messages:[…], latest_updates:{ts:version}}
+```
+
+Observed working in `scroll.har`: client sent one cached `{ts: version}`,
+server returned `unchanged_messages=1, messages=27`. slk can validate cached
+scrollback without re-downloading it.
+
+**Channel open = 3 calls**, matching the observed official pattern:
+`latest=<anchor>` (older direction), `oldest=<anchor>` (newer direction), and
+one tagged `_x_reason=unread-counts/onLastReadUpdated` — a bidirectional
+window around last-read, not a blind latest-N.
+
+`limit=28` everywhere. slk currently uses 50 on open and **200–500** in
+backfill (`main.go:3756`); 500-message pages are a shape the official client
+never emits.
+
+### Schema additions
+
+Revalidation requires version stamps slk does not store:
+
+- `channels.version` — millisecond int (`1783337533019`)
+- `users.version` — second int (`1612802061`)
+- `messages.version` — from `latest_updates`
+
+Rows without a version send `:0` and are fully hydrated, exactly as the
+official client does for IDs it has never seen.
+
+### Channel finder
+
+```
+POST edgeapi.slack.com/cache/{team}/channels/search
+{"query":"test","count":30,"fuzz":1,"include_record_channels":true,
+ "top_channels":[…frecent IDs…],"check_membership":true}
+→ {results:[30 channels], member_channels:[…]}
+```
+
+Debounced ~300 ms on input, not per keystroke — the capture shows two
+requests for a four-second typing session. `search.precache`
+(`_x_reason=search-precache-onFocus-omniswitcher`) fires on focus.
+`top_channels` / `top_users` are fed from `internal/cache/frecent.go`. Local
+cache is matched first for instant feedback; server results merge on arrival.
+
+Member lists are channel-scoped, never workspace-wide:
+
+```
+POST edgeapi.slack.com/cache/{team}/users/list
+{"channels":["C06FR0Q00"],"present_first":true,
+ "filter":"everyone AND NOT bots AND NOT apps","count":30}
+```
+
+### Module boundaries
+
+`cmd/slk/main.go` is 4323 lines and `connectWorkspace` (`main.go:1877`) is a
+large share of it. Rather than growing it:
+
+- **`internal/slack/edge`** (new) — edgeapi client: `channels/info`,
+  `users/info`, `channels/search`, `users/search`, `users/list`,
+  `channels/membership`. A distinct protocol (JSON body,
+  `content-type: text/plain;charset=UTF-8`, different host, `updated_ids`
+  conditional semantics) that deserves its own package rather than more
+  surface on `Client`.
+- **`internal/slack/boot`** (new) — `client.userBoot` and
+  `conversations.view` parsing into one `BootstrapResult`. `connectWorkspace`
+  reduces to orchestration.
+- **`internal/cache`** — version columns plus `ChannelVersions()`,
+  `UserVersions()`, `MessageVersions()` helpers.
+- **`internal/slackhttp`** — as specified in Layer 1.
+
+### Unverified assumption
+
+`conversations.view` carried **no `channel` param** in the capture; it
+returned the last-viewed conversation. slk must open a *specific* channel
+(restored last channel or config default). A `channel` param likely works but
+is unverified. Fallback, fully verified: `conversations.history` with
+`limit=28` plus `cached_latest_updates`. Implementation probes the param
+once and falls back on error.
+
+---
+
+## Layer 3 — Viewport-Scoped Asset Fetch
+
+### Root cause
+
+Fetches are spawned inside the render path. `buildCache` loops every buffered
+message (`internal/ui/messages/model.go:1747`) → `renderMessageEntry` →
+`m.avatarFn(msg.UserID)` (`model.go:1607`) and `RenderBlock`
+(`internal/ui/imgrender/imgrender.go:348`), each spawning a goroutine on
+cache miss. Render scope and fetch scope are the same thing, so "render the
+buffer" means "fetch the buffer."
+
+### Enabler
+
+Full-buffer render is required — `recomputeEntryOffsets` (`model.go:1679`)
+needs every entry's height for scroll geometry. But `buildPlaceholder` already
+returns the correct height (`target.Y`) without image bytes. Heights are known
+without fetching, so render scope and fetch scope decouple cleanly.
+
+### Design
+
+1. **`buildCache` renders with fetching disabled.** Placeholders everywhere,
+   correct heights, zero network. `RenderBlock` takes an explicit fetch gate
+   rather than deciding for itself.
+2. **A visibility pass requests assets.** After `yOffset` changes (scroll,
+   selection move, resize, new message), compute the visible entry range from
+   `entryOffsets` and request fetches for entries intersecting
+   `[yOffset − margin, yOffset + height + margin]`, where margin is one
+   screen.
+3. **Per-entry invalidation on arrival.** `ImageReadyMsg` /
+   `BlockImageReadyMsg` already re-render a single entry by index — the
+   documented purpose of `renderMessageEntry` (`imgrender.go:296`). No new
+   machinery.
+
+Opening a channel then fetches roughly one screen of assets rather than 50
+messages' worth — matching the official client, which pulled 1 thumb on one
+channel switch and 12 on another.
+
+### Concurrency
+
+The limit of 4 (`fetcher.go:117`) was tuned while fetching whole buffers. With
+a bounded window the burst is far smaller, and observed official concurrency
+is much higher:
+
+| Asset class | Official observed max | slk now | Proposed |
+|---|---|---|---|
+| `files.slack.com` thumbs | 16 (`scroll.har`) | 4 (shared) | 12 |
+| `emoji.slack-edge.com` | 71 (`initial-load.har`) | 4 (shared) | 24 |
+| avatars (`ca.slack-edge.com`) | few, unbounded | 4 (shared) | 24 (small pool) |
+
+**Split the single semaphore into two pools:** small assets (avatars, emoji —
+KB-scale, high count) and large assets (file thumbs, unfurls — up to 1.3 MB
+observed). Today one 1.3 MB thumb blocks four avatar fetches behind it; that
+head-of-line blocking is the observed UI crawl. Two pools remove it without a
+full priority queue.
+
+The large pool is held at 12 rather than the observed 16; slk's existing
+429-retry telemetry (`fetcher.go:124`) is the signal for whether that is
+right. Both values become config knobs with these as defaults.
+
+### Unchanged
+
+`image_protocol=off` and `emoji_images=off` remain full escape hatches. The
+200 MB disk LRU, singleflight dedup, and per-panel failure sets are sound and
+stay as-is.
+
+---
+
+## Testing Strategy
+
+**Golden fixtures from the captures.** Sanitized request/response pairs are
+extracted from the five HARs into `testdata/`. Parsers are tested against real
+payloads, and a shape-diff test asserts slk's generated requests match the
+captured ones field-for-field. The captures become a permanent regression
+harness rather than a one-time analysis.
+
+**Layer 1.** Table tests over `RoundTrip`: exact header set for an `/api/`
+host, an `edgeapi` host, and a non-Slack host (which must stay untouched);
+`Referer` absent; envelope params present and well-formed; UA major version
+equals client-hint major version.
+
+**Layer 2.** Fixture-driven parser tests for `client.userBoot`,
+`conversations.view`, `channels/info`, `users/info`, `channels/search`. A test
+asserting the boot sequence issues exactly the Phase A–D calls and **no**
+`conversations.list`, `users.list`, or per-channel `conversations.history` —
+the regression guard for the scraper signature. Round-trip tests for version
+columns and `cached_latest_updates` construction.
+
+**Layer 3.** Table tests on the visibility calculation: given `entryOffsets`,
+`yOffset`, and viewport height, assert the exact entry set in the fetch window
+(boundaries: top, bottom, entry taller than viewport, margin clipped at buffer
+edges). A fake fetcher asserts `buildCache` alone issues **zero** fetch
+requests — the regression guard for the layer.
+
+## Success Criteria
+
+1. A boot on a busy workspace issues ≤ 10 API calls, with zero
+   `users.list`, zero `conversations.list`, and zero per-channel
+   `conversations.history` fan-out (verifiable from `SLK_DEBUG=1` logs).
+2. Every slk request carries the full `_x_*` envelope and browser client
+   hints, and sends no `Referer`.
+3. Opening a channel fetches assets for approximately one screen, not the
+   whole buffer.
+4. An Enterprise Grid tester completes add-workspace, boot, and channel
+   switching without a sign-out or security email.
+
+Criterion 4 is the only one that settles the question, and it requires a
+volunteer tester. Criteria 1–3 are verifiable locally and are prerequisites,
+not proof.
+
+## Risks
+
+- **Detection may be TLS/JA3-level, not behavioral.** #111 concluded the
+  fingerprint is client-side. If Grid keys on TLS cipher ordering (raised by
+  `Icantjuddle` in #5), no amount of request-shape parity helps. This design
+  removes the behavioral signal, which is necessary but may not be
+  sufficient. Layer 1 shipping first gives the cheapest read on this.
+- **Undocumented internal endpoints.** `client.userBoot`,
+  `conversations.view`, and the `edgeapi` surface are unversioned and can
+  change without notice. Mitigation: fixture tests fail loudly, and each
+  phase keeps a documented fallback to the current call.
+- **Testers bear real cost.** Every validation attempt risks signing a
+  volunteer out of their work Slack and forcing a conversation with their
+  security team. #111's tester was signed out twice. Ask for validation only
+  once all three layers are ready, and never repeatedly from the same person.
+- **Raised asset concurrency could increase 429s.** Bounded by the existing
+  retry logic and made configurable; the numbers are derived from observed
+  official behavior rather than guessed.
