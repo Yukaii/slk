@@ -300,3 +300,62 @@ func TestMigrate_CreatesThreadSubscriptionsTable(t *testing.T) {
 		t.Fatalf("thread_subscriptions: want %d cols, got %d", wantCols, count)
 	}
 }
+
+// countColumn reports how many columns named `column` exist on `table`.
+// Expected values are 0 (missing) or 1 (present).
+func countColumn(t *testing.T, db *DB, table, column string) int {
+	t.Helper()
+	var count int
+	err := db.conn.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`,
+		table, column,
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("pragma_table_info(%s): %v", table, err)
+	}
+	return count
+}
+
+func TestMigrate_AddsVersionColumns(t *testing.T) {
+	db, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer db.Close()
+
+	for _, tc := range []struct{ table, column string }{
+		{"channels", "version"},
+		{"users", "version"},
+		{"messages", "version"},
+	} {
+		t.Run(tc.table+"."+tc.column, func(t *testing.T) {
+			if got := countColumn(t, db, tc.table, tc.column); got != 1 {
+				t.Errorf("column %s.%s missing after migrate()", tc.table, tc.column)
+			}
+		})
+	}
+}
+
+func TestMigrate_VersionColumnsAreIdempotent(t *testing.T) {
+	// migrate() runs on every Open. A second run must not error, and
+	// must leave exactly one of each version column behind.
+	db, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.migrate(); err != nil {
+		t.Fatalf("second migrate(): %v", err)
+	}
+
+	for _, tc := range []struct{ table, column string }{
+		{"channels", "version"},
+		{"users", "version"},
+		{"messages", "version"},
+	} {
+		if got := countColumn(t, db, tc.table, tc.column); got != 1 {
+			t.Errorf("after second migrate(), %s.%s count = %d, want 1", tc.table, tc.column, got)
+		}
+	}
+}
