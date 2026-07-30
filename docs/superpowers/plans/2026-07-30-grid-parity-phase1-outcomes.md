@@ -67,6 +67,17 @@ hand-rolled `postForm` path.
    rather than per-saver locks: they contend on the same file, so separate
    locks would be theatre.
 
+   That mutex covers one process. It does nothing about **two slk
+   instances** sharing a `config.toml`, and there the old
+   truncate-then-write `os.WriteFile` was destructive rather than merely
+   lossy: the other instance could read the file mid-write and, since
+   every saver is a read-modify-write, persist the truncation. All four
+   savers now render into a temp file in the same directory and
+   `os.Rename` over the target, which is atomic within a filesystem, so a
+   reader sees the whole old file or the whole new one. Cross-process
+   *update* loss remains — that needs file locking — but a partial read
+   can no longer become the whole file.
+
 3. **`_x_id` is not unique in the real client.** The plan implicitly assumed
    a unique request id. In `initial-load.har`, 53 requests produced 52
    distinct values, with `741e4b14-1785407067.503` sent twice 68 ms apart;
@@ -115,6 +126,14 @@ live Slack connection or an interface extraction whose only consumer would be
 the test. Left as a deliberate gap rather than refactoring production
 structure to chase coverage; the risk is a wiring mistake (wrong order, or a
 dropped error) that unit tests would not catch anyway.
+
+The 15 s `context.WithTimeout` now wrapping that `ShouldReload` call falls in
+the same gap. `newCookieHTTPClient` sets no `Client.Timeout`, and
+`http.DefaultTransport` bounds only the dial and the TLS handshake — not the
+response headers or body — so a server that accepted and never answered
+pinned the goroutine and its connection for the life of the process. The
+bound is there; nothing asserts it, for the same reason nothing asserts the
+rest of `connectWorkspace`.
 
 Also untested by construction: the actual detection outcome. Success criterion
 5 in the spec — an Enterprise Grid tester completing add-workspace, boot and
