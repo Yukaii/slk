@@ -398,9 +398,16 @@ type envelopeParam struct{ key, value string }
 // requests carried alphabetically-sorted params; the client emits one
 // canonical sequence with optional members omitted in place, and fp /
 // _x_num_retries always last. url.Values.Encode() sorts keys, so using
-// it would give every slk request a perfectly alphabetized query
-// string — a stable distributional signature, which is exactly what
-// this package exists to remove.
+// it here would give the envelope a perfectly alphabetized order — a
+// stable distributional signature, which is exactly what this package
+// exists to remove.
+//
+// Scope: this orders the params it APPENDS, and nothing else. Params
+// the caller already put on the URL keep the caller's order, and on
+// slack-go's GET path (misc.go getResource) that order is
+// url.Values.Encode()'s — i.e. sorted. In practice almost every slk
+// API call is a POST whose business params ride in the body, so the
+// query string is envelope-only; chat.getPermalink is the exception.
 //
 // Host classes take different sets — measured, not assumed (see
 // testdata/capture-evidence.json):
@@ -488,10 +495,24 @@ func applyEnvelopeQuery(req *http.Request, env *Envelope) {
 // text/plain pass through untouched; rewriting either would corrupt
 // them.
 //
-// Known residual divergence: all 163 captured bodies are
-// multipart/form-data while slk sends urlencoded. Converting is
-// deferred — see the spec's "Deliberately deferred" section. Getting
-// the field order right now means it carries over when it lands.
+// Two known residual divergences, both deferred, both recorded in the
+// residual-divergence table in
+// docs/superpowers/plans/2026-07-30-grid-parity-phase1-outcomes.md:
+//
+//   - All 163 captured bodies are multipart/form-data while slk sends
+//     urlencoded.
+//   - Only this four-field tail is ordered. The business params AHEAD
+//     of it are alphabetical, because every body slk sends is built
+//     with url.Values.Encode(): slack.Client.postForm for the
+//     hand-rolled endpoints, slack-go's own misc.go postForm for the
+//     rest. So slk emits e.g.
+//     `channel=…&include_all_metadata=0&inclusive=0&limit=50&token=…`
+//     followed by this tail. Reordering only the bodies this repo
+//     builds would leave slack-go's sorted and give slk two
+//     distinguishable body shapes rather than one; the multipart
+//     conversion rebuilds every body here, at the chokepoint, and is
+//     where that gets fixed for all of them at once. Pinned by
+//     TestPostForm_BodyFieldOrderIsAlphabeticalThenEnvelope.
 func applyEnvelopeBody(req *http.Request) error {
 	if req.Body == nil {
 		return nil

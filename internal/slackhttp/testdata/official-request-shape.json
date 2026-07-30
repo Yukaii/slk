@@ -19,8 +19,9 @@
       "Pragma",
       "Priority"
     ],
-    "absent": ["Referer"],
-    "absent_evidence": "0 of 279 captured API requests carried a non-empty Referer."
+    "absent": ["Referer", "Accept-Encoding"],
+    "absent_evidence": "Referer: 0 of 279 captured API requests carried a non-empty one. Accept-Encoding: absent from slk's header map ON PURPOSE, which is NOT the same as absent from the wire — see accept_encoding_note.",
+    "accept_encoding_note": "MEASURED AND DEFERRED, not solved. Chrome sends `gzip, deflate, br, zstd`; slk sends nothing, so Go's http.Transport supplies bare `gzip` at write time, and bare `gzip` is the stdlib's own signature. Setting the header here would turn net/http's automatic decompression OFF, so slk would have to decode bodies by hand and then either implement br/zstd or advertise a narrower set than Chrome — moving the divergence rather than removing it. Listed in `absent` so the tests at least pin that this is a decision and not an oversight."
   },
 
   "websocket_upgrade_headers": {
@@ -62,9 +63,9 @@
       "Pragma",
       "Priority"
     ],
-    "absent": ["Origin", "DNT"],
-    "absent_evidence": "Origin: Chrome sends none on a no-cors fetch, so the XHR set's Origin would be an slk signature here. DNT: real Chrome DOES send `dnt: 1` in these captures, but it reflects a USER preference rather than the client's identity — most installs leave it off — so reproducing it would narrow slk to that subset instead of blending in.",
-    "accept_encoding_note": "Chrome sends `gzip, deflate, br, zstd`; slk sends none and lets net/http manage it, exactly as on the XHR path. Overriding it would leave response bodies in an encoding this process cannot decode."
+    "absent": ["Origin", "DNT", "Accept-Encoding"],
+    "absent_evidence": "Origin: Chrome sends none on a no-cors fetch, so the XHR set's Origin would be an slk signature here. DNT: real Chrome DOES send `dnt: 1` in these captures, but it reflects a USER preference rather than the client's identity — most installs leave it off — so reproducing it would narrow slk to that subset instead of blending in. Accept-Encoding: same measured-and-deferred divergence as on the XHR path, see http_headers.accept_encoding_note.",
+    "authorization_note": "MEASURED AND NOT FIXED, and the largest known divergence left on this path. 0 of 40 captured image requests carry an Authorization header, and the real client never uses that header anywhere — its API token rides in the POST body. slk's internal/image/fetcher.go sends `Authorization: Bearer xoxc-…` on every files.slack.com request, i.e. on the 337-request-per-boot surface. Not fixed here because cmd/slk/main.go (~line 687) records that the d cookie ALONE returns Slack's login page and the Bearer ALONE returns 403, so removing it likely breaks thumbnails outright; and the HAR cannot settle the cookie question because Chrome's export stripped cookies (the cookies array is empty even on /api/ requests that certainly sent d). Deliberately NOT in `absent`: listing it would make this fixture assert something slk does not do. See the residual-divergence table in docs/superpowers/plans/2026-07-30-grid-parity-phase1-outcomes.md."
   },
 
   "workspace_api": {

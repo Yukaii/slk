@@ -2976,3 +2976,66 @@ func TestAPIHTTPClient_FallbackCarriesEnvelope(t *testing.T) {
 		t.Error("apiHTTPClient() built a new client while c.httpClient was set")
 	}
 }
+
+// TestPostForm_BodyFieldOrderIsAlphabeticalThenEnvelope pins what
+// postForm actually puts on the wire. It is a characterization test:
+// the alphabetical lead it asserts is a known, deliberate residual
+// divergence, not the shape the official client emits.
+//
+// postForm builds its body with url.Values.Encode(), which SORTS keys.
+// So slk emits `channel=…&include_all_metadata=0&inclusive=0&limit=50&
+// token=…` — perfectly alphabetized — and only the four-field _x_*
+// envelope the transport appends is in the client's captured order.
+//
+// It is not fixed here because the fix would be partial and would make
+// things worse rather than better. slack-go builds its own bodies with
+// the same url.Values.Encode() (misc.go postForm) and is out of reach
+// from this package, so ordering postForm's handful of hand-rolled
+// endpoints would give slk TWO distinguishable body shapes — hand-
+// ordered on ~6 endpoints, sorted on ~50 — where the official client
+// has one. The real fix is the deferred multipart conversion, which
+// rebuilds every body at the transport chokepoint and can impose one
+// order on all of them; see the residual-divergence table in
+// docs/superpowers/plans/2026-07-30-grid-parity-phase1-outcomes.md.
+//
+// The golden fixture test cannot cover this: it hands the transport a
+// hand-written literal body, so it only proves appendQuery does not
+// reorder its input. This test drives the real production body
+// builder.
+func TestPostForm_BodyFieldOrderIsAlphabeticalThenEnvelope(t *testing.T) {
+	var raw string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+		}
+		raw = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("xoxc-test", "d-cookie")
+	pointClientAtTestServer(t, c, srv)
+	c.Envelope().SetTeamID("T04T4TH8W")
+
+	// Deliberately supplied out of alphabetical order, so a body that
+	// came back sorted can only have been sorted by postForm.
+	if _, err := c.postForm(context.Background(), "conversations.history", url.Values{
+		"limit":                {"50"},
+		"channel":              {"C123"},
+		"inclusive":            {"0"},
+		"include_all_metadata": {"0"},
+	}); err != nil {
+		t.Fatalf("postForm: %v", err)
+	}
+
+	const want = "channel=C123&include_all_metadata=0&inclusive=0&limit=50&token=xoxc-test" +
+		"&_x_reason=message-pane%2FrequestHistory&_x_mode=online&_x_sonic=true&_x_app_name=client"
+	if raw != want {
+		t.Errorf("postForm body =\n  %s\nwant\n  %s\n\n"+
+			"If the lead is no longer alphabetical, postForm stopped using url.Values.Encode(): "+
+			"that is an improvement only if slack-go's bodies were fixed too, otherwise slk now "+
+			"emits two different body shapes. Update the residual-divergence table either way.", raw, want)
+	}
+}
