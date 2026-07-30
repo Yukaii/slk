@@ -3555,7 +3555,18 @@
         },
         "request_as_admin_values": {
           "false": 7
-        }
+        },
+        "counts_field_frequency": {
+          "everyone": 7,
+          "people": 7,
+          "members": 7,
+          "guests": 7,
+          "bots": 7,
+          "apps": 7,
+          "by_team": 7,
+          "invited": 2
+        },
+        "counts_objects_observed": 7
       }
     }
   },
@@ -4166,5 +4177,19 @@
         }
       ]
     }
+  },
+  "captures_analyzed": {
+    "count": 8,
+    "names": [
+      "channel-switch",
+      "channel-switch-2",
+      "coldboot",
+      "initial-load",
+      "quickswitch",
+      "quickswitch2",
+      "reconnect",
+      "scroll"
+    ],
+    "note": "All measured/* aggregates in this file cover all of these captures. The samples/* lists are capped at 3 per endpoint, so the distinct capture names appearing under samples are a subset."
   }
 }
