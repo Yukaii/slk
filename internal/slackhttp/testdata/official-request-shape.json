@@ -1,0 +1,114 @@
+{
+  "source": "Measured from 8 HAR captures of the official Slack web client (Chrome 150 on Linux, rands-leadership.slack.com), taken 2026-07-30. Aggregate counts live alongside in capture-evidence.json.",
+  "note": "The raw HARs are deliberately NOT in the repo: they contain live xoxc tokens, session cookies and message content. This file is the redacted shape digest derived from them, and is the single source of truth for golden_test.go. Arrays are ORDERED where sequence is part of the contract — do not sort them.",
+
+  "http_headers": {
+    "comment": "Headers on a same-site XHR to *.slack.com/api/* and edgeapi.slack.com. Values are pinned separately by capture-evidence.json and TestBrowserHeaderPairsMatchesCapture; this list pins the SET.",
+    "present": [
+      "User-Agent",
+      "Accept",
+      "Accept-Language",
+      "Origin",
+      "Sec-Fetch-Site",
+      "Sec-Fetch-Mode",
+      "Sec-Fetch-Dest",
+      "Sec-Ch-Ua",
+      "Sec-Ch-Ua-Mobile",
+      "Sec-Ch-Ua-Platform",
+      "Cache-Control",
+      "Pragma",
+      "Priority"
+    ],
+    "absent": ["Referer"],
+    "absent_evidence": "0 of 279 captured API requests carried a non-empty Referer."
+  },
+
+  "websocket_upgrade_headers": {
+    "comment": "Chrome sends a strictly SMALLER set on a WebSocket upgrade. These are the 5 slk sets; gorilla/websocket owns Connection, Upgrade, Host, Accept-Encoding and the Sec-Websocket-* set, so they are not listed here. Verified against the status-101 upgrades in initial-load.har and coldboot.har.",
+    "present": [
+      "User-Agent",
+      "Accept-Language",
+      "Cache-Control",
+      "Pragma",
+      "Origin"
+    ],
+    "absent": [
+      "Accept",
+      "Sec-Fetch-Site",
+      "Sec-Fetch-Mode",
+      "Sec-Fetch-Dest",
+      "Sec-Ch-Ua",
+      "Sec-Ch-Ua-Mobile",
+      "Sec-Ch-Ua-Platform",
+      "Priority",
+      "Referer"
+    ]
+  },
+
+  "workspace_api": {
+    "comment": "*.slack.com/api/*, 163 captured requests. 0 of 163 carried alphabetically sorted params, so this ORDER is the contract, not just the set.",
+    "query_param_order": [
+      "_x_id",
+      "_x_csid",
+      "slack_route",
+      "_x_version_ts",
+      "_x_foreground",
+      "_x_frontend_build_type",
+      "_x_desktop_ia",
+      "_x_gantry",
+      "_x_b3_traceid",
+      "_x_b3_spanid",
+      "_x_b3_sampled",
+      "fp",
+      "_x_num_retries"
+    ],
+    "pre_boot": {
+      "comment": "Before the team id is known. The expected pre-boot order is query_param_order MINUS absent_params, in place — it is derived, never restated, so the two cannot drift.",
+      "absent_params": [
+        "_x_csid",
+        "slack_route",
+        "_x_b3_traceid",
+        "_x_b3_spanid",
+        "_x_b3_sampled"
+      ],
+      "x_id_prefix": "noversion-",
+      "evidence": "initial-load.har: experiments.getByUser at t+3.0s carries _x_id=noversion-… and no slack_route; sfdc.integration.listOrgs at t+4.6s carries _x_id=741e4b14-… and slack_route=T04T4TH8W."
+    },
+    "body_trailing_field_order": [
+      "_x_reason",
+      "_x_mode",
+      "_x_sonic",
+      "_x_app_name"
+    ],
+    "body_trailing_evidence": "149 of 163 request bodies end in exactly this sequence, with business params (token, channel, …) first.",
+    "x_reason_placement": "body",
+    "x_reason_evidence": "153 occurrences as a form field, 0 in any query string, 48 distinct values."
+  },
+
+  "edgeapi": {
+    "comment": "edgeapi.slack.com, 116 captured requests, 116/116 matching this exact order.",
+    "query_param_order": [
+      "_x_app_name",
+      "_x_b3_traceid",
+      "_x_b3_spanid",
+      "_x_b3_sampled",
+      "fp",
+      "_x_num_retries"
+    ],
+    "absent_params": [
+      "_x_id",
+      "_x_version_ts",
+      "slack_route",
+      "_x_csid",
+      "_x_frontend_build_type",
+      "_x_desktop_ia",
+      "_x_gantry",
+      "_x_foreground"
+    ],
+    "body": {
+      "content_type": "text/plain;charset=UTF-8",
+      "envelope_fields": [],
+      "evidence": "116/116 edgeapi bodies are JSON sent as text/plain and carry zero _x_* fields. The body envelope is workspace-API-only."
+    }
+  }
+}
