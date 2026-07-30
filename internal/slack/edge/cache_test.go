@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -113,10 +115,10 @@ func TestChannelsInfo_SendsUpdatedIDsAndDecodesResults(t *testing.T) {
 		return 200, `{"ok":true,"results":[
 			{"id":"C2QPK1V44","name":"general","updated":1783337533019,
 			 "is_channel":true,"is_group":false,"is_im":false,"is_mpim":false,
-			 "is_private":false,"is_archived":false,"is_member":true,
+			 "is_private":false,"is_archived":false,
 			 "context_team_id":"T04T4TH8W",
 			 "topic":{"creator":"U1","last_set":123,"value":"stand-ups here"}}
-		]}`
+		],"member_channels":["C2QPK1V44"]}`
 	})
 	c := rec.client()
 
@@ -158,10 +160,10 @@ func TestChannelsInfo_SendsUpdatedIDsAndDecodesResults(t *testing.T) {
 		t.Errorf("updated_ids = %v; want the {id: version} map verbatim, version 0 included", sent)
 	}
 
-	if len(got) != 1 {
-		t.Fatalf("got %d channels; want 1", len(got))
+	if len(got.Channels) != 1 {
+		t.Fatalf("got %d channels; want 1", len(got.Channels))
 	}
-	ch := got[0]
+	ch := got.Channels[0]
 	if ch.ID != "C2QPK1V44" {
 		t.Errorf("ID = %q; want C2QPK1V44", ch.ID)
 	}
@@ -186,6 +188,207 @@ func TestChannelsInfo_SendsUpdatedIDsAndDecodesResults(t *testing.T) {
 	if ch.Topic.Value != "stand-ups here" {
 		t.Errorf("Topic.Value = %q; want %q", ch.Topic.Value, "stand-ups here")
 	}
+
+	if len(got.MemberChannels) != 1 || got.MemberChannels[0] != "C2QPK1V44" {
+		t.Errorf("MemberChannels = %v; want [C2QPK1V44] — this array is what "+
+			"check_membership:true actually returns", got.MemberChannels)
+	}
+	if len(got.FailedIDs) != 0 {
+		t.Errorf("FailedIDs = %v; want empty when the response omits failed_ids", got.FailedIDs)
+	}
+}
+
+// TestChannel_HasNoIsMemberField pins the finding that motivated
+// removing it. Across 8 HAR captures — 18 channels/info requests, 7
+// responses with results, 36 result objects — `is_member` appears 0
+// times, while the other 43 fields appear 36/36. A struct field for it
+// would decode false forever and read as "not a member" for every
+// channel the user is in.
+//
+// If the server ever does start sending it, a field is still the wrong
+// answer: membership is carried by member_channels, and two sources of
+// truth for it would eventually disagree.
+func TestChannel_HasNoIsMemberField(t *testing.T) {
+	typ := reflect.TypeFor[Channel]()
+	if _, ok := typ.FieldByName("IsMember"); ok {
+		t.Error("Channel has an IsMember field; the captures show is_member on 0 of 36 " +
+			"observed result objects — membership arrives in the top-level member_channels")
+	}
+	for i := range typ.NumField() {
+		f := typ.Field(i)
+		if f.Tag.Get("json") == "is_member" {
+			t.Errorf("field %s is tagged json:%q; that key does not exist on a "+
+				"channels/info result", f.Name, "is_member")
+		}
+	}
+}
+
+// TestChannelsInfo_MembershipArrivesWithNoResults is the common
+// real-world shape, not an edge case: 5 of the 6 observed responses
+// carrying member_channels had `"results":[]`. Membership comes back
+// whether or not any channel record changed, which is exactly what
+// lets us stop enumerating.
+func TestChannelsInfo_MembershipArrivesWithNoResults(t *testing.T) {
+	rec := newRecorder(t, func(int) (int, string) {
+		return 200, `{"results":[],"ok":true,"member_channels":["C2QPK1V44","CL0AET1L0"]}`
+	})
+	c := rec.client()
+
+	got, err := c.ChannelsInfo(context.Background(), map[string]int64{
+		"C2QPK1V44":   1,
+		"CL0AET1L0":   2,
+		"C092E63RUUC": 3,
+	})
+	if err != nil {
+		t.Fatalf("ChannelsInfo: %v", err)
+	}
+	if len(got.Channels) != 0 {
+		t.Errorf("Channels = %+v; want empty", got.Channels)
+	}
+	if len(got.MemberChannels) != 2 {
+		t.Fatalf("MemberChannels = %v; want 2 ids — membership is returned even when "+
+			"results is empty, and dropping it forces enumeration", got.MemberChannels)
+	}
+	seen := map[string]bool{}
+	for _, id := range got.MemberChannels {
+		seen[id] = true
+	}
+	if !seen["C2QPK1V44"] || !seen["CL0AET1L0"] {
+		t.Errorf("MemberChannels = %v; want C2QPK1V44 and CL0AET1L0", got.MemberChannels)
+	}
+	// An id sent but absent from member_channels is a non-membership,
+	// not missing data.
+	if seen["C092E63RUUC"] {
+		t.Errorf("MemberChannels = %v; C092E63RUUC was not in the response", got.MemberChannels)
+	}
+}
+
+// TestChannelsInfo_SurfacesFailedIDs covers the correctness hazard: an
+// id the server could not resolve is absent from results, exactly like
+// an unchanged one. Without failed_ids the caller marks it fresh and
+// keeps a stale record forever, because its version never advances.
+func TestChannelsInfo_SurfacesFailedIDs(t *testing.T) {
+	rec := newRecorder(t, func(int) (int, string) {
+		return 200, `{"results":[],"ok":true,
+			"member_channels":["C2QPK1V44"],
+			"failed_ids":["C092E63RUUCX","C0B0QD6BH1N"]}`
+	})
+	c := rec.client()
+
+	got, err := c.ChannelsInfo(context.Background(), map[string]int64{
+		"C2QPK1V44":    1,
+		"C092E63RUUCX": 2,
+		"C0B0QD6BH1N":  3,
+	})
+	if err != nil {
+		t.Fatalf("ChannelsInfo: %v", err)
+	}
+	// failed_ids is not an error: the rest of the batch succeeded.
+	if len(got.FailedIDs) != 2 {
+		t.Fatalf("FailedIDs = %v; want 2 — a failed id is indistinguishable from an "+
+			"unchanged one unless it is surfaced", got.FailedIDs)
+	}
+	seen := map[string]bool{}
+	for _, id := range got.FailedIDs {
+		seen[id] = true
+	}
+	if !seen["C092E63RUUCX"] || !seen["C0B0QD6BH1N"] {
+		t.Errorf("FailedIDs = %v; want C092E63RUUCX and C0B0QD6BH1N", got.FailedIDs)
+	}
+	if len(got.MemberChannels) != 1 || got.MemberChannels[0] != "C2QPK1V44" {
+		t.Errorf("MemberChannels = %v; want [C2QPK1V44] alongside the failures",
+			got.MemberChannels)
+	}
+}
+
+// TestChannelsInfo_AbsentMembershipAndFailuresDecodeEmpty pins the
+// dominant observed shape: member_channels appears in 5 of 18
+// responses and failed_ids in 4 of 18, so absence is the norm and must
+// mean empty, never an error.
+func TestChannelsInfo_AbsentMembershipAndFailuresDecodeEmpty(t *testing.T) {
+	rec := newRecorder(t, alwaysEmpty) // {"results":[],"ok":true}
+	c := rec.client()
+
+	got, err := c.ChannelsInfo(context.Background(), map[string]int64{"C2QPK1V44": 1})
+	if err != nil {
+		t.Fatalf("ChannelsInfo on a response with neither key: %v", err)
+	}
+	if len(got.MemberChannels) != 0 {
+		t.Errorf("MemberChannels = %v; want empty when member_channels is absent",
+			got.MemberChannels)
+	}
+	if len(got.FailedIDs) != 0 {
+		t.Errorf("FailedIDs = %v; want empty when failed_ids is absent", got.FailedIDs)
+	}
+}
+
+// TestChannelsInfo_AccumulatesMembershipAcrossBatches is the batching
+// bug most likely to slip through: member_channels is per-batch, so
+// assigning instead of appending silently keeps only the last batch
+// and reports every channel in the earlier batches as a non-membership.
+func TestChannelsInfo_AccumulatesMembershipAcrossBatches(t *testing.T) {
+	// Three batches, each naming a distinct member channel and a
+	// distinct failure.
+	rec := newRecorder(t, func(n int) (int, string) {
+		return 200, fmt.Sprintf(
+			`{"ok":true,"results":[],"member_channels":["M%d"],"failed_ids":["F%d"]}`, n, n)
+	})
+	c := rec.client()
+
+	got, err := c.ChannelsInfo(context.Background(), ids("C", channelsInfoBatchSize*2+10))
+	if err != nil {
+		t.Fatalf("ChannelsInfo: %v", err)
+	}
+	if n := len(rec.requests()); n != 3 {
+		t.Fatalf("made %d requests; want 3", n)
+	}
+
+	member := map[string]bool{}
+	for _, id := range got.MemberChannels {
+		member[id] = true
+	}
+	for _, want := range []string{"M1", "M2", "M3"} {
+		if !member[want] {
+			t.Errorf("member channel %s missing from %v; membership from earlier batches "+
+				"was overwritten instead of accumulated", want, got.MemberChannels)
+		}
+	}
+	if len(got.MemberChannels) != 3 {
+		t.Errorf("MemberChannels = %v; want exactly 3 ids, one per batch", got.MemberChannels)
+	}
+
+	failed := map[string]bool{}
+	for _, id := range got.FailedIDs {
+		failed[id] = true
+	}
+	for _, want := range []string{"F1", "F2", "F3"} {
+		if !failed[want] {
+			t.Errorf("failed id %s missing from %v; failures from earlier batches "+
+				"were overwritten instead of accumulated", want, got.FailedIDs)
+		}
+	}
+	if len(got.FailedIDs) != 3 {
+		t.Errorf("FailedIDs = %v; want exactly 3 ids, one per batch", got.FailedIDs)
+	}
+}
+
+// TestChannelsInfo_MembershipAccumulatesInOrder pins the ordering too:
+// a merge that kept only the first batch, or reversed them, would pass
+// the set-membership assertions above.
+func TestChannelsInfo_MembershipAccumulatesInOrder(t *testing.T) {
+	rec := newRecorder(t, func(n int) (int, string) {
+		return 200, fmt.Sprintf(`{"ok":true,"results":[],"member_channels":["M%d"]}`, n)
+	})
+	c := rec.client()
+
+	got, err := c.ChannelsInfo(context.Background(), ids("C", channelsInfoBatchSize*2+10))
+	if err != nil {
+		t.Fatalf("ChannelsInfo: %v", err)
+	}
+	want := []string{"M1", "M2", "M3"}
+	if !slices.Equal(got.MemberChannels, want) {
+		t.Errorf("MemberChannels = %v; want %v in request order", got.MemberChannels, want)
+	}
 }
 
 func TestChannelsInfo_EmptyResultsMeansNothingChanged(t *testing.T) {
@@ -196,8 +399,8 @@ func TestChannelsInfo_EmptyResultsMeansNothingChanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ChannelsInfo: %v", err)
 	}
-	if len(got) != 0 {
-		t.Errorf("got %d channels; want 0 — an empty results array means nothing changed, not an error", len(got))
+	if len(got.Channels) != 0 {
+		t.Errorf("got %d channels; want 0 — an empty results array means nothing changed, not an error", len(got.Channels))
 	}
 	// The request still has to happen: this is the revalidation.
 	if n := len(rec.requests()); n != 1 {
@@ -214,8 +417,8 @@ func TestChannelsInfo_NoIDsMakesNoRequest(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ChannelsInfo(%v): %v", in, err)
 		}
-		if len(got) != 0 {
-			t.Errorf("ChannelsInfo(%v) returned %d channels; want 0", in, len(got))
+		if len(got.Channels) != 0 || len(got.MemberChannels) != 0 || len(got.FailedIDs) != 0 {
+			t.Errorf("ChannelsInfo(%v) returned %+v; want a zero result", in, got)
 		}
 	}
 	if n := len(rec.requests()); n != 0 {
@@ -294,16 +497,16 @@ func TestChannelsInfo_ReturnsResultsFromEveryBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ChannelsInfo: %v", err)
 	}
-	if len(got) != 3 {
-		t.Fatalf("got %d channels from 3 batches; want 3 — results from later batches were dropped: %+v", len(got), got)
+	if len(got.Channels) != 3 {
+		t.Fatalf("got %d channels from 3 batches; want 3 — results from later batches were dropped: %+v", len(got.Channels), got.Channels)
 	}
 	seen := map[string]bool{}
-	for _, ch := range got {
+	for _, ch := range got.Channels {
 		seen[ch.ID] = true
 	}
 	for _, want := range []string{"C1", "C2", "C3"} {
 		if !seen[want] {
-			t.Errorf("channel %s missing from the merged result: %+v", want, got)
+			t.Errorf("channel %s missing from the merged result: %+v", want, got.Channels)
 		}
 	}
 }
@@ -339,11 +542,12 @@ func TestChannelsInfo_IgnoresUnknownResponseFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ChannelsInfo on a full real-shaped response: %v", err)
 	}
-	if len(got) != 1 {
-		t.Fatalf("got %d channels; want 1", len(got))
+	if len(got.Channels) != 1 {
+		t.Fatalf("got %d channels; want 1", len(got.Channels))
 	}
-	if got[0].ID != "C2QPK1V44" || got[0].Version != 1783337533019 || got[0].Topic.Value != "t" {
-		t.Errorf("modelled fields did not survive the unmodelled ones: %+v", got[0])
+	if got.Channels[0].ID != "C2QPK1V44" || got.Channels[0].Version != 1783337533019 ||
+		got.Channels[0].Topic.Value != "t" {
+		t.Errorf("modelled fields did not survive the unmodelled ones: %+v", got.Channels[0])
 	}
 }
 
@@ -360,8 +564,8 @@ func TestChannelsInfo_PropagatesAPIError(t *testing.T) {
 	if !strings.Contains(err.Error(), "invalid_auth") {
 		t.Errorf("error = %v; want it to mention invalid_auth", err)
 	}
-	if got != nil {
-		t.Errorf("got = %+v; want nil results alongside an error", got)
+	if got.Channels != nil || got.MemberChannels != nil || got.FailedIDs != nil {
+		t.Errorf("got = %+v; want a zero result alongside an error", got)
 	}
 }
 
@@ -375,7 +579,9 @@ func TestChannelsInfo_MidBatchErrorAbortsAndDiscardsPartialResults(t *testing.T)
 		if n == 2 {
 			return 200, `{"ok":false,"error":"ratelimited"}`
 		}
-		return 200, fmt.Sprintf(`{"ok":true,"results":[{"id":"C%d","updated":%d}]}`, n, n)
+		return 200, fmt.Sprintf(
+			`{"ok":true,"results":[{"id":"C%d","updated":%d}],"member_channels":["M%d"],"failed_ids":["F%d"]}`,
+			n, n, n, n)
 	})
 	c := rec.client()
 
@@ -386,8 +592,11 @@ func TestChannelsInfo_MidBatchErrorAbortsAndDiscardsPartialResults(t *testing.T)
 	if !strings.Contains(err.Error(), "ratelimited") {
 		t.Errorf("error = %v; want it to mention ratelimited", err)
 	}
-	if got != nil {
-		t.Errorf("got = %+v; want nil — partial results would look like "+
+	// Membership and failures accumulated by the first batch must be
+	// discarded too: a partial membership snapshot read as a complete
+	// one turns every unqueried channel into a non-membership.
+	if got.Channels != nil || got.MemberChannels != nil || got.FailedIDs != nil {
+		t.Errorf("got = %+v; want a zero result — partial results would look like "+
 			"'only these changed' and strand the unfetched ids", got)
 	}
 	if n := len(rec.requests()); n != 2 {

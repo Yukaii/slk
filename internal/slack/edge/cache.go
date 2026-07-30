@@ -32,6 +32,15 @@ const (
 // (enterprise_id, shared_team_ids, properties{}, channel_agent_status,
 // …); decoding ignores the rest, and must keep doing so — Slack adds
 // fields to this response without notice.
+//
+// There is deliberately no IsMember field. An earlier draft asserted
+// one; the captures disprove it. Across 8 HAR captures — 18
+// channels/info requests, 7 responses carrying results, 36 result
+// objects — `is_member` appears in 0 of 36, while the other 43 fields
+// appear in 36 of 36. Membership does not travel on the result at all;
+// it travels on the top-level member_channels array (see
+// ChannelsInfoResult.MemberChannels). A bool field here would decode
+// false forever and read as "not a member".
 type Channel struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
@@ -39,22 +48,13 @@ type Channel struct {
 	// updated_ids on the next revalidation. Channels stamp it in
 	// milliseconds (1783337533019), users in seconds; to us it is an
 	// opaque monotonic version, never a timestamp.
-	Version    int64 `json:"updated"`
-	IsChannel  bool  `json:"is_channel"`
-	IsGroup    bool  `json:"is_group"`
-	IsIM       bool  `json:"is_im"`
-	IsMPIM     bool  `json:"is_mpim"`
-	IsPrivate  bool  `json:"is_private"`
-	IsArchived bool  `json:"is_archived"`
-	// IsMember is UNVERIFIED against the captures. check_membership:true
-	// is sent precisely to get membership back, but the one fully
-	// hydrated channels/info result in
-	// internal/slack/testdata/phase2-api-contracts.json does not list
-	// is_member (only 3 of the 18 observed requests are sampled there,
-	// and only one has a non-empty results array). Treat a false here
-	// as "unknown" until a capture confirms the field, and do not add a
-	// test asserting it as though it were an observed contract.
-	IsMember    bool   `json:"is_member"`
+	Version     int64  `json:"updated"`
+	IsChannel   bool   `json:"is_channel"`
+	IsGroup     bool   `json:"is_group"`
+	IsIM        bool   `json:"is_im"`
+	IsMPIM      bool   `json:"is_mpim"`
+	IsPrivate   bool   `json:"is_private"`
+	IsArchived  bool   `json:"is_archived"`
 	ContextTeam string `json:"context_team_id"`
 	Topic       struct {
 		Value string `json:"value"`
@@ -82,17 +82,85 @@ type User struct {
 	} `json:"profile"`
 }
 
+// ChannelsInfoResult is everything one ChannelsInfo call learned,
+// accumulated across all of its batches.
+//
+// This is a struct rather than three return values because the three
+// outputs are independent, accumulate separately, and are easy to
+// transpose at a call site if they were positional; a fourth top-level
+// key is also plausible, since Slack has already added two beyond
+// `results`.
+type ChannelsInfoResult struct {
+	// Channels holds only the channels whose version moved, plus the
+	// ones sent with version 0. Empty here is the normal case, not a
+	// sign the call learned nothing: all 5 observed responses that
+	// carried membership also had `"results":[]`.
+	Channels []Channel
+	// MemberChannels holds the ids the authenticated user belongs to.
+	// This is what check_membership:true buys, and it is the reason
+	// this endpoint can replace a conversations.list walk: membership
+	// comes back regardless of whether any channel record changed —
+	// all 5 observed responses carrying it had `"results":[]` — so it
+	// is learned without ever enumerating.
+	//
+	// It is a snapshot over the ids this call sent, not a delta. An id
+	// that was sent and is absent here is one the user is not a member
+	// of; an id that was never sent says nothing either way.
+	MemberChannels []string
+	// FailedIDs holds the ids the server could not resolve. Ignoring
+	// this is a correctness hazard rather than a lost nicety: absence
+	// from Channels otherwise means "unchanged, still fresh", so a
+	// failed id would be marked current and its stale record kept
+	// forever, because its version never advances. A caller should
+	// retry these or leave their rows explicitly stale.
+	FailedIDs []string
+}
+
+// channelsInfoResponse is one channels/info batch on the wire.
+//
+// member_channels and failed_ids are each absent from most responses
+// (observed 5/18 and 4/18 respectively). Absence decodes to a nil
+// slice and means empty, never an error.
+type channelsInfoResponse struct {
+	Results        []Channel `json:"results"`
+	MemberChannels []string  `json:"member_channels"`
+	FailedIDs      []string  `json:"failed_ids"`
+}
+
 // ChannelsInfo revalidates channels against the edge cache.
 //
 // updatedIDs maps channel id to the version last seen (0 for a channel
-// we have never seen). The response contains only the entries whose
-// version moved plus the unknown ones, so a fully current cache costs
-// one 24-byte response per batch instead of a full conversations.list
+// we have never seen). Only the entries whose version moved, plus the
+// unknown ones, come back in Channels, so a fully current cache costs
+// one small response per batch instead of a full conversations.list
 // walk. An empty or nil map makes no request at all.
-func (c *Client) ChannelsInfo(ctx context.Context, updatedIDs map[string]int64) ([]Channel, error) {
-	return fetchInfo[Channel](ctx, c, "channels/info", map[string]any{
+//
+// check_membership:true does not add a field to those results. It adds
+// the top-level member_channels array, returned for every id in the
+// batch whether or not that channel changed — see
+// ChannelsInfoResult.MemberChannels.
+func (c *Client) ChannelsInfo(ctx context.Context, updatedIDs map[string]int64) (ChannelsInfoResult, error) {
+	var out ChannelsInfoResult
+	err := fetchInfo(ctx, c, "channels/info", map[string]any{
 		"check_membership": true,
-	}, updatedIDs, channelsInfoBatchSize)
+	}, updatedIDs, channelsInfoBatchSize, func(batch channelsInfoResponse) {
+		out.Channels = append(out.Channels, batch.Results...)
+		out.MemberChannels = append(out.MemberChannels, batch.MemberChannels...)
+		out.FailedIDs = append(out.FailedIDs, batch.FailedIDs...)
+	})
+	if err != nil {
+		return ChannelsInfoResult{}, err
+	}
+	return out, nil
+}
+
+// usersInfoResponse is one users/info batch on the wire.
+//
+// There is no membership analogue here. Across 30 observed users/info
+// responses the only top-level keys are results (30/30), ok (30/30)
+// and can_interact (12/30) — no member_channels, no failed_ids.
+type usersInfoResponse struct {
+	Results []User `json:"results"`
 }
 
 // UsersInfo revalidates users against the edge cache, with the same
@@ -105,36 +173,56 @@ func (c *Client) ChannelsInfo(ctx context.Context, updatedIDs map[string]int64) 
 // merging maps across batches and widening this signature for data no
 // caller wants. Adding it later is a two-line change plus a merge.
 func (c *Client) UsersInfo(ctx context.Context, updatedIDs map[string]int64) ([]User, error) {
-	return fetchInfo[User](ctx, c, "users/info", map[string]any{
+	var out []User
+	err := fetchInfo(ctx, c, "users/info", map[string]any{
 		"check_interaction":          true,
 		"include_profile_only_users": true,
-	}, updatedIDs, usersInfoBatchSize)
+	}, updatedIDs, usersInfoBatchSize, func(batch usersInfoResponse) {
+		out = append(out, batch.Results...)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // fetchInfo posts updatedIDs to a cache endpoint in batches of at most
-// batchSize and concatenates the results.
+// batchSize, decoding each batch into Resp and handing it to merge.
 //
-// This is a generic free function rather than a method because Go
-// methods cannot take type parameters, and rather than a shared helper
-// that inspects the endpoint name to decide what to decode into: the
-// only thing that differs between channels/info and users/info is the
-// result element type and the flag payload, and both are things the
-// caller already knows. Passing the type in makes that explicit and
-// keeps a new endpoint from having to be added to a string switch.
+// It is generic over the whole per-batch response rather than over the
+// result element type, which is the change the captures forced: the
+// two endpoints no longer share a response shape. channels/info
+// carries member_channels and failed_ids alongside results;
+// users/info carries neither and carries can_interact instead. A
+// helper parameterised on the element type could only have grown a
+// second return value that users/info always left empty, or the
+// `endpoint == "channels/info"` string comparison that was rejected
+// outright.
 //
-// A failed batch fails the whole call and discards what already
-// succeeded. Returning partial results with a nil error would be
-// indistinguishable from "only these entries changed", so a caller
-// would mark the unfetched ids current and never revalidate them again.
-func fetchInfo[T any](
+// Splitting this into two functions was the alternative and was
+// rejected: what the endpoints still share is exactly the part that is
+// easy to get subtly wrong and expensive to get wrong twice — the
+// trailing-partial-batch guard, never sending an empty batch, a fresh
+// batch map per flush, and abort-on-first-error. What differs is
+// decoding and accumulation, which is now entirely in the caller's
+// merge closure where it is plain to read. So the generic earns its
+// place, just on a different axis than before.
+//
+// merge is called once per successful batch, in request order, and
+// never after an error. A failed batch fails the whole call and the
+// caller discards what already merged: returning partial results with
+// a nil error would be indistinguishable from "only these entries
+// changed", so a caller would mark the unfetched ids current and never
+// revalidate them again.
+func fetchInfo[Resp any](
 	ctx context.Context,
 	c *Client,
 	endpoint string,
 	flags map[string]any,
 	updatedIDs map[string]int64,
 	batchSize int,
-) ([]T, error) {
-	var out []T
+	merge func(Resp),
+) error {
 	batch := make(map[string]int64, min(batchSize, len(updatedIDs)))
 
 	flush := func() error {
@@ -142,13 +230,11 @@ func fetchInfo[T any](
 		maps.Copy(payload, flags)
 		payload["updated_ids"] = batch
 
-		var resp struct {
-			Results []T `json:"results"`
-		}
+		var resp Resp
 		if err := c.call(ctx, endpoint, payload, &resp); err != nil {
 			return err
 		}
-		out = append(out, resp.Results...)
+		merge(resp)
 		// A fresh map rather than clear(): payload still references
 		// this one. clear() happens to be safe today only because
 		// call marshals the body synchronously before returning — no
@@ -162,7 +248,7 @@ func fetchInfo[T any](
 		batch[id] = version
 		if len(batch) == batchSize {
 			if err := flush(); err != nil {
-				return nil, err
+				return err
 			}
 		}
 	}
@@ -180,9 +266,9 @@ func fetchInfo[T any](
 	// it could fail a test.)
 	if len(batch) > 0 {
 		if err := flush(); err != nil {
-			return nil, err
+			return err
 		}
 	}
 
-	return out, nil
+	return nil
 }
