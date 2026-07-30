@@ -36,12 +36,29 @@ const usersListFilter = "everyone AND NOT bots AND NOT apps"
 // enumeration in one request instead of fifty, and the fingerprint
 // does not care which shape it arrived in.
 //
+// The asymmetry with the `count <= 0` check below is deliberate, not
+// an oversight. A non-positive count has a knowably wrong shape —
+// `count:0` is a request no capture shows and the server can only
+// reject or answer uselessly — whereas the upper hazard is a
+// judgement about volume with no observed threshold behind it.
+// Erroring on the first is enforcing the captures; erroring on the
+// second would be enforcing a number this package made up.
+//
 // # truncated, and the cursor that is deliberately not returned
 //
-// The response carries a next_marker pagination cursor when the page
-// came back full (3 of 4 observations; the one that asked for 20 and
-// got 4 had none). This returns whether that marker was present and
-// not the marker itself.
+// The response carried a next_marker pagination cursor in 3 of 4
+// observations. All three that had one asked for 30 and got 30 back;
+// the one without asked for 20 and got 4. "Present exactly when the
+// page came back full" is the obvious reading of that, but note the
+// denominator before relying on it: only one observation
+// discriminates, because only one short page was ever seen. If the
+// server ever returns a marker on a non-full page — or omits one on a
+// full page — `truncated` is silently wrong, and unlike a cursor it
+// gives the caller nothing to inspect and no way to notice. Treat the
+// correlation as inferred from a single sample rather than promised.
+//
+// This returns whether that marker was present and not the marker
+// itself.
 //
 // That is a deliberate narrowing, for two reasons.
 //

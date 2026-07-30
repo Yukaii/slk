@@ -3,6 +3,7 @@ package edge
 import (
 	"context"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -85,8 +86,16 @@ func TestChannelsSearch_SendsObservedPayload(t *testing.T) {
 	})
 	c := rec.client()
 
+	// Deliberately not in sorted order. The capture's top_channels
+	// begins C04T4TH9N, C04T4TH9Q, C94H848UB — ascending by accident —
+	// and a fixture in that order cannot tell "sent verbatim" from
+	// "sorted on the way out", because both produce the same bytes.
+	// Order is the entire content of a frecency hint: a sorted
+	// most-recently-used list is not a ranking, it is noise. So these
+	// are the capture's three ids rotated, which is neither sorted nor
+	// reverse-sorted and so fails under either mutation.
 	if _, _, err := c.ChannelsSearch(context.Background(), "test",
-		[]string{"C04T4TH9N", "C04T4TH9Q", "C94H848UB"}); err != nil {
+		[]string{"C94H848UB", "C04T4TH9N", "C04T4TH9Q"}); err != nil {
 		t.Fatalf("ChannelsSearch: %v", err)
 	}
 
@@ -116,7 +125,7 @@ func TestChannelsSearch_SendsObservedPayload(t *testing.T) {
 	wantTrue(t, body, "include_record_channels")
 	wantTrue(t, body, "check_membership")
 	wantString(t, body, "default_workspace", "T04T4TH8W")
-	wantStrings(t, body, "top_channels", "C04T4TH9N", "C04T4TH9Q", "C94H848UB")
+	wantStrings(t, body, "top_channels", "C94H848UB", "C04T4TH9N", "C04T4TH9Q")
 }
 
 // TestChannelsSearch_DecodesResultsAndMemberChannels covers the
@@ -613,8 +622,14 @@ func TestUsersSearch_IgnoresUnknownResponseFields(t *testing.T) {
 // wrong answers rather than a visible failure. ChannelsInfo and
 // UsersInfo already discard on error; this keeps the package
 // consistent.
+// Both orderings are covered per endpoint, and that is not
+// redundancy. Whichever key fails is the key that stays at its zero
+// value, so the fixture where member_channels is the broken one
+// cannot see a `return nil, resp.MemberChannels, err` — the leak it
+// would expose is nil either way. Only a fixture where
+// member_channels decodes *before* the failure discriminates.
 func TestSearch_DiscardsPartialResultsOnADecodeError(t *testing.T) {
-	t.Run("channels", func(t *testing.T) {
+	t.Run("channels/member_channels fails after results decodes", func(t *testing.T) {
 		rec := newRecorder(t, func(int) (int, string) {
 			// results decodes; member_channels then fails.
 			return 200, `{"ok":true,"results":[{"id":"C-LEAKED","updated":9}],` +
@@ -632,6 +647,30 @@ func TestSearch_DiscardsPartialResultsOnADecodeError(t *testing.T) {
 			t.Errorf("member_channels = %v; want nil alongside an error", members)
 		}
 	})
+	t.Run("channels/results fails after member_channels decodes", func(t *testing.T) {
+		rec := newRecorder(t, func(int) (int, string) {
+			// member_channels is first on the wire and well-formed,
+			// so it is fully populated by the time the second result
+			// hits a string where `updated` must be a number. Both
+			// return values are live at the moment the error is
+			// produced, which is the only arrangement that can catch
+			// either one being handed to the caller.
+			return 200, `{"ok":true,"member_channels":["C-LEAKED","C2"],` +
+				`"results":[{"id":"C-LEAKED","updated":9},{"id":"C2","updated":"not-a-number"}]}`
+		})
+		got, members, err := rec.client().ChannelsSearch(context.Background(), "test", nil)
+		if err == nil {
+			t.Fatal("ChannelsSearch returned nil error on an undecodable result")
+		}
+		if got != nil {
+			t.Errorf("results = %+v; want nil alongside an error", got)
+		}
+		if members != nil {
+			t.Errorf("member_channels = %v; want nil — this array decoded cleanly, but "+
+				"it came from a response that failed, and a finder that marks channels "+
+				"\"you are in this one\" from a half-read response is confidently wrong", members)
+		}
+	})
 	t.Run("users", func(t *testing.T) {
 		rec := newRecorder(t, func(int) (int, string) {
 			// The first user decodes; the second has a string where
@@ -647,6 +686,55 @@ func TestSearch_DiscardsPartialResultsOnADecodeError(t *testing.T) {
 			t.Errorf("results = %+v; want nil — those rows came from a response that "+
 				"failed to decode", got)
 		}
+	})
+}
+
+// TestSearch_SendsTheWholeTopList catches an implementation that caps
+// the frecency hint at the length the captures happen to show.
+//
+// Every captured channels/search sent exactly 22 top_channels and
+// every captured users/search exactly 50 top_users, so a silent
+// `[:22]` or `[:50]` is invisible to every other test in this file —
+// none of them sends a longer list. This one sends more than both.
+//
+// Be honest about what this does and does not establish. It pins that
+// slk does not truncate; it does *not* establish that sending more
+// than 22/50 is a shape the server has been seen accepting, because
+// no capture shows one. The lengths are the official client's own
+// frecency-list sizes rather than a limit it was observed negotiating,
+// so if Phase 2b hands this a list of 500 it is in unverified
+// territory — and capping here would be equally unverified, just
+// silently. Whichever way that is decided, it should be decided out
+// loud with a capture behind it, not by a slice expression.
+func TestSearch_SendsTheWholeTopList(t *testing.T) {
+	// Distinct, non-ascending ids: a truncation and a sort both have
+	// to fail here, and 60 clears both observed lengths at once.
+	top := make([]string, 60)
+	for i := range top {
+		top[i] = "X" + strconv.Itoa(len(top)-i)
+	}
+
+	t.Run("channels", func(t *testing.T) {
+		rec := newRecorder(t, func(int) (int, string) { return 200, `{"ok":true,"results":[]}` })
+		if _, _, err := rec.client().ChannelsSearch(context.Background(), "test", top); err != nil {
+			t.Fatalf("ChannelsSearch: %v", err)
+		}
+		reqs := rec.requests()
+		if len(reqs) != 1 {
+			t.Fatalf("made %d requests; want 1", len(reqs))
+		}
+		wantStrings(t, reqs[0].generic(t), "top_channels", top...)
+	})
+	t.Run("users", func(t *testing.T) {
+		rec := newRecorder(t, func(int) (int, string) { return 200, `{"ok":true,"results":[]}` })
+		if _, err := rec.client().UsersSearch(context.Background(), "test", "", top); err != nil {
+			t.Fatalf("UsersSearch: %v", err)
+		}
+		reqs := rec.requests()
+		if len(reqs) != 1 {
+			t.Fatalf("made %d requests; want 1", len(reqs))
+		}
+		wantStrings(t, reqs[0].generic(t), "top_users", top...)
 	})
 }
 

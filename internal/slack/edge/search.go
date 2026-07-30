@@ -25,6 +25,15 @@ const searchCount = 30
 // empty — a null or empty array under that key is still a key on the
 // wire, and no capture has one.
 //
+// It is sent whole and in the caller's order. Order is the entire
+// content of a frecency hint, and the list is not capped: both
+// captured requests carried exactly 22, so 22 is the official
+// client's own list size rather than a limit it was seen negotiating.
+// A caller handing this more than 22 is therefore in territory no
+// capture covers — but truncating here would be equally uncovered and
+// silent about it, so that call belongs to Phase 2b with a capture
+// behind it, not to a slice expression.
+//
 // The returned []string is the top-level member_channels array, the
 // same one channels/info returns and the same thing check_membership
 // buys: membership without enumeration. It is a snapshot over the
@@ -42,7 +51,11 @@ const searchCount = 30
 //
 // An empty query returns empty and makes no request: there is nothing
 // to rank, and firing one every time the input is cleared is a shape
-// the official client never produces.
+// the official client never produces. Whether "empty" arrives as a
+// nil slice or a zero-length one is deliberately unspecified here and
+// on UsersSearch — no caller can act on the difference, and pinning it
+// would promote a Go representation detail into a contract no capture
+// backs. Use len().
 //
 // Evidence: 2 observed requests, both from one capture. That is a
 // much thinner base than channels/info's 18 — the payload below is
@@ -94,7 +107,10 @@ func (c *Client) ChannelsSearch(ctx context.Context, query string, topChannels [
 // is omitted when empty (the finder's first keystroke after launch
 // may well have no current channel).
 //
-// topUsers is the frecency hint, 50 ids in both captures.
+// topUsers is the frecency hint, 50 ids in both captures. Sent whole
+// and in the caller's order, uncapped, for the reasons on
+// ChannelsSearch — 50 is the size of the official client's list, not
+// an observed ceiling.
 //
 // This payload is the one place this package knowingly departs from
 // the plan it was built to: the plan omitted both current_channel and

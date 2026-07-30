@@ -791,6 +791,187 @@ func TestUsersCounts_PropagatesAPIError(t *testing.T) {
 	}
 }
 
+// ------------------------------------------------------ all three calls
+
+// TestMembers_DiscardsPartialResultsOnADecodeError pins zero-value-on-
+// error for every method in this file, which `return resp.X, err`
+// quietly breaks.
+//
+// The ok:false tests above cannot show this and must not be mistaken
+// for it: call returns before it ever unmarshals into the result
+// struct, so the struct is still zero and a leaking implementation is
+// byte-identical to a correct one. The failure that discriminates is a
+// modelled field that decodes cleanly followed by a *later* field with
+// the wrong type — encoding/json records the first UnmarshalTypeError
+// and keeps decoding, so the earlier field is already populated when
+// the error comes back. That is what makes the leak reachable rather
+// than theoretical.
+//
+// Handing that data to a caller alongside an error is worse than it
+// sounds here. A member list rendered next to a logged error is a
+// roster the user has no reason to doubt; a `truncated` read off a
+// half-decoded response tells them "30+ members" about a channel
+// nobody counted; and Counts is a bare number with nowhere to put a
+// caveat. cache.go states this invariant for fetchInfo and search.go
+// pins it for both search endpoints — this closes the file that had
+// no coverage at all.
+func TestMembers_DiscardsPartialResultsOnADecodeError(t *testing.T) {
+	t.Run("UsersList", func(t *testing.T) {
+		rec := newRecorder(t, func(int) (int, string) {
+			// next_marker comes first and decodes, so a leaking
+			// `truncated` would be true; the first result decodes, so
+			// a leaking `users` would be non-empty; the second result
+			// has a string where `updated` must be a number. All
+			// three return values are live at the moment of failure.
+			return 200, `{"ok":true,"next_marker":"abc",` +
+				`"results":[{"id":"U-LEAKED","updated":9},{"id":"U2","updated":"not-a-number"}]}`
+		})
+		got, truncated, err := rec.client().UsersList(context.Background(), "C1", 30)
+		if err == nil {
+			t.Fatal("UsersList returned nil error on an undecodable result")
+		}
+		if got != nil {
+			t.Errorf("results = %+v; want nil — those rows came from a response that "+
+				"failed to decode, and a roster rendered beside a logged error looks "+
+				"exactly like a complete one", got)
+		}
+		if truncated {
+			t.Error("truncated = true; want false alongside an error — next_marker " +
+				"decoded, but it describes a page this call never successfully read")
+		}
+	})
+	t.Run("ChannelsMembership/non_members fails after members decodes", func(t *testing.T) {
+		rec := newRecorder(t, func(int) (int, string) {
+			return 200, `{"ok":true,"channel":"C1","members":["U1","U3"],` +
+				`"non_members":"not-an-array"}`
+		})
+		members, nonMembers, err := rec.client().ChannelsMembership(
+			context.Background(), "C1", []string{"U1", "U2", "U3"})
+		if err == nil {
+			t.Fatal("ChannelsMembership returned nil error on an undecodable non_members")
+		}
+		if members != nil {
+			t.Errorf("members = %v; want nil alongside an error — this array decoded, "+
+				"but the partition it is half of never arrived, so treating it as the "+
+				"answer silently reclassifies everybody missing from it as a non-member",
+				members)
+		}
+		if nonMembers != nil {
+			t.Errorf("non_members = %v; want nil alongside an error", nonMembers)
+		}
+	})
+	t.Run("ChannelsMembership/members fails after non_members decodes", func(t *testing.T) {
+		// The mirror image. Whichever key fails is the key left at
+		// its zero value, so one ordering alone cannot see both
+		// halves of the partition leaking.
+		rec := newRecorder(t, func(int) (int, string) {
+			return 200, `{"ok":true,"channel":"C1","non_members":["U2"],` +
+				`"members":"not-an-array"}`
+		})
+		members, nonMembers, err := rec.client().ChannelsMembership(
+			context.Background(), "C1", []string{"U1", "U2"})
+		if err == nil {
+			t.Fatal("ChannelsMembership returned nil error on an undecodable members")
+		}
+		if members != nil {
+			t.Errorf("members = %v; want nil alongside an error", members)
+		}
+		if nonMembers != nil {
+			t.Errorf("non_members = %v; want nil alongside an error", nonMembers)
+		}
+	})
+	t.Run("UsersCounts", func(t *testing.T) {
+		rec := newRecorder(t, func(int) (int, string) {
+			// everyone decodes; people is a string where an int must
+			// be. resp.Counts is genuinely populated when the error
+			// is returned.
+			return 200, `{"ok":true,"channel":"C1","counts":{"everyone":91,` +
+				`"people":"not-a-number"}}`
+		})
+		got, err := rec.client().UsersCounts(context.Background(), "C1")
+		if err == nil {
+			t.Fatal("UsersCounts returned nil error on an undecodable count")
+		}
+		if !isZeroCounts(got) {
+			t.Errorf("got = %+v; want the zero Counts alongside an error — a count is "+
+				"a bare number with nowhere to carry a caveat, so a partial one is "+
+				"indistinguishable from a real one at every call site", got)
+		}
+	})
+}
+
+// TestMembers_UseTheCallersContext pins that ctx reaches the request
+// rather than being swapped for a background one.
+//
+// These are the channel-switch calls: all three fire when the user
+// opens a channel, and a superseded switch is precisely when
+// cancellation matters. A user clicking through four channels with an
+// implementation that ignored ctx would leave twelve abandoned
+// requests running to completion against one credential — a burst
+// shape produced by nobody's hand, which is the fingerprint this
+// package exists to avoid. Cancellation is the only thing that stops
+// them, and it can only arrive through the caller's context.
+//
+// The handler answers successfully on purpose. A client that honours
+// the cancelled context never reaches it; one that drops it gets a
+// clean success and fails the assertion below immediately, rather
+// than hanging.
+func TestMembers_UseTheCallersContext(t *testing.T) {
+	cancelled := func() context.Context {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx
+	}
+
+	t.Run("UsersList", func(t *testing.T) {
+		rec := newRecorder(t, func(int) (int, string) { return 200, usersListResults })
+		got, truncated, err := rec.client().UsersList(cancelled(), "C1", 30)
+		if err == nil {
+			t.Fatal("UsersList on a cancelled context returned nil error")
+		}
+		if got != nil || truncated {
+			t.Errorf("got = %+v, %v; want nil, false on a cancelled context", got, truncated)
+		}
+		if n := len(rec.requests()); n != 0 {
+			t.Errorf("made %d requests on a cancelled context; want 0 — the caller's "+
+				"cancellation must reach the request", n)
+		}
+	})
+	t.Run("ChannelsMembership", func(t *testing.T) {
+		rec := newRecorder(t, func(int) (int, string) {
+			return 200, `{"ok":true,"channel":"C1","members":["U1"]}`
+		})
+		members, nonMembers, err := rec.client().ChannelsMembership(
+			cancelled(), "C1", []string{"U1"})
+		if err == nil {
+			t.Fatal("ChannelsMembership on a cancelled context returned nil error")
+		}
+		if members != nil || nonMembers != nil {
+			t.Errorf("got %v, %v; want nil, nil on a cancelled context", members, nonMembers)
+		}
+		if n := len(rec.requests()); n != 0 {
+			t.Errorf("made %d requests on a cancelled context; want 0", n)
+		}
+	})
+	t.Run("UsersCounts", func(t *testing.T) {
+		rec := newRecorder(t, func(int) (int, string) {
+			return 200, `{"ok":true,"channel":"C1","counts":{"everyone":91}}`
+		})
+		got, err := rec.client().UsersCounts(cancelled(), "C1")
+		if err == nil {
+			t.Fatal("UsersCounts on a cancelled context returned nil error")
+		}
+		if !isZeroCounts(got) {
+			t.Errorf("got = %+v; want the zero Counts on a cancelled context", got)
+		}
+		if n := len(rec.requests()); n != 0 {
+			t.Errorf("made %d requests on a cancelled context; want 0", n)
+		}
+	})
+}
+
+// ------------------------------------------------ users/counts, continued
+
 func TestUsersCounts_IgnoresUnknownResponseFields(t *testing.T) {
 	rec := newRecorder(t, func(int) (int, string) {
 		return 200, `{"ok":true,"channel":"C1","a_future_top_level_key":[1,2],
