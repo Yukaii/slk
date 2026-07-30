@@ -1641,7 +1641,7 @@ func run() error {
 	// Results are sent to the TUI via p.Send()
 	for _, ot := range orderedTokens {
 		go func(tok slackclient.Token) {
-			wctx, err := connectWorkspace(ctx, tok, db, cfg, avatarCache, p)
+			wctx, err := connectWorkspace(ctx, tok, db, cfg, avatarCache, p, configPath)
 			if err != nil {
 				p.Send(ui.WorkspaceFailedMsg{TeamName: tok.TeamName})
 				return
@@ -1867,11 +1867,34 @@ func slugifyHandle(name string) string {
 	return b.String()
 }
 
-func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB, cfg config.Config, avatarCache *avatar.Cache, p *tea.Program) (*WorkspaceContext, error) {
+func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB, cfg config.Config, avatarCache *avatar.Cache, p *tea.Program, configPath string) (*WorkspaceContext, error) {
 	client := slackclient.NewClient(token.AccessToken, token.Cookie)
+
+	// Seed the build timestamp from the last run so the very first
+	// request of this session already carries a current _x_version_ts
+	// instead of the compiled-in fallback.
+	seedVersionTS(client.Envelope(), cfg, token.TeamID)
+
 	if err := client.Connect(ctx); err != nil {
 		return nil, fmt.Errorf("connecting %s: %w", token.TeamName, err)
 	}
+
+	// Refresh the build timestamp in the background. Failure is
+	// non-fatal: the seeded or compiled-in value stays in use.
+	go func() {
+		ts, err := client.ShouldReload(ctx)
+		if err != nil {
+			debuglog.General("shouldReload: %v", err)
+			return
+		}
+		if env := client.Envelope(); env != nil {
+			env.SetVersionTS(ts)
+		}
+		tomlKey := workspaceTOMLKey(cfg, client.TeamID())
+		if err := saveWorkspaceVersionTS(configPath, tomlKey, client.TeamID(), token.TeamName, ts); err != nil {
+			debuglog.General("saving version_ts: %v", err)
+		}
+	}()
 
 	wctx := &WorkspaceContext{
 		Client:               client,

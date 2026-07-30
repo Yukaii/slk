@@ -6,7 +6,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
+
+// configWriteMu serializes the read-modify-write cycles the save*
+// helpers below perform on config.toml. The theme and width savers run
+// on the UI goroutine, but the version_ts refresh fires from one
+// background goroutine per workspace, all racing on the same file:
+// without this lock two concurrent saves lose one another's update, and
+// a reader can observe a half-written file and persist the truncation.
+var configWriteMu sync.Mutex
 
 // tomlString returns s as a properly escaped TOML basic string,
 // including the surrounding quotes. Backslashes and double quotes
@@ -58,6 +67,9 @@ func sanitizeComment(s string) string {
 // Existing comments and ordering are preserved (textual rewrite, not
 // TOML re-marshal).
 func saveGlobalTheme(configPath, themeName string) error {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+
 	data, err := os.ReadFile(configPath)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
@@ -101,6 +113,9 @@ func saveGlobalTheme(configPath, themeName string) error {
 // "..." line (currently we only create legacy-keyed blocks here, but
 // slug callers update an existing block).
 func saveWorkspaceTheme(configPath, tomlKey, teamID, teamName, themeName string) error {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+
 	data, err := os.ReadFile(configPath)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
