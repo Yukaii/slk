@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -2623,5 +2624,105 @@ func TestWSUpgradeHeaders_OmitsXHROnlyHeaders(t *testing.T) {
 	}
 	if h.Get("Origin") != "https://app.slack.com" {
 		t.Errorf("wsUpgradeHeaders() Origin = %q; want https://app.slack.com", h.Get("Origin"))
+	}
+}
+
+// --- Envelope wiring (Task 7) ---------------------------------------
+
+// pointClientAtTestServer makes the client's requests to slack.com land
+// on srv without changing the URL the client builds.
+//
+// BrowserTransport only decorates *.slack.com hosts, so a test that
+// pointed apiBaseURL straight at the 127.0.0.1 httptest address would
+// silently skip every envelope param and every browser header — and
+// would then "pass" only if we weakened it to assert struct fields
+// instead of wire bytes. Redirecting inside the dialer instead keeps
+// req.URL.Host genuinely "slack.com" (exactly as in production) while
+// the bytes go to the test server, so the production decoration path
+// runs for real.
+//
+// It deliberately reaches through c.httpClient.Transport rather than
+// replacing it: swapping only BrowserTransport.Inner leaves the Env
+// NewClient installed in place, so the test fails if NewClient stops
+// wiring it.
+func pointClientAtTestServer(t *testing.T, c *Client, srv *httptest.Server) {
+	t.Helper()
+	bt, ok := c.httpClient.Transport.(*slackhttp.BrowserTransport)
+	if !ok {
+		t.Fatalf("client transport is %T; want *slackhttp.BrowserTransport", c.httpClient.Transport)
+	}
+	addr := srv.Listener.Addr().String()
+	bt.Inner = &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		},
+	}
+	c.apiBaseURL = "http://slack.com/api/"
+}
+
+func TestClient_EnvelopeExistsAndIsPreBoot(t *testing.T) {
+	c := NewClient("xoxc-test", "d-cookie")
+	if c.Envelope() == nil {
+		t.Fatal("Envelope() is nil; want a non-nil envelope")
+	}
+	if got := c.Envelope().TeamID(); got != "" {
+		t.Errorf("TeamID() = %q before Connect; want empty (pre-boot phase)", got)
+	}
+}
+
+func TestClient_ConnectSetsEnvelopeTeamID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"url":"https://acme.slack.com/","team":"Acme","user":"grant","team_id":"T04T4TH8W","user_id":"U123"}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("xoxc-test", "d-cookie")
+	c.apiBaseURL = srv.URL + "/api/"
+	c.api = slack.New("xoxc-test",
+		slack.OptionHTTPClient(c.httpClient),
+		slack.OptionAPIURL(c.apiBaseURL))
+
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if got := c.Envelope().TeamID(); got != "T04T4TH8W" {
+		t.Errorf("Envelope().TeamID() = %q after Connect; want T04T4TH8W", got)
+	}
+}
+
+func TestClient_RequestsCarryEnvelopeParams(t *testing.T) {
+	// End-to-end: a real call through the client's http.Client must
+	// arrive with the envelope on it. This is the test that proves the
+	// wiring, not just that the field exists.
+	var gotQuery url.Values
+	var gotUA, gotSecCHUA string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		gotUA = r.Header.Get("User-Agent")
+		gotSecCHUA = r.Header.Get("Sec-Ch-Ua")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("xoxc-test", "d-cookie")
+	pointClientAtTestServer(t, c, srv)
+	c.Envelope().SetTeamID("T04T4TH8W")
+
+	if _, err := c.postForm(context.Background(), "conversations.mark", url.Values{"channel": {"C123"}}); err != nil {
+		t.Fatalf("postForm: %v", err)
+	}
+
+	for _, k := range []string{"_x_id", "_x_version_ts", "slack_route", "_x_csid", "fp", "_x_num_retries"} {
+		if gotQuery.Get(k) == "" {
+			t.Errorf("request missing envelope param %s (query: %v)", k, gotQuery)
+		}
+	}
+	if gotQuery.Get("slack_route") != "T04T4TH8W" {
+		t.Errorf("slack_route = %q; want T04T4TH8W", gotQuery.Get("slack_route"))
+	}
+	if gotUA == "" || gotSecCHUA == "" {
+		t.Errorf("browser headers missing: UA=%q sec-ch-ua=%q", gotUA, gotSecCHUA)
 	}
 }

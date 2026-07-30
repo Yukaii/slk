@@ -103,13 +103,26 @@ type Client struct {
 	// constructed directly in tests (e.g., &Client{api: mock}); in
 	// that case Connect() leaves the existing api field alone.
 	httpClient *http.Client
+
+	// envelope carries the per-session telemetry identity Slack's web
+	// client puts on every API request (_x_id, _x_csid, slack_route,
+	// _x_version_ts, ...). It is owned by the Client because its
+	// post-boot phase is keyed on the team id Connect discovers, and
+	// because httpClient's BrowserTransport holds the same pointer —
+	// so SetTeamID here changes what every subsequent request emits.
+	//
+	// Nil for clients constructed directly in tests
+	// (e.g. &Client{api: mock}); BrowserTransport treats a nil Env as
+	// "send no envelope params", so those clients still work.
+	envelope *slackhttp.Envelope
 }
 
 // NewClient creates a new Slack client using browser cookie auth.
 // xoxcToken is the xoxc-... token from the browser.
 // dCookie is the value of the 'd' cookie from slack.com.
 func NewClient(xoxcToken, dCookie string) *Client {
-	httpClient := newCookieHTTPClient(dCookie)
+	env := slackhttp.NewEnvelope()
+	httpClient := newCookieHTTPClient(dCookie, env)
 
 	api := slack.New(
 		xoxcToken,
@@ -123,6 +136,7 @@ func NewClient(xoxcToken, dCookie string) *Client {
 		apiBaseURL: defaultAPIBaseURL,
 		wsBaseURL:  defaultWSBaseURL,
 		httpClient: httpClient,
+		envelope:   env,
 	}
 }
 
@@ -148,8 +162,31 @@ func newCookieJar(dCookie string) http.CookieJar {
 // and a BrowserTransport that injects Chrome-like headers on every request
 // to *.slack.com hosts. This keeps Enterprise Grid anomaly detectors from
 // flagging slk's traffic as non-browser. See internal/slackhttp.
-func newCookieHTTPClient(dCookie string) *http.Client {
-	return slackhttp.NewBrowserHTTPClient(newCookieJar(dCookie))
+//
+// env supplies the telemetry envelope (_x_id, _x_csid, slack_route, ...)
+// added to workspace API calls. Pass nil for clients that fetch pages or
+// assets rather than calling /api/ — BrowserTransport scopes the envelope
+// to /api/ paths anyway, but nil states the intent.
+//
+// slackhttp.NewBrowserHTTPClient is deliberately not used here: it builds
+// a BrowserTransport with no Env, which is right for asset clients (see
+// internal/image) and wrong for the API client.
+func newCookieHTTPClient(dCookie string, env *slackhttp.Envelope) *http.Client {
+	return &http.Client{
+		Transport: &slackhttp.BrowserTransport{
+			Inner: http.DefaultTransport,
+			Env:   env,
+		},
+		Jar: newCookieJar(dCookie),
+	}
+}
+
+// Envelope returns the client's Slack telemetry envelope, or nil for a
+// Client constructed directly (tests). Callers use it to read or update
+// session-scoped values such as the build timestamp; the same pointer is
+// held by the HTTP transport, so updates take effect on the next request.
+func (c *Client) Envelope() *slackhttp.Envelope {
+	return c.envelope
 }
 
 // TeamID returns the authenticated workspace's team ID.
@@ -189,6 +226,13 @@ func (c *Client) Connect(ctx context.Context) error {
 		return fmt.Errorf("auth test failed: %w", err)
 	}
 	c.teamID = resp.TeamID
+	// Moves the envelope into its post-boot phase: from here on every
+	// request carries _x_csid and slack_route, as the official client's
+	// do once it knows the workspace. Nil for Clients built directly in
+	// tests, which have no transport to decorate either.
+	if c.envelope != nil {
+		c.envelope.SetTeamID(c.teamID)
+	}
 	c.userID = resp.UserID
 	c.apiBaseURL = deriveAPIBaseURL(resp.URL)
 	c.teamURL = resp.URL
@@ -891,7 +935,7 @@ func (c *Client) GetUnreadCounts() ([]UnreadInfo, ThreadsAggregate, error) {
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	httpClient := newCookieHTTPClient(c.cookie)
+	httpClient := newCookieHTTPClient(c.cookie, c.envelope)
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, ThreadsAggregate{}, fmt.Errorf("fetching unread counts: %w", err)
@@ -1357,7 +1401,7 @@ func (c *Client) postForm(ctx context.Context, method string, form url.Values) (
 
 	httpClient := c.httpClient
 	if httpClient == nil {
-		httpClient = newCookieHTTPClient(c.cookie)
+		httpClient = newCookieHTTPClient(c.cookie, c.envelope)
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -1398,7 +1442,7 @@ func (c *Client) callChannelSectionsList(ctx context.Context, cursor string) ([]
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	httpClient := newCookieHTTPClient(c.cookie)
+	httpClient := newCookieHTTPClient(c.cookie, c.envelope)
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("calling channelSections API: %w", err)
@@ -1453,7 +1497,7 @@ func (c *Client) GetStarredChannels(ctx context.Context) ([]string, error) {
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	httpClient := newCookieHTTPClient(c.cookie)
+	httpClient := newCookieHTTPClient(c.cookie, c.envelope)
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("calling stars.list: %w", err)
