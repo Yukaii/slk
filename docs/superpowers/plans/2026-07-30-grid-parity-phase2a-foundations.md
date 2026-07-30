@@ -15,9 +15,17 @@
 You have **no context** from the sessions that produced this plan. Read these, in order:
 
 1. `docs/superpowers/specs/2026-07-30-enterprise-grid-bootstrap-design.md` — the design. Layer 2 is what this plan implements.
-2. `internal/slack/testdata/phase2-api-contracts.json` — **the evidence base.** Verbatim request params (tokens redacted) and response shapes for all 12 endpoints, plus the ordered boot sequence from two captures. The raw HAR captures are *not* in the repo (live credentials + message content) and are gone. This file is all you get; do not guess at contracts it covers.
-3. `internal/slackhttp/testdata/capture-evidence.json` — aggregate measurements from Phase 1.
-4. `docs/superpowers/plans/2026-07-30-grid-parity-phase1-outcomes.md` — what Phase 1 shipped and its known gaps.
+2. `internal/slack/testdata/phase2-api-contracts.json` — **the committed evidence base.** Verbatim request params (tokens redacted) and response shapes for all 12 endpoints, plus the ordered boot sequence from two captures. Start here; do not guess at contracts it covers.
+
+3. **The raw HAR captures at `/tmp/*.har`** — 8 files, ~270 MB, from the machine that recorded them. These are the ground truth behind every claim in this plan and the spec, and you can query them directly to derive facts the committed fixtures don't cover.
+
+   **They must never be committed.** They contain live `xoxc`/`xoxd` credentials and real message content. Anything you extract must be sanitized (redact `xoxc-…`/`xoxd-…`, summarize response bodies to types/shapes rather than values) before it goes in `testdata/`. `/tmp/opencode/phase2_fixtures.py` is the script that produced the committed contracts file and shows the pattern, including its assert-no-token-leak check.
+
+   Helper scripts, all taking HAR paths as arguments: `/tmp/opencode/har_analyze.py` (request counts by kind/host, concurrency, per-second rate), `har_detail.py` (splits static bundles from data/asset fetches), `har_endpoint.py <har> <url-substring>` (request params, headers, response shape for one endpoint).
+
+   If a claim in this plan disagrees with the captures, **the captures win** — say so and correct the plan.
+4. `internal/slackhttp/testdata/capture-evidence.json` — aggregate measurements from Phase 1.
+5. `docs/superpowers/plans/2026-07-30-grid-parity-phase1-outcomes.md` — what Phase 1 shipped and its known gaps.
 
 ## Why This Is Split From Phase 2b
 
@@ -1370,6 +1378,6 @@ Not in scope here. Recorded so the shape is clear:
 
 **Spec coverage.** Layer 2 of the spec requires: `client.userBoot` (Task 7), `conversations.view` (Task 8), edgeapi conditional revalidation (Task 4), `channels/search` finder (Task 5), `cached_latest_updates` incremental sync (Task 9), version columns (Tasks 1-2), and the `internal/slack/edge` + `internal/slack/boot` module split (Tasks 3-8). The deletions and rewiring are explicitly Phase 2b.
 
-**Known weakness in this plan:** Tasks 6, 7 and 8 specify tests in prose rather than complete code, because their fixtures depend on response shapes that are recorded in `phase2-api-contracts.json` but too large to inline here. The implementer must read that file. This is a deliberate trade-off against a plan long enough to time out — but it does mean those three tasks need more judgement than Tasks 1-5.
+**Known weakness in this plan:** Tasks 6, 7 and 8 specify tests in prose rather than complete code, because their fixtures depend on response shapes too large to inline here. The implementer must read `phase2-api-contracts.json`, and can query `/tmp/*.har` directly for anything it doesn't cover. This is a deliberate trade-off against a plan long enough to time out — but it does mean those three tasks need more judgement than Tasks 1-5.
 
 **Deliberately unresolved:** the `conversations.view` `channel` param (Task 8) is unverified and the plan says so rather than guessing. Task 4's `batched` helper is given with an explicit note that its shape is poor and the implementer should improve it.
