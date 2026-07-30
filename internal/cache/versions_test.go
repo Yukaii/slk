@@ -126,6 +126,46 @@ func TestChannelVersions_ScopedToWorkspace(t *testing.T) {
 	}
 }
 
+// A workspace with no rows must yield an empty map, never a nil one.
+// The distinction is not cosmetic: these maps are marshalled straight
+// into edgeapi's updated_ids / cached_latest_updates, and
+// encoding/json renders a nil map as `null` but an empty map as `{}`.
+// "I hold nothing" and "I am not telling you what I hold" are
+// different assertions to send Slack, and only the second is a lie.
+//
+// Every helper is covered because `var out map[...]` reads identically
+// to `make(map[...])` at every call site inside this package; nothing
+// short of an assertion here distinguishes them.
+func TestVersions_EmptyResultIsNonNilMap(t *testing.T) {
+	db := openVersionsTestDB(t)
+	seedWorkspace(t, db, "T1")
+	seedChannel(t, db, "T1", "C1", "general")
+
+	chans, err := db.ChannelVersions("T-none")
+	if err != nil {
+		t.Fatalf("ChannelVersions: %v", err)
+	}
+	if chans == nil {
+		t.Error("ChannelVersions returned a nil map for a workspace with no channels; want empty, non-nil (nil marshals as JSON null)")
+	}
+
+	users, err := db.UserVersions("T-none")
+	if err != nil {
+		t.Fatalf("UserVersions: %v", err)
+	}
+	if users == nil {
+		t.Error("UserVersions returned a nil map for a workspace with no users; want empty, non-nil (nil marshals as JSON null)")
+	}
+
+	msgs, err := db.MessageVersions("C1", "1700000000.000000", "1700000003.000000")
+	if err != nil {
+		t.Fatalf("MessageVersions: %v", err)
+	}
+	if msgs == nil {
+		t.Error("MessageVersions returned a nil map for a channel with no versioned messages; want empty, non-nil (nil marshals as JSON null)")
+	}
+}
+
 func TestUserVersions_RoundTrip(t *testing.T) {
 	db := openVersionsTestDB(t)
 	seedWorkspace(t, db, "T1")
@@ -211,13 +251,26 @@ func TestMessageVersions_RoundTripAndScope(t *testing.T) {
 // The [oldestTS, latestTS] bounds scope the assertion we send in
 // cached_latest_updates to the window we actually asked about. Claiming
 // versions outside that window is a lie about what the request covers.
+//
+// The interval is CLOSED, matching the doc comment on MessageVersions
+// and conversations.history's own inclusive oldest/latest. The
+// exactly-on-the-boundary cases below are load-bearing: with only
+// strictly-interior fixtures, `ts > ? AND ts < ?` passes, and each
+// history window then silently drops the version of its first and last
+// message.
 func TestMessageVersions_RespectsTSRange(t *testing.T) {
 	db := openVersionsTestDB(t)
+	const (
+		oldestTS = "1700000001.000000"
+		latestTS = "1700000003.000000"
+	)
 	seedWorkspace(t, db, "T1")
 	seedChannel(t, db, "T1", "C1", "general")
 	for _, ts := range []string{
 		"1700000000.000000", // below the window
-		"1700000002.000000", // inside
+		oldestTS,            // exactly on the lower bound: inclusive
+		"1700000002.000000", // strictly inside
+		latestTS,            // exactly on the upper bound: inclusive
 		"1700000009.000000", // above the window
 	} {
 		seedMessage(t, db, "T1", "C1", ts, "m")
@@ -226,12 +279,18 @@ func TestMessageVersions_RespectsTSRange(t *testing.T) {
 		}
 	}
 
-	got, err := db.MessageVersions("C1", "1700000001.000000", "1700000003.000000")
+	got, err := db.MessageVersions("C1", oldestTS, latestTS)
 	if err != nil {
 		t.Fatalf("MessageVersions: %v", err)
 	}
 	if _, ok := got["1700000002.000000"]; !ok {
 		t.Error("MessageVersions dropped a message inside the requested window")
+	}
+	if _, ok := got[oldestTS]; !ok {
+		t.Errorf("MessageVersions dropped the message at exactly oldestTS (%s); the window is closed, not open", oldestTS)
+	}
+	if _, ok := got[latestTS]; !ok {
+		t.Errorf("MessageVersions dropped the message at exactly latestTS (%s); the window is closed, not open", latestTS)
 	}
 	if _, ok := got["1700000000.000000"]; ok {
 		t.Error("MessageVersions included a message older than oldestTS")
@@ -241,23 +300,89 @@ func TestMessageVersions_RespectsTSRange(t *testing.T) {
 	}
 }
 
+// Both channels hold a message at the SAME ts. That collision is the
+// whole point of the fixture and must not be "simplified" away to
+// distinct timestamps: `messages` has the composite primary key
+// (ts, channel_id), so ts alone identifies nothing, and Slack ts values
+// do collide across channels. With distinct ts values a channel-blind
+// query still returns the right rows by accident and the filter goes
+// untested.
+//
+// Only C2's copy is stamped. If MessageVersions dropped its
+// channel_id predicate it would hand C2's version back to a caller
+// asking about C1 — we would then assert in cached_latest_updates that
+// we hold a version of a C1 message we have never seen, and Slack would
+// answer `unchanged_messages`. The symptom is a *missing* message, not
+// a stale one.
 func TestMessageVersions_ScopedToChannel(t *testing.T) {
 	db := openVersionsTestDB(t)
+	const collidingTS = "1700000001.000100"
 	seedWorkspace(t, db, "T1")
 	seedChannel(t, db, "T1", "C1", "here")
 	seedChannel(t, db, "T1", "C2", "elsewhere")
-	seedMessage(t, db, "T1", "C1", "1700000001.000100", "mine")
-	seedMessage(t, db, "T1", "C2", "1700000001.000900", "theirs")
-	if err := db.SetMessageVersion("C2", "1700000001.000900", sampleMessageVersion); err != nil {
+	seedMessage(t, db, "T1", "C1", collidingTS, "mine")
+	seedMessage(t, db, "T1", "C2", collidingTS, "theirs")
+	if err := db.SetMessageVersion("C2", collidingTS, sampleMessageVersion); err != nil {
 		t.Fatalf("SetMessageVersion: %v", err)
+	}
+
+	// Guard against a vacuous pass: prove the stamp landed somewhere,
+	// so "C1 has nothing" is scoping and not a silent write failure.
+	owner, err := db.MessageVersions("C2", "1700000000.000000", "1700000003.000000")
+	if err != nil {
+		t.Fatalf("MessageVersions(C2): %v", err)
+	}
+	if owner[collidingTS] != sampleMessageVersion {
+		t.Fatalf("MessageVersions(C2)[%s] = %q; want %s", collidingTS, owner[collidingTS], sampleMessageVersion)
 	}
 
 	got, err := db.MessageVersions("C1", "1700000000.000000", "1700000003.000000")
 	if err != nil {
-		t.Fatalf("MessageVersions: %v", err)
+		t.Fatalf("MessageVersions(C1): %v", err)
 	}
-	if _, leaked := got["1700000001.000900"]; leaked {
-		t.Error("MessageVersions leaked a message from another channel")
+	if v, leaked := got[collidingTS]; leaked {
+		t.Errorf("MessageVersions(C1)[%s] = %q; want absent — that version belongs to C2's message at the same ts",
+			collidingTS, v)
+	}
+}
+
+// The write side of the same collision. SetMessageVersion takes a
+// channelID and must use it: `UPDATE messages SET version = ? WHERE
+// ts = ?` compiles, passes any fixture with distinct timestamps, and
+// stamps every channel's message that happens to share the ts.
+//
+// Here C1 is stamped and C2 must stay unstamped. A channel-blind
+// UPDATE writes C1's version onto C2's row, and MessageVersions would
+// then vouch for a C2 message we never fetched.
+func TestSetMessageVersion_ScopedToChannel(t *testing.T) {
+	db := openVersionsTestDB(t)
+	const collidingTS = "1700000001.000100"
+	seedWorkspace(t, db, "T1")
+	seedChannel(t, db, "T1", "C1", "here")
+	seedChannel(t, db, "T1", "C2", "elsewhere")
+	seedMessage(t, db, "T1", "C1", collidingTS, "mine")
+	seedMessage(t, db, "T1", "C2", collidingTS, "theirs")
+
+	if err := db.SetMessageVersion("C1", collidingTS, sampleMessageVersion); err != nil {
+		t.Fatalf("SetMessageVersion: %v", err)
+	}
+
+	target, err := db.MessageVersions("C1", "1700000000.000000", "1700000003.000000")
+	if err != nil {
+		t.Fatalf("MessageVersions(C1): %v", err)
+	}
+	if target[collidingTS] != sampleMessageVersion {
+		t.Fatalf("MessageVersions(C1)[%s] = %q; want %s — the stamp did not land",
+			collidingTS, target[collidingTS], sampleMessageVersion)
+	}
+
+	bystander, err := db.MessageVersions("C2", "1700000000.000000", "1700000003.000000")
+	if err != nil {
+		t.Fatalf("MessageVersions(C2): %v", err)
+	}
+	if v, stamped := bystander[collidingTS]; stamped {
+		t.Errorf("MessageVersions(C2)[%s] = %q; want absent — SetMessageVersion(C1, ...) stamped C2's message at the same ts",
+			collidingTS, v)
 	}
 }
 
