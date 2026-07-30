@@ -54,10 +54,16 @@ func New(token, teamID string, httpClient *http.Client) *Client {
 // /cache/<teamID>/<endpoint> and decodes the response into out.
 func (c *Client) call(ctx context.Context, endpoint string, payload map[string]any, out any) error {
 	body := make(map[string]any, len(payload)+1)
-	body["token"] = c.token
 	for k, v := range payload {
 		body[k] = v
 	}
+	// The token is merged last, deliberately. This function is the
+	// single chokepoint for the user's live xoxc credential, so the
+	// client's token must be authoritative: merging it first would let
+	// any caller payload carrying a "token" key silently replace it.
+	// No edgeapi payload uses that key today, so this is defensive —
+	// but the collision is impossible by construction this way.
+	body["token"] = c.token
 
 	encoded, err := json.Marshal(body)
 	if err != nil {
@@ -96,7 +102,13 @@ func (c *Client) call(ctx context.Context, endpoint string, payload map[string]a
 		return fmt.Errorf("edge %s: decoding %s: %w", endpoint, truncate(raw), err)
 	}
 	if !probe.OK {
-		return fmt.Errorf("edge %s: %s", endpoint, probe.Error)
+		apiErr := probe.Error
+		if apiErr == "" {
+			// Without this the message ends in a dangling colon and
+			// carries no diagnostic at all.
+			apiErr = "ok=false with no error field"
+		}
+		return fmt.Errorf("edge %s: %s", endpoint, apiErr)
 	}
 	if out != nil {
 		if err := json.Unmarshal(raw, out); err != nil {

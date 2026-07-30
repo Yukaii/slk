@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -134,6 +135,92 @@ func TestClient_RespectsContextCancellation(t *testing.T) {
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("error = %v; want it to wrap context.Canceled", err)
+	}
+}
+
+// markerTransport records that it was asked to carry a request, then
+// delegates to the real transport.
+type markerTransport struct {
+	used atomic.Bool
+	next http.RoundTripper
+}
+
+func (m *markerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	m.used.Store(true)
+	return m.next.RoundTrip(req)
+}
+
+// TestClient_SendsThroughTheCallerSuppliedHTTPClient is not a tautology
+// — do not delete it as one.
+//
+// Every other test here passes srv.Client() to a plain non-TLS
+// httptest server, where http.DefaultClient behaves identically. So a
+// New that dropped its httpClient argument and used http.DefaultClient
+// would pass the entire rest of this suite. In production that
+// substitution is not invisible at all: the injected client is the one
+// built with slackhttp.BrowserTransport, and it is the *only* thing
+// that puts the browser headers and the edgeapi query envelope on
+// these requests. Losing it means every edgeapi call goes out
+// unbrowser-shaped — exactly the divergence that gets Grid users
+// flagged for scraping. This test pins the injection itself by
+// watching for traffic on a transport only the caller could have
+// supplied.
+func TestClient_SendsThroughTheCallerSuppliedHTTPClient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	marker := &markerTransport{next: srv.Client().Transport}
+	c := New("xoxc-test", "T1", &http.Client{Transport: marker})
+	c.baseURL = srv.URL
+
+	if err := c.call(context.Background(), "users/info", map[string]any{}, nil); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !marker.used.Load() {
+		t.Error("request bypassed the caller-supplied http.Client; " +
+			"edgeapi traffic would carry no browser headers and no query envelope")
+	}
+}
+
+// TestClient_AcceptsNilOutToDiscardTheBody pins the out != nil guard.
+// Endpoints that are called only for their status (membership pokes,
+// counts) pass a nil out; without the guard that is an unmarshal into
+// nil and a spurious error.
+func TestClient_AcceptsNilOutToDiscardTheBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true,"results":[]}`))
+	}))
+	defer srv.Close()
+
+	c := New("xoxc-test", "T1", srv.Client())
+	c.baseURL = srv.URL
+	if err := c.call(context.Background(), "users/info", map[string]any{}, nil); err != nil {
+		t.Fatalf("call with out=nil: %v", err)
+	}
+}
+
+// TestClient_ReportsAPIErrorWithNoErrorField covers ok:false with the
+// error field absent: without a fallback the message is "edge
+// users/info: " — a dangling colon and no diagnostic.
+func TestClient_ReportsAPIErrorWithNoErrorField(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":false}`))
+	}))
+	defer srv.Close()
+
+	c := New("xoxc-test", "T1", srv.Client())
+	c.baseURL = srv.URL
+	err := c.call(context.Background(), "users/info", map[string]any{}, nil)
+	if err == nil {
+		t.Fatal("call returned nil error on ok:false")
+	}
+	if strings.HasSuffix(err.Error(), ": ") || strings.HasSuffix(err.Error(), ":") {
+		t.Errorf("error = %q; want a diagnostic, not a dangling colon", err)
+	}
+	if !strings.Contains(err.Error(), "ok=false") {
+		t.Errorf("error = %q; want it to say the response was ok=false with no error field", err)
 	}
 }
 
