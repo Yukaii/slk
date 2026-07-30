@@ -17,16 +17,18 @@ Both problems trace to what slk *does* on the wire, not how it authenticates.
 
 ## Evidence
 
-Five HAR captures of the official Slack web client on a busy workspace
+Seven HAR captures of the official Slack web client on a busy workspace
 (`rands-leadership.slack.com`, 10k+ users), taken 2026-07-30:
 
 | Capture | Requests | API calls | Assets | Max concurrent |
 |---|---|---|---|---|
-| `initial-load` | 521 | 53 workspace + 24 edgeapi | 337 CDN / 68 MB | 80 |
+| `initial-load` (warm cache) | 521 | 53 workspace + 24 edgeapi | 337 CDN / 68 MB | 80 |
+| `coldboot` (fresh profile) | 746 | 49 workspace + 20 edgeapi | 469 bundles / 60 MB | 55 |
 | `channel-switch` | 84 | 12 | 5 images | 39 |
 | `channel-switch-2` | 146 | 9 | 57 images / 3.8 MB | 43 |
 | `scroll` (1 page) | 246 | 5 | 124 images / 12 MB | 56 |
 | `quickswitch2` (finder) | 62 | 7 + 12 edgeapi | 4 emoji | — |
+| `reconnect` (90 s offline) | 109 | **3** + 12 edgeapi | 24 avatars | — |
 
 Three findings reframe the problem:
 
@@ -36,11 +38,20 @@ Three findings reframe the problem:
    magnitude politer than the real client. *Asset volume is not the detection
    trigger.*
 
-2. **The official client never enumerates.** Zero `conversations.history` at
-   boot, zero `users.list`, zero `conversations.list` across all five
-   captures. It maintains a local cache and revalidates it conditionally.
+2. **The official client never enumerates.** Zero `users.list` and zero
+   `conversations.list` across all seven captures, warm *or* cold. It
+   maintains a local cache and revalidates it conditionally. A cold boot on a
+   fresh browser profile issues 49 API calls — four *fewer* than a warm boot,
+   because cold and warm follow the same path.
 
-3. **slk enumerates on every start.** `users.list` (~50 pages),
+3. **The official client does no HTTP catch-up on reconnect.** After 90
+   seconds fully offline, it issued **zero** recovery calls — no
+   `client.counts`, no history sweep. Missed state arrives over the
+   WebSocket. The only three `conversations.history` calls in the capture are
+   the ordinary channel-open triple for the one channel the user then
+   clicked.
+
+4. **slk enumerates on every start.** `users.list` (~50 pages),
    `conversations.list` (all public channels), then
    `conversations.history` for *every channel ever visited* plus
    `conversations.replies` for every thread found. That is a textbook scraper
@@ -188,6 +199,18 @@ when nothing changed. Identical pattern for `users/info` with
 Steady-state boot: two sub-KB requests replace ~55 paginated enumeration
 calls.
 
+**The cold path is the same path — verified.** On a fresh browser profile
+with no IndexedDB, `client.userBoot` still returns `version_all_channels=false`
+and 55 channels, each carrying an `updated` version stamp. The client seeds
+its cache from that response, then revalidates in batches: one
+`channels/info` with 63 version-stamped IDs, plus small `:0` batches for IDs
+it has never seen (observed: one `users/info` with 14 IDs, all zero). Six
+`channels/info` and four `users/info` calls total, no enumeration anywhere.
+
+This matters because `--add-workspace` is slk's cold path and the operation
+that got testers signed out in #5 and #111. The design does not need a
+separate cold-start strategy.
+
 ### Deletions
 
 - **`triggerBackfill` on first WS connect (`main.go:3712`) is removed.** This
@@ -205,13 +228,37 @@ calls.
 
 ### Reconnect behavior
 
-On a genuine WS reconnect: refresh `client.counts`, refresh the **active
-channel only**, and mark other channels stale for lazy revalidation on next
-open. No 300-channel sweep.
+**Observed:** after 90 seconds fully offline, the official client issued
+**zero** HTTP catch-up calls. No `client.counts`, no history sweep, no cache
+revalidation. It resumes over the WebSocket alone.
 
-*No reconnect capture exists.* This is designed from principle rather than
-observation, and is the weakest-evidence part of this design. It is
-nonetheless strictly less traffic than today's behavior.
+slk currently runs its heaviest fan-out on exactly this path —
+`triggerBackfill` fires from `OnConnect` (`main.go:3712`), so every laptop
+sleep, wifi change, and VPN flap replays the full `BackfillCandidates` sweep.
+That is the scraper signature several times a day, not once at boot.
+
+**Design:** on WS reconnect, refresh `client.counts` (one call) plus the
+**active channel only**, via the normal three-call open path with
+`cached_latest_updates`. Mark all other channels stale for lazy revalidation
+on next open.
+
+This is deliberately *more* than the official client does, because slk cannot
+yet prove it receives the same WebSocket replay. slk's socket URL carries
+`sync_desync=1`, `ms_latest=true`, `flannel=3`, and `lazy_channels=1`
+(`client.go:261`) — substantially the same parameters as the official client
+— which strongly suggests it gets the same missed-event delivery, but that is
+inference, not measurement.
+
+The distinction that matters is **O(1) versus O(channels)**. A fixed two-to-
+four calls does not read as enumeration at any workspace size; a sweep over
+every channel ever visited does. Dropping to the official client's literal
+zero is a follow-up gated on a measurement, not a guess.
+
+**Verification task (cheap, local):** run slk with `SLK_DEBUG=1`, drop the
+network for 90 s, restore it, and check whether messages sent during the
+outage arrive over the socket without any HTTP fetch. If they do, the
+`client.counts` call can be dropped too and slk matches the official client
+exactly.
 
 ### Incremental sync as the core primitive
 
@@ -398,15 +445,19 @@ requests — the regression guard for the layer.
 1. A boot on a busy workspace issues ≤ 10 API calls, with zero
    `users.list`, zero `conversations.list`, and zero per-channel
    `conversations.history` fan-out (verifiable from `SLK_DEBUG=1` logs).
-2. Every slk request carries the full `_x_*` envelope and browser client
+   Cold boot (`--add-workspace`) and warm boot follow the same path and land
+   within a few calls of each other, as the official client does.
+2. A WS reconnect issues a constant number of calls independent of how many
+   channels the user has visited — O(1), not O(channels).
+3. Every slk request carries the full `_x_*` envelope and browser client
    hints, and sends no `Referer`.
-3. Opening a channel fetches assets for approximately one screen, not the
+4. Opening a channel fetches assets for approximately one screen, not the
    whole buffer.
-4. An Enterprise Grid tester completes add-workspace, boot, and channel
+5. An Enterprise Grid tester completes add-workspace, boot, and channel
    switching without a sign-out or security email.
 
-Criterion 4 is the only one that settles the question, and it requires a
-volunteer tester. Criteria 1–3 are verifiable locally and are prerequisites,
+Criterion 5 is the only one that settles the question, and it requires a
+volunteer tester. Criteria 1–4 are verifiable locally and are prerequisites,
 not proof.
 
 ## Risks
