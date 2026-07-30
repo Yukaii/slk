@@ -1316,6 +1316,18 @@ func TestNewClient_HasDefaultAPIBaseURL(t *testing.T) {
 	}
 }
 
+// NewClient must likewise give the Client a wsBaseURL, since StartWebSocket
+// builds its URL from that field alone. The value is pinned literally rather
+// than compared against defaultWSBaseURL: the host is the one the official
+// web client dials, and changing it silently would move slk's event socket
+// off the browser's path.
+func TestNewClient_HasDefaultWSBaseURL(t *testing.T) {
+	c := NewClient("xoxc-test", "d-cookie")
+	if c.wsBaseURL != "wss://wss-primary.slack.com" {
+		t.Errorf("wsBaseURL = %q, want %q", c.wsBaseURL, "wss://wss-primary.slack.com")
+	}
+}
+
 // newTestClient returns a *Client wired to point at the given test server.
 // Internal helpers like markChannel use c.httpClient (set here) and
 // c.apiBaseURL (which defaults to https://slack.com/api/ in production).
@@ -2057,13 +2069,23 @@ func TestNewClient_UsesBrowserTransport(t *testing.T) {
 // The name deliberately says "ChromeUpgrade" rather than "Browser": the
 // WS handshake carries a different, smaller set than the browser headers
 // BrowserTransport puts on ordinary HTTP requests.
+//
+// This drives StartWebSocket end-to-end rather than dialing with
+// wsUpgradeHeaders() directly, so that severing the two — passing nil
+// headers to dialer.Dial, say — fails here instead of silently turning
+// wsUpgradeHeaders into dead code that the rest of the suite still
+// happily exercises.
 func TestStartWebSocket_SendsChromeUpgradeHeaders(t *testing.T) {
 	// Spin up an httptest server that completes the WS upgrade and
-	// captures the upgrade request's headers.
-	var gotHeaders http.Header
+	// reports the upgrade request's headers back over a channel (rather
+	// than a shared var, which the race detector would flag).
+	gotCh := make(chan http.Header, 1)
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
-			gotHeaders = r.Header.Clone()
+			select {
+			case gotCh <- r.Header.Clone():
+			default:
+			}
 			return true
 		},
 	}
@@ -2077,35 +2099,55 @@ func TestStartWebSocket_SendsChromeUpgradeHeaders(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// Drive the dialer directly with the same headers StartWebSocket
-	// builds. We can't easily exercise StartWebSocket end-to-end because
-	// it dials wss-primary.slack.com — but we CAN test the header-merging
-	// helper. To make that helper independently testable, Step 3 extracts
-	// it into wsUpgradeHeaders.
-	headers := wsUpgradeHeaders()
-	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1)
-	dialer := websocket.DefaultDialer
-	conn, _, err := dialer.Dial(wsURL, headers)
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
+	// wsBaseURL is the seam: in production it is defaultWSBaseURL, here
+	// it points at the test server. Everything else about the URL —
+	// every query parameter — is StartWebSocket's own, and is part of
+	// the protocol fingerprint we are impersonating.
+	c := &Client{
+		token:     "xoxc-test",
+		cookie:    "d-cookie",
+		teamID:    "T12345",
+		wsBaseURL: "ws://" + srv.Listener.Addr().String(),
 	}
-	conn.Close()
+	if err := c.StartWebSocket(&mockEventHandler{}); err != nil {
+		t.Fatalf("StartWebSocket: %v", err)
+	}
+	// The server hangs up immediately; wait for the read loop to notice
+	// so the goroutine doesn't outlive the test.
+	defer func() { <-c.WsDone() }()
 
-	if got := gotHeaders.Get("User-Agent"); !strings.HasPrefix(got, "Mozilla/5.0") {
-		t.Errorf("upgrade User-Agent = %q; want Mozilla-prefixed", got)
+	var gotHeaders http.Header
+	select {
+	case gotHeaders = <-gotCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never received an upgrade request")
 	}
-	if got := gotHeaders.Get("Origin"); got != "https://app.slack.com" {
-		t.Errorf("upgrade Origin = %q; want https://app.slack.com", got)
+
+	// The five headers real Chrome sends on a WS upgrade.
+	wantPresent := map[string]string{
+		"User-Agent":      slackhttp.UserAgent(),
+		"Accept-Language": "en-US,en;q=0.9",
+		"Cache-Control":   "no-cache",
+		"Pragma":          "no-cache",
+		"Origin":          "https://app.slack.com",
 	}
-	if got := gotHeaders.Get("Accept-Language"); got == "" {
-		t.Errorf("upgrade missing Accept-Language")
+	for k, want := range wantPresent {
+		if got := gotHeaders.Get(k); got != want {
+			t.Errorf("upgrade header %s = %q; want %q", k, got, want)
+		}
 	}
-	// Real Chrome sends no Sec-Fetch-* header at all on a WS upgrade —
-	// verified against the status-101 upgrades in the 2026-07-30
-	// captures. This assertion used to require Sec-Fetch-Dest:
-	// websocket, which no browser sends; that made slk separable.
-	if got := gotHeaders.Get("Sec-Fetch-Dest"); got != "" {
-		t.Errorf("upgrade Sec-Fetch-Dest = %q; want absent (real Chrome omits it)", got)
+
+	// Real Chrome sends none of these on a WS upgrade — verified against
+	// the status-101 upgrades in the 2026-07-30 captures. An earlier
+	// version of slk sent Sec-Fetch-Dest: websocket on the mistaken
+	// belief that browsers do; that made slk separable.
+	for _, k := range []string{
+		"Accept", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest",
+		"Sec-Ch-Ua", "Sec-Ch-Ua-Mobile", "Sec-Ch-Ua-Platform", "Priority", "Referer",
+	} {
+		if got := gotHeaders.Get(k); got != "" {
+			t.Errorf("upgrade header %s = %q; want absent (real Chrome omits it)", k, got)
+		}
 	}
 }
 

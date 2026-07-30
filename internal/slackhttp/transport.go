@@ -1,9 +1,18 @@
-// Package slackhttp provides a Slack-aware http.RoundTripper that decorates
-// outbound requests with the headers a recent desktop Chrome would send when
-// app.slack.com makes a fetch/XHR/WebSocket call. The goal is to make
-// xoxc-token traffic indistinguishable from official browser-client traffic
-// at the header level, so Enterprise Grid anomaly detectors don't flag slk
-// as a non-browser client and sign the user out.
+// Package slackhttp owns the two distinct header sets a recent desktop
+// Chrome sends to Slack, and the http.RoundTripper that applies one of them.
+//
+//   - BrowserTransport decorates outbound HTTP requests to *.slack.com with
+//     the fetch/XHR set (browserHeaderPairs).
+//   - WebSocketHeaders returns the strictly smaller set Chrome sends on a
+//     WebSocket upgrade, for the gorilla/websocket dialer, which cannot go
+//     through an http.RoundTripper.
+//
+// The two sets are deliberately different — real Chrome omits Accept,
+// Sec-Fetch-*, sec-ch-ua*, and Priority on a WS handshake — so they must not
+// be merged. The goal is to make xoxc-token traffic indistinguishable from
+// official browser-client traffic at the header level, so Enterprise Grid
+// anomaly detectors don't flag slk as a non-browser client and sign the user
+// out.
 //
 // See: docs/superpowers/plans/2026-05-20-browser-like-headers.md and GitHub
 // issue #5 for context.
@@ -59,32 +68,19 @@ func NewBrowserHTTPClient(jar http.CookieJar) *http.Client {
 	}
 }
 
-// BrowserHeaders returns the full set of browser-like headers a Chrome
-// tab sends on an XHR to Slack, as an http.Header value, for callers
-// that can't go through BrowserTransport.
-//
-// This is NOT the WebSocket upgrade set — use WebSocketHeaders() for
-// that. Chrome sends strictly fewer headers on a WS handshake, so
-// reusing this one there produces a header combination no real browser
-// emits.
-func BrowserHeaders() http.Header {
-	h := http.Header{}
-	for k, v := range browserHeaderPairs() {
-		h.Set(k, v)
-	}
-	return h
-}
-
 // WebSocketHeaders returns the headers Chrome sends on a WebSocket
-// upgrade to Slack. This is deliberately a SMALLER set than
-// BrowserHeaders(): Chrome omits Accept, all Sec-Fetch-* headers, all
-// sec-ch-ua* client hints, and Priority on a WS handshake.
+// upgrade to Slack. This is deliberately a SMALLER set than the HTTP
+// set in browserHeaderPairs: Chrome omits Accept, all Sec-Fetch-*
+// headers, all sec-ch-ua* client hints, and Priority on a WS handshake.
 //
 // Verified against the status-101 upgrade requests in the 2026-07-30
 // captures. See docs/superpowers/specs/2026-07-30-enterprise-grid-bootstrap-design.md.
 //
-// gorilla/websocket's Dialer owns Connection, Upgrade, Host, and the
-// Sec-WebSocket-* set, so those are absent here by design.
+// gorilla/websocket's Dialer owns Connection, Upgrade, and the
+// Sec-Websocket-* set — it rejects a caller-supplied duplicate of any of
+// them — so those are absent here by design. Host is NOT in that list:
+// gorilla explicitly honors a caller-supplied Host, so omitting it here
+// is a choice, not a constraint.
 func WebSocketHeaders() http.Header {
 	h := http.Header{}
 	h.Set("User-Agent", UserAgent())
@@ -96,9 +92,8 @@ func WebSocketHeaders() http.Header {
 }
 
 // browserHeaderPairs is the single source of truth for the headers a
-// Chrome tab sends on a same-site XHR to Slack. Both RoundTrip and
-// BrowserHeaders consume it, so slk's two HTTP-header exposures cannot
-// drift apart.
+// Chrome tab sends on a same-site XHR to Slack. RoundTrip is its only
+// consumer.
 //
 // The WebSocket upgrade deliberately does NOT consume this — see
 // WebSocketHeaders. Chrome's WS handshake omits Accept, Sec-Fetch-*,
@@ -107,7 +102,15 @@ func WebSocketHeaders() http.Header {
 //
 // Deliberately contains NO Referer: the official web client sends none
 // on /api/ calls, and slk sending one made it separable. Verified
-// across all seven 2026-07-30 HAR captures. See
+// across all 8 of the 2026-07-30 HAR captures: 279 requests to
+// *.slack.com/api/* and edgeapi.slack.com, zero with a Referer.
+//
+// Caveat for anyone re-deriving that number: Chrome DevTools records an
+// EMPTY `referer:` key on requests it aborted (status 0, e.g. during the
+// deliberate network-outage capture). Those are not Referers. The only
+// two non-empty Referers anywhere in the captures are a webfont pointing
+// at its CSS and an image on slack-imgs.com — static subresources, not
+// API calls. See
 // docs/superpowers/specs/2026-07-30-enterprise-grid-bootstrap-design.md.
 func browserHeaderPairs() map[string]string {
 	return map[string]string{

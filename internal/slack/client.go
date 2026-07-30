@@ -57,6 +57,12 @@ type SlackAPI interface {
 // internal default (slack.APIURL).
 const defaultAPIBaseURL = "https://slack.com/api/"
 
+// defaultWSBaseURL is the scheme+host slk opens its event WebSocket
+// against, matching the official web client. Only the scheme and host
+// live here; StartWebSocket owns the query string, which is part of the
+// protocol fingerprint being impersonated.
+const defaultWSBaseURL = "wss://wss-primary.slack.com"
+
 // Client wraps the slack-go library, providing RTM connectivity
 // and a simplified Web API surface for the service layer.
 // Uses browser cookie auth (xoxc token + d cookie).
@@ -77,6 +83,13 @@ type Client struct {
 	// Discovered from auth.test's URL field on Connect; defaults to
 	// defaultAPIBaseURL until then.
 	apiBaseURL string
+
+	// wsBaseURL is the scheme+host StartWebSocket dials, e.g.
+	// "wss://wss-primary.slack.com". Never ends in "/" — StartWebSocket
+	// appends "/?..." itself. Set to defaultWSBaseURL by NewClient;
+	// overridden by tests so the upgrade handshake can be exercised
+	// against a local server, the same way apiBaseURL is.
+	wsBaseURL string
 
 	// teamURL is the raw workspace URL from auth.test's response
 	// (e.g. "https://truelist-workspace.slack.com/"). Used to derive
@@ -108,6 +121,7 @@ func NewClient(xoxcToken, dCookie string) *Client {
 		token:      xoxcToken,
 		cookie:     dCookie,
 		apiBaseURL: defaultAPIBaseURL,
+		wsBaseURL:  defaultWSBaseURL,
 		httpClient: httpClient,
 	}
 }
@@ -260,7 +274,8 @@ func wsUpgradeHeaders() http.Header {
 // Call this after Connect.
 func (c *Client) StartWebSocket(handler EventHandler) error {
 	wsURL := fmt.Sprintf(
-		"wss://wss-primary.slack.com/?token=%s&sync_desync=1&slack_client=desktop&start_args=%%3Fagent%%3Dclient%%26connect_only%%3Dtrue%%26ms_latest%%3Dtrue&no_query_on_subscribe=1&flannel=3&lazy_channels=1&gateway_server=%s-1&batch_presence_aware=1",
+		"%s/?token=%s&sync_desync=1&slack_client=desktop&start_args=%%3Fagent%%3Dclient%%26connect_only%%3Dtrue%%26ms_latest%%3Dtrue&no_query_on_subscribe=1&flannel=3&lazy_channels=1&gateway_server=%s-1&batch_presence_aware=1",
+		c.wsBaseURL,
 		url.QueryEscape(c.token),
 		c.teamID,
 	)

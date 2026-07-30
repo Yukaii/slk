@@ -173,17 +173,6 @@ func TestBrowserTransport_HandlesNilHeader(t *testing.T) {
 	}
 }
 
-func TestBrowserHeaders_ContainsAllRequiredKeys(t *testing.T) {
-	h := BrowserHeaders()
-	// No Referer: the official web client sends none on /api/ calls, so
-	// neither does the WebSocket upgrade path this feeds.
-	for _, key := range []string{"User-Agent", "Accept", "Accept-Language", "Origin", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest", "Sec-Ch-Ua", "Sec-Ch-Ua-Mobile", "Sec-Ch-Ua-Platform", "Cache-Control", "Pragma", "Priority"} {
-		if h.Get(key) == "" {
-			t.Errorf("BrowserHeaders missing %s", key)
-		}
-	}
-}
-
 func TestUserAgentForGOOS(t *testing.T) {
 	cases := []struct {
 		goos       string
@@ -322,43 +311,47 @@ func TestBrowserTransport_HeaderParity(t *testing.T) {
 	}
 }
 
-func TestBrowserHeadersMatchesRoundTripHeaders(t *testing.T) {
-	// BrowserHeaders() is the exported view of what RoundTrip puts on
-	// HTTP requests; the two must not drift. It does NOT feed the
-	// WebSocket dialer — that path uses WebSocketHeaders(), a
-	// deliberately smaller set, because real Chrome sends fewer headers
-	// on a WS upgrade than on an XHR.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer srv.Close()
-	client, recorder := newCaptureClient(t, srv)
+func TestBrowserHeaderPairsMatchesCapture(t *testing.T) {
+	// Every header a real Chrome 150 sends on a same-site XHR to Slack,
+	// with exact values. Verified against the 2026-07-30 HAR captures;
+	// see docs/superpowers/specs/2026-07-30-enterprise-grid-bootstrap-design.md
+	// ("Verified impersonation values").
+	//
+	// This test is deliberately exact rather than a presence check: a
+	// wrong value (Sec-Fetch-Mode: navigate on an XHR, say) is just as
+	// identifying as a missing header, and an EXTRA header no real
+	// Chrome sends is a stable slk-specific signature.
+	want := map[string]string{
+		"User-Agent":         UserAgent(),
+		"Accept":             "*/*",
+		"Accept-Language":    "en-US,en;q=0.9",
+		"Origin":             "https://app.slack.com",
+		"Sec-Fetch-Site":     "same-site",
+		"Sec-Fetch-Mode":     "cors",
+		"Sec-Fetch-Dest":     "empty",
+		"Sec-Ch-Ua":          ClientHintUA(),
+		"Sec-Ch-Ua-Mobile":   "?0",
+		"Sec-Ch-Ua-Platform": ClientHintPlatform(),
+		"Cache-Control":      "no-cache",
+		"Pragma":             "no-cache",
+		"Priority":           "u=1, i",
+	}
+	got := browserHeaderPairs()
 
-	req, _ := http.NewRequest("GET", srv.URL, nil)
-	req.Host = "slack.com"
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatalf("Do: %v", err)
-	}
-	resp.Body.Close()
-
-	ws := BrowserHeaders()
-	for k := range ws {
-		if got, want := recorder.last.Header.Get(k), ws.Get(k); got != want {
-			t.Errorf("header %s: RoundTrip set %q, BrowserHeaders has %q", k, got, want)
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("browserHeaderPairs()[%q] = %q; want %q", k, got[k], v)
 		}
 	}
-	// And the reverse: nothing RoundTrip sets should be missing from
-	// BrowserHeaders (ignoring headers net/http adds itself).
-	for k := range recorder.last.Header {
-		switch k {
-		case "Accept-Encoding", "Content-Length", "Host", "User-Agent":
-			continue // net/http or checked above
-		}
-		if ws.Get(k) == "" {
-			t.Errorf("RoundTrip sets %s but BrowserHeaders does not", k)
+	for k := range got {
+		if _, ok := want[k]; !ok {
+			t.Errorf("browserHeaderPairs() has unexpected header %q = %q; "+
+				"real Chrome does not send it, so it is an slk-specific signature",
+				k, got[k])
 		}
 	}
-	if ws.Get("User-Agent") != recorder.last.Header.Get("User-Agent") {
-		t.Error("User-Agent differs between RoundTrip and BrowserHeaders")
+	if len(got) != len(want) {
+		t.Errorf("browserHeaderPairs() has %d headers; want exactly %d", len(got), len(want))
 	}
 }
 
