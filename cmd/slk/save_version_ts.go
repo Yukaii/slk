@@ -95,7 +95,7 @@ func saveWorkspaceVersionTS(configPath, tomlKey, teamID, teamName, versionTS str
 			newLines = append(newLines, lines[sectionStart+1:]...)
 			lines = newLines
 		}
-		return os.WriteFile(configPath, []byte(strings.Join(lines, "\n")), 0644)
+		return writeConfigAtomic(configPath, []byte(strings.Join(lines, "\n")))
 	}
 
 	// No existing section — append a legacy-keyed block.
@@ -109,5 +109,5 @@ func saveWorkspaceVersionTS(configPath, tomlKey, teamID, teamName, versionTS str
 	commentLine := "# " + safeName
 	legacyHeader := fmt.Sprintf("[workspaces.%s]", teamID)
 	lines = append(lines, commentLine, legacyHeader, "version_ts = "+tomlString(versionTS))
-	return os.WriteFile(configPath, []byte(strings.Join(lines, "\n")), 0644)
+	return writeConfigAtomic(configPath, []byte(strings.Join(lines, "\n")))
 }

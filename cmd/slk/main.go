@@ -1878,6 +1878,14 @@ func slugifyHandle(name string) string {
 	return b.String()
 }
 
+// shouldReloadTimeout bounds the background _x_version_ts refresh.
+// Matches slackclient.MintToken's 15s — the only other bounded Slack
+// HTTP call in slk — rather than inventing a second number for the
+// same job. Nothing waits on this refresh, so a generous bound costs
+// nothing, while a tight one would turn a merely slow proxy into a
+// lost refresh and a stale build timestamp.
+const shouldReloadTimeout = 15 * time.Second
+
 func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB, cfg config.Config, avatarCache *avatar.Cache, p *tea.Program, configPath string) (*WorkspaceContext, error) {
 	client := slackclient.NewClient(token.AccessToken, token.Cookie)
 
@@ -1893,7 +1901,16 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 	// Refresh the build timestamp in the background. Failure is
 	// non-fatal: the seeded or compiled-in value stays in use.
 	go func() {
-		ts, err := client.ShouldReload(ctx)
+		// The API client sets no http.Client.Timeout, and
+		// http.DefaultTransport bounds only the dial and the TLS
+		// handshake — not the response headers or body. A server that
+		// accepts the connection and then never answers (captive
+		// portal, wedged corporate proxy — see #111) would otherwise
+		// pin this goroutine and its connection for the whole life of
+		// the process, because ctx here is the app root context.
+		rctx, cancel := context.WithTimeout(ctx, shouldReloadTimeout)
+		defer cancel()
+		ts, err := client.ShouldReload(rctx)
 		if err != nil {
 			debuglog.General("shouldReload: %v", err)
 			return
