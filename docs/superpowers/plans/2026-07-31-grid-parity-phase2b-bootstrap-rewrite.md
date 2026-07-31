@@ -1409,7 +1409,21 @@ Behaviour, in order:
 1. Build `channelIDs` from `out.Channels` + `out.IMs`. Look up `deps.Store.ChannelVersions(deps.WorkspaceID)`; for each id use the cached version, or `0` when absent.
 2. Call `deps.Revalidate.ChannelsInfo`. On error, log and return — do not abort the boot.
 3. For each returned channel, `deps.Store.UpdateChannelFromEdge(...)` (Task 2), which preserves `is_member`/`is_starred`.
-4. `deps.Store.ApplyMembership(deps.WorkspaceID, channelIDs, res.MemberChannels)` — **`channelIDs`, the queried set**, not the returned members.
+4. Apply membership. **The `Store` interface must take `cache.MembershipSnapshot`, not a `[]string`** — that type exists precisely because `encoding/json` cannot distinguish an absent `member_channels` from a literal `[]`, and those are opposite answers (absent = no information, preserve; empty = everyone queried is a non-member, clear). Putting a bare slice in the interface would push a heuristic into the adapter, which is exactly where the bug would live.
+
+   Use `edge`'s `MembershipQueried` — the ids sent in batches whose response actually carried `member_channels` — as the queried set. That removes the guesswork entirely:
+
+   ```go
+   if len(res.MembershipQueried) > 0 {
+       err := deps.Store.ApplyMembership(deps.WorkspaceID, res.MembershipQueried,
+           cache.MembershipReported(res.MemberChannels, res.FailedIDs))
+       // ...
+   }
+   ```
+
+   When no batch reported, make no call at all. Note `res.FailedIDs` accumulates across *all* batches while `MembershipQueried` covers only reporting ones; that is harmless, since `ApplyMembership` touches nothing outside the queried set.
+
+   Do **not** pass `res.MemberChannels` as the queried set — that silently clears membership for everything not returned.
 5. Log `res.FailedIDs` and skip them. Do not advance their versions.
 6. Build `userIDs` from `out.Users` plus `out.IMs[].UserID` (the field is `UserID`, tagged `json:"user"` — not `User`). Same version lookup via `UserVersions`.
 7. Call `UsersInfo`, then `UpdateUserFromEdge` per result.
