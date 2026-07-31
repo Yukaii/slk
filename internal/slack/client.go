@@ -1801,3 +1801,307 @@ func (c *Client) callListThreadSubscriptions(ctx context.Context, currentTS stri
 	}
 	return c.postForm(ctx, "subscriptions.thread.getView", form)
 }
+
+// historyMethod is the API method name. It is also the key slackhttp
+// looks up in its _x_reason and _x_mode tables, and
+// conversations.history is in NEITHER exclusion set — unlike
+// client.userBoot and conversations.view, this endpoint carries both
+// flags, on 14 of 14 captured requests.
+const historyMethod = "conversations.history"
+
+// historyReason is the _x_reason the official client sends on 11 of the
+// 14 captured conversations.history requests. The other 3 carry
+// "unread-counts/onLastReadUpdated", which reason.go documents as a
+// caller-supplied override rather than a second table entry — hence the
+// conditional in HistoryWithVersions.
+const historyReason = "message-pane/requestHistory"
+
+// defaultHistoryLimit is the page size the official web client asks
+// for: 28, on 14 of 14 captured conversations.history requests. Not 50,
+// not 200, not 500 — the three sizes slk's existing history paths use.
+//
+// It is 28 because that is what was measured, not because 28 is a good
+// number, and it must not be "tuned".
+const defaultHistoryLimit = 28
+
+// emptyCachedLatestUpdates is what cached_latest_updates carries when
+// the caller holds no cached messages: the literal two-character JSON
+// object, on 11 of the 14 captured requests. The key is never omitted —
+// omitting it is a request shape the official client emits zero times.
+//
+// A constant rather than json.Marshal of an empty map, because
+// json.Marshal of a nil map[string]string produces "null", not "{}",
+// and "null" is a third shape no capture shows.
+const emptyCachedLatestUpdates = "{}"
+
+// HistoryOpts are the caller-varying parameters of HistoryWithVersions.
+// Everything not here is fixed by the captures and is not configurable.
+type HistoryOpts struct {
+	// Limit is the page size. Non-positive means defaultHistoryLimit
+	// (28), the only value the official client was ever observed
+	// sending.
+	//
+	// A non-zero Limit is sent VERBATIM. It is deliberately not
+	// clamped to 28, and the reason is not timidity about changing
+	// caller-visible behaviour:
+	//
+	//  1. Clamping lies about data. A caller that asks for 200 and
+	//     silently receives 28 concludes the channel holds 28
+	//     messages. That misinformation propagates into caches,
+	//     watermarks and the UI, and nothing anywhere can detect it.
+	//     A fingerprint divergence, by contrast, is visible in the
+	//     source: somebody typed 200 at a call site, and a reviewer
+	//     can see it.
+	//
+	//  2. Clamping does not even remove the fingerprint. A caller that
+	//     needs 200 messages and gets 28 will loop eight times. That
+	//     turns one anomalous request into a burst of eight
+	//     well-shaped ones — and burst request volume is precisely
+	//     what Enterprise Grid's anomaly detection scores. Clamping
+	//     would trade the fingerprint this phase is removing for the
+	//     one it is removing harder.
+	//
+	// The fingerprint concern is answered by the default instead:
+	// every caller that does not think about page size gets 28.
+	//
+	// This mirrors edge.UsersList, which documents its count rather
+	// than bounding it, on the grounds that a silent truncation lies
+	// to the caller. The counter-argument is real here in a way it was
+	// not there — 28 is 14/14, whereas UsersList's captures disagreed
+	// 30/30/30/20 — but "the observed value is unanimous" argues for a
+	// firm default, which this has, not for overriding an explicit
+	// caller.
+	//
+	// The asymmetry with the non-positive case is the same one
+	// edge.UsersList draws: `limit=0` or `limit=-5` is a knowably
+	// wrong SHAPE that no capture shows and the server can only
+	// reject, whereas an unusually large page is a judgement about
+	// volume with no observed threshold behind it. Correcting the
+	// first is enforcing the captures; bounding the second would be
+	// enforcing a number invented here.
+	Limit int
+
+	// Latest and Oldest are the window anchors. Exactly one, or
+	// neither, in every capture: oldest on 5 requests, latest on 4,
+	// neither on 5, both on 0. Each is omitted entirely when empty —
+	// `latest=` on the wire is a shape no capture shows.
+	//
+	// Setting both is not rejected, because the server's behaviour
+	// with both is unmeasured and erroring would be enforcing a rule
+	// invented here rather than one read off the captures. It is
+	// nonetheless a shape the official client never emits; don't.
+	Latest string
+	Oldest string
+
+	// CachedVersions is the {ts: version} map for the messages the
+	// caller already holds — the whole point of this method. The
+	// server answers with unchanged_messages, confirming which of them
+	// are still current, plus the bodies of only those that actually
+	// changed. It is what makes validating cached scrollback cheap
+	// instead of a full re-download of every channel on every boot and
+	// every reconnect.
+	//
+	// Nil and empty both serialise to "{}", which is what the client
+	// sends when it holds nothing. The map is not retained or
+	// mutated.
+	CachedVersions map[string]string
+
+	// IncludeDateJoined is a genuine caller parameter, not a constant:
+	// true on 8 of 14 captured requests and false on 6. It is sent
+	// either way — the key is present on 14 of 14, carrying the
+	// literal string "false" when off, never omitted. The response's
+	// `date_joined` object appears on exactly the 8 requests that set
+	// it, and is not modelled here because nothing in slk consumes it.
+	IncludeDateJoined bool
+}
+
+// HistoryResult is the subset of the conversations.history response
+// this method models.
+//
+// Four of the eight keys present on 14 of 14 responses. pin_count,
+// channel_actions_ts and channel_actions_count are unmodelled because
+// nothing in slk consumes them; response_metadata is unmodelled because
+// following its next_cursor in a loop is the enumeration this phase
+// exists to stop, and a cursor sitting in the return values is an
+// invitation to write that loop. Adding any of them later is a two-line
+// change; inventing a consumer for them now is not.
+type HistoryResult struct {
+	// Messages are the message bodies the server actually sent. With a
+	// populated CachedVersions this is only what CHANGED — in the
+	// scroll capture, one cached ts came back in UnchangedTS and 27
+	// bodies arrived here.
+	Messages []slack.Message
+
+	// UnchangedTS lists the timestamps from the request's
+	// cached_latest_updates that the server confirms the caller still
+	// holds correctly. These are ts strings only; the caller already
+	// has the bodies. This is the response's `unchanged_messages`.
+	UnchangedTS []string
+
+	// LatestUpdates is {ts: version} for the returned messages — the
+	// values to feed back as CachedVersions on the next call. Versions
+	// are opaque 17-character ts-like strings; they are NOT
+	// timestamps to be parsed or compared, only echoed.
+	LatestUpdates map[string]string
+
+	// HasMore reports whether the window the caller asked for was
+	// truncated by Limit.
+	HasMore bool
+}
+
+// historyWithVersionsResponse is the wire shape. Separate from
+// HistoryResult so `ok` and `error` do not leak into the caller's type.
+type historyWithVersionsResponse struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error"`
+
+	Messages      []slack.Message   `json:"messages"`
+	UnchangedTS   []string          `json:"unchanged_messages"`
+	LatestUpdates map[string]string `json:"latest_updates"`
+	HasMore       bool              `json:"has_more"`
+}
+
+// HistoryWithVersions fetches channel history using Slack's incremental
+// sync primitive: the caller sends {ts: version} for the messages it
+// already holds, and the server replies with unchanged_messages — the
+// subset it confirms are still current — plus only the bodies that
+// actually changed.
+//
+// This is the fix for one of the three enumerations that get slk's
+// Enterprise Grid accounts signed out for "data scraping". slk re-downloads
+// conversations.history for every channel ever visited on every boot AND
+// every reconnect, at page sizes of 50/200/500. With cached_latest_updates
+// the same scrollback is VALIDATED rather than refetched, and at the page
+// size the official client actually uses.
+//
+// This is additive. GetHistory, GetHistoryAround and GetHistorySince are
+// untouched and still route through slack-go; nothing calls this yet.
+// Phase 2b wires it.
+//
+// # Request shape
+//
+// Measured across all 14 conversations.history requests in the 8
+// captures. Eleven business params on 14 of 14, plus `token` (injected
+// by postForm) and the four _x_ envelope params (added by
+// slackhttp.BrowserTransport — conversations.history is in neither of
+// its exclusion sets), plus at most one of latest/oldest.
+//
+// # _x_reason
+//
+// slackhttp's defaultReasons table ALREADY maps conversations.history
+// to historyReason, so the WithReason call below is, TODAY, byte-for-byte
+// redundant on the wire. That is measured, not assumed: deleting the
+// whole block is a surviving mutant against this file's full test suite,
+// because defaultReason("conversations.history") then supplies the same
+// string. It is kept as an explicit pin at the call site so the value
+// this endpoint sends does not depend on a shared table it does not own,
+// and so a method rename cannot silently drop it to slackhttp's
+// genericReason fallback. Mutating historyReason itself IS caught.
+//
+// It is conditional rather than unconditional because the unconditional
+// form would be actively wrong: 3 of the 14 captured requests carry
+// "unread-counts/onLastReadUpdated" instead, and reason.go deliberately
+// leaves that variant to a caller override. Clobbering a reason the
+// caller already set would make the second variant unreachable — that
+// mutation is caught.
+//
+// TRAP FOR PHASE 2b: the conditional cuts the other way too. A ctx that
+// already carries some OTHER endpoint's reason — say one built for
+// client.userBoot under WithReason(ctx, "initial-data") and then reused
+// here — reaches the wire unchanged, and "initial-data" on
+// conversations.history is a shape no capture shows. Derive the ctx for
+// this call from a reason-free one, or set the reason you mean.
+//
+// # Errors
+//
+// Any error returns a zero HistoryResult. That is load-bearing rather
+// than tidiness: encoding/json populates a struct as it goes and keeps
+// decoding past the first type error, and `ok` is only inspected after
+// the whole body is decoded — so at both failure points a populated
+// response struct is sitting in a local. Handing it back would give the
+// caller plausible-looking scrollback built from a response the server
+// rejected or the decoder could not read.
+func (c *Client) HistoryWithVersions(ctx context.Context, channelID string, opts HistoryOpts) (HistoryResult, error) {
+	if channelID == "" {
+		// `channel=` on the wire is a request shape none of the 14
+		// captures show, and the server can only reject it or answer
+		// uselessly.
+		return HistoryResult{}, fmt.Errorf("%s: channelID is required", historyMethod)
+	}
+
+	limit := opts.Limit
+	if limit <= 0 {
+		// Non-positive is not a page size, it is caller error:
+		// `limit=0` and `limit=-5` are wire shapes none of the 14
+		// captures show, and the server can only reject them or answer
+		// uselessly. Correcting a knowably-wrong shape is different
+		// from clamping a large well-formed one, which this
+		// deliberately does not do — see HistoryOpts.Limit.
+		limit = defaultHistoryLimit
+	}
+
+	cached := emptyCachedLatestUpdates
+	if len(opts.CachedVersions) > 0 {
+		b, err := json.Marshal(opts.CachedVersions)
+		if err != nil {
+			// Unreachable for map[string]string, but returning the
+			// empty object here would silently degrade an incremental
+			// sync into a full refetch.
+			return HistoryResult{}, fmt.Errorf("%s: encoding cached_latest_updates: %w", historyMethod, err)
+		}
+		cached = string(b)
+	}
+
+	// Strings, not booleans: this is a form body. Every value here was
+	// read off the captures.
+	form := url.Values{
+		"channel":                          {channelID},
+		"limit":                            {strconv.Itoa(limit)},
+		"ignore_replies":                   {"true"},
+		"include_pin_count":                {"true"},
+		"inclusive":                        {"true"},
+		"no_user_profile":                  {"true"},
+		"include_stories":                  {"true"},
+		"include_free_team_extra_messages": {"true"},
+		"include_date_joined":              {strconv.FormatBool(opts.IncludeDateJoined)},
+		"cached_latest_updates":            {cached},
+	}
+	// Set, not unconditional assignment: an unset anchor must leave
+	// the key absent, not present-and-empty.
+	if opts.Oldest != "" {
+		form.Set("oldest", opts.Oldest)
+	}
+	if opts.Latest != "" {
+		form.Set("latest", opts.Latest)
+	}
+
+	if slackhttp.ReasonFrom(ctx) == "" {
+		ctx = slackhttp.WithReason(ctx, historyReason)
+	}
+
+	raw, err := c.postForm(ctx, historyMethod, form)
+	if err != nil {
+		return HistoryResult{}, fmt.Errorf("%s: %w", historyMethod, err)
+	}
+
+	var resp historyWithVersionsResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return HistoryResult{}, fmt.Errorf("%s: parsing response: %w (body: %s)",
+			historyMethod, err, truncateForLog(raw))
+	}
+	if !resp.OK {
+		apiErr := resp.Error
+		if apiErr == "" {
+			// Without this the message names no failure at all.
+			apiErr = "ok=false with no error field"
+		}
+		return HistoryResult{}, fmt.Errorf("%s: API error: %s", historyMethod, apiErr)
+	}
+
+	return HistoryResult{
+		Messages:      resp.Messages,
+		UnchangedTS:   resp.UnchangedTS,
+		LatestUpdates: resp.LatestUpdates,
+		HasMore:       resp.HasMore,
+	}, nil
+}
