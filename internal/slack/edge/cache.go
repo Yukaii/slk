@@ -79,12 +79,42 @@ type Channel struct {
 
 // User is one entry in a users/info response.
 //
-// Also a deliberate subset. Note what is absent: the observed profile
-// object in this response carries avatar_hash, not image_32 — there is
-// no image URL anywhere in a users/info profile, so a field for one
-// would decode empty forever and quietly hand callers a blank avatar.
-// If Phase 2b needs avatars it should add AvatarHash and derive the
-// URL, with a capture to back it.
+// Also a deliberate subset, and the avatar fields are the part worth
+// stating precisely, because an earlier version of this comment got
+// them wrong. Measured across all 291 users/info result objects in the
+// 8 captures:
+//
+//	profile.avatar_hash      288/291
+//	profile.image_original   255/291   (non-empty in all 255)
+//	profile.is_custom_image  255/291
+//	profile.image_32           0/291
+//	profile.image_72           0/291
+//	profile.image_192          0/291
+//
+// So the sized image_NN variants really are absent, and a field for
+// one would decode empty forever and quietly hand callers a blank
+// avatar. That much of the original reasoning stands.
+//
+// The rest of it did not: this comment used to claim there is no image
+// URL anywhere in a users/info profile. There is. image_original is an
+// absolute URL and it is present on 88% of results. users/search
+// carries the same key at the same rate (42/60) — the two endpoints
+// AGREE, and an earlier note on UsersSearch claiming they disagree was
+// wrong for the same reason.
+//
+// The claim came from the committed fixture rather than the captures.
+// internal/slack/testdata/phase2-api-contracts.json keeps samples[:3];
+// two of the three users/info samples were `results: []`, and the one
+// remaining sample's results[0] happened to be a user with no custom
+// image. One user was generalised into a contract. A per-field claim
+// about an array element needs a denominator.
+//
+// ImageOriginal is therefore omitted here because NOTHING CONSUMES IT
+// YET, not because it is unavailable. Adding it is a one-line change —
+//
+//	ImageOriginal string `json:"image_original"`
+//
+// — inside Profile, and the evidence for it is already in hand.
 type User struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`

@@ -28,10 +28,23 @@ import (
 // Every unmodelled *string* neighbour is set to a "WRONG-…" value on
 // purpose. A modelled field mis-tagged onto one of them then decodes a
 // visibly wrong answer instead of a plausible one, and the assertion
-// dies. Unmodelled *booleans* are all-false (or, for is_member,
-// all-true) for the same reason: neither an all-false nor an all-true
-// column matches any modelled field's column, so a mis-tag onto one is
-// always caught.
+// dies. Unmodelled *booleans* are all-false for the same reason: an
+// all-false column matches no modelled field's column, so a mis-tag
+// onto one is always caught.
+//
+// The channels[] entries carry the unread state measured on the real
+// ones, and carry it UNEVENLY on purpose: last_read, latest,
+// unread_count and unread_count_display appear on rows 1 and 4 only,
+// because across the 54 observed entries they appear on 14. A fixture
+// that put them on every row would pin a contract the captures do not
+// support, which is the exact failure this file exists to avoid.
+//
+// `latest` on a channels[] entry is an OBJECT — a whole message — and
+// not the ts string the top-level `channel` object carries under the
+// same key. That is measured (14/14 object on entries, 2/2 string on
+// the `channel` object) and it is the reason ViewChannelEntry is a
+// separate type from ViewChannel rather than a reuse of it: a
+// `Latest string` field would fail the entire response decode.
 //
 // One shape here is an honest guess and is marked as such: `bots` was
 // `[]` in BOTH captures, so its element shape is unverified. This
@@ -173,7 +186,11 @@ const fullViewBody = `{
       "topic": {"value": "company announcements", "creator": "U0VIEWAA1", "last_set": 1670000101},
       "purpose": {"value": "all hands", "creator": "U0VIEWBB2", "last_set": 1670000102},
       "properties": {"tabs": [], "canvas": {"file_id": "F0AAA"}},
-      "previous_names": ["genral"]
+      "previous_names": ["genral"],
+      "last_read": "1783337511.000111",
+      "latest": {"type": "message", "user": "U0VIEWAA1", "ts": "1783337512.000112", "text": "latest in general"},
+      "unread_count": 41,
+      "unread_count_display": 17
     },
     {
       "id": "C0VIEW0002", "name": "secret-plans", "name_normalized": "secret-plans-norm",
@@ -181,7 +198,7 @@ const fullViewBody = `{
       "is_private": true, "created": 1670000002, "updated": 1783337533020,
       "is_archived": true, "is_general": false, "unlinked": 0,
       "is_shared": true, "is_org_shared": true, "is_pending_ext_shared": false,
-      "is_ext_shared": false, "is_member": true,
+      "is_ext_shared": false, "is_member": false,
       "pending_shared": [], "parent_conversation": null,
       "context_team_id": "T7777777Z", "creator": "U0VIEWCC3",
       "shared_team_ids": ["T04T4TH8W", "T7777777Z"], "pending_connected_team_ids": [],
@@ -209,13 +226,17 @@ const fullViewBody = `{
       "is_private": true, "created": 1670000004, "updated": 1783337533022,
       "is_archived": false, "is_general": false, "unlinked": 0,
       "is_shared": true, "is_org_shared": false, "is_pending_ext_shared": false,
-      "is_ext_shared": true, "is_member": true,
+      "is_ext_shared": true, "is_member": false,
       "pending_shared": [], "parent_conversation": null,
       "context_team_id": "T04T4TH8W", "creator": "U0VIEWEE5",
       "shared_team_ids": ["T04T4TH8W", "E11EXTERN"], "pending_connected_team_ids": [],
       "topic": {"value": "partner integration", "creator": "U0VIEWEE5", "last_set": 1670000106},
       "purpose": {"value": "cross-org work", "creator": "U0VIEWEE5", "last_set": 1670000107},
-      "properties": {}, "previous_names": []
+      "properties": {}, "previous_names": [],
+      "last_read": "1783337544.000444",
+      "latest": {"type": "message", "user": "U0VIEWEE5", "ts": "1783337545.000445", "text": "latest in partner-sync"},
+      "unread_count": 6,
+      "unread_count_display": 3
     }
   ],
   "emojis": {
@@ -669,8 +690,11 @@ func TestConversationsView_DecodesUsers(t *testing.T) {
 
 // ------------------------------------------------------------ channels
 
-// TestConversationsView_DecodesChannels pins the referenced-channel
-// array, which reuses boot.Channel.
+// TestConversationsView_DecodesChannels pins the part of the
+// referenced-channel array that comes from the embedded boot.Channel —
+// the fields shared with userBoot's channels[]. The five view-only
+// fields are pinned separately by
+// TestConversationsView_ChannelsCarryUnreadState.
 //
 // Every boolean has a unique non-zero column vector across these four
 // rows, which is the property that makes these assertions worth
@@ -679,10 +703,16 @@ func TestConversationsView_DecodesUsers(t *testing.T) {
 //	is_channel 1001   is_group 0100   is_mpim 0010
 //	is_private 0111   is_archived 0110   is_general 1000
 //	is_shared 1101   is_org_shared 1100   is_ext_shared 0001
+//	is_member  1010
 //
-// The unmodelled channel booleans are decoys with columns no modelled
-// field has: is_im and is_pending_ext_shared are all-false, is_member
-// is all-true. A modelled field mis-tagged onto any of them dies.
+// is_member is in that list rather than the decoy list below because
+// it is now modelled: it appears on 54 of 54 observed entries, and
+// giving it column 1010 — unused by any other boolean here — is what
+// stops it being swappable with one of them.
+//
+// The unmodelled channel booleans are decoys with a column no modelled
+// field has: is_im and is_pending_ext_shared are all-false. A modelled
+// field mis-tagged onto either dies.
 func TestConversationsView_DecodesChannels(t *testing.T) {
 	res, _ := mustView(t, fullViewBody, "C0OPENED99")
 
@@ -737,9 +767,142 @@ func TestConversationsView_DecodesChannels(t *testing.T) {
 		},
 	}
 	for i, w := range want {
-		if got := res.Channels[i]; !reflect.DeepEqual(got, w) {
-			t.Errorf("Channels[%d] =\n  %#v\nwant\n  %#v", i, got, w)
+		if got := res.Channels[i].Channel; !reflect.DeepEqual(got, w) {
+			t.Errorf("Channels[%d].Channel =\n  %#v\nwant\n  %#v", i, got, w)
 		}
+	}
+}
+
+// TestConversationsView_ChannelsCarryUnreadState pins the five keys a
+// conversations.view channels[] entry carries and a userBoot one does
+// not.
+//
+// This is the correction of a measured claim, not a new feature. An
+// earlier version of this package decoded channels[] into boot.Channel
+// and dropped all five, on the stated grounds that the four
+// non-boolean ones "would decode to zero on every row forever". That
+// was read off a single committed sample. Measured across all 54
+// entries in the two captures:
+//
+//	is_member             54/54
+//	last_read             14/54
+//	latest                14/54
+//	unread_count          14/54
+//	unread_count_display  14/54
+//
+// So the four do appear, on 26% of entries, and dropping them meant
+// Phase 2b would issue a separate unread-counts call for numbers it
+// had already been handed in the same response.
+//
+// The two count fields carry DISTINCT values on both rows that have
+// them (41/17 and 6/3). Same-typed adjacent fields sharing a value are
+// freely swappable and no assertion can tell them apart; this project
+// has already lost mutants to exactly that.
+func TestConversationsView_ChannelsCarryUnreadState(t *testing.T) {
+	res, _ := mustView(t, fullViewBody, "C0OPENED99")
+
+	if len(res.Channels) != 4 {
+		t.Fatalf("len(Channels) = %d; want 4", len(res.Channels))
+	}
+
+	// is_member is on every observed entry, so every row asserts it.
+	// The column is 1010 — see TestConversationsView_DecodesChannels.
+	for i, want := range []bool{true, false, true, false} {
+		if got := res.Channels[i].IsMember; got != want {
+			t.Errorf("Channels[%d].IsMember = %v; want %v (column 1010 across the four rows)", i, got, want)
+		}
+	}
+
+	// The unread quartet, on the two rows that carry it.
+	unread := map[int]struct {
+		lastRead string
+		count    int
+		display  int
+	}{
+		0: {lastRead: "1783337511.000111", count: 41, display: 17},
+		3: {lastRead: "1783337544.000444", count: 6, display: 3},
+	}
+	for i, w := range unread {
+		c := res.Channels[i]
+		if c.LastRead != w.lastRead {
+			t.Errorf("Channels[%d].LastRead = %q; want %q (a ts STRING, not an int)", i, c.LastRead, w.lastRead)
+		}
+		if c.UnreadCount != w.count {
+			t.Errorf("Channels[%d].UnreadCount = %d; want %d", i, c.UnreadCount, w.count)
+		}
+		if c.UnreadCountDisplay != w.display {
+			t.Errorf("Channels[%d].UnreadCountDisplay = %d; want %d", i, c.UnreadCountDisplay, w.display)
+		}
+		if c.UnreadCount == c.UnreadCountDisplay {
+			t.Errorf("Channels[%d] has unread_count == unread_count_display (%d); the fixture must keep them distinct or a swapped tag survives", i, c.UnreadCount)
+		}
+	}
+
+	// A row that never mentioned the keys must stay zero — and must be
+	// distinguishable from one that carried a real zero. Latest is the
+	// field that can say so: nil means the key was absent.
+	for _, i := range []int{1, 2} {
+		c := res.Channels[i]
+		if c.LastRead != "" || c.UnreadCount != 0 || c.UnreadCountDisplay != 0 || c.Latest != nil {
+			t.Errorf("Channels[%d] carries unread state it was never sent: LastRead=%q UnreadCount=%d UnreadCountDisplay=%d Latest=%s",
+				i, c.LastRead, c.UnreadCount, c.UnreadCountDisplay, c.Latest)
+		}
+	}
+}
+
+// TestConversationsView_ChannelsLatestIsAMessageNotATS pins the one
+// key whose TYPE differs between the two places conversations.view
+// uses it.
+//
+// On the top-level `channel` object, `latest` is a ts string (2/2
+// captures). On a channels[] entry it is a whole message OBJECT (14/14
+// entries that carry it). Those are not the same contract, and the
+// difference is load-bearing: `Latest string` on the entry type fails
+// the entire response decode, losing the channel open. That is why
+// ViewChannelEntry is a sibling of ViewChannel rather than the same
+// type used twice.
+//
+// json.RawMessage, matching History.Messages, for the reason stated
+// there: nothing consumes these yet, a second message struct would be
+// a shape to keep in agreement forever, and raw bytes claim nothing.
+func TestConversationsView_ChannelsLatestIsAMessageNotATS(t *testing.T) {
+	res, _ := mustView(t, fullViewBody, "C0OPENED99")
+
+	// The entry's latest is an object and its bytes survive whole.
+	var m struct {
+		Type string `json:"type"`
+		TS   string `json:"ts"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(res.Channels[0].Latest, &m); err != nil {
+		t.Fatalf("Channels[0].Latest is not a JSON object: %v (%s)", err, res.Channels[0].Latest)
+	}
+	if m.TS != "1783337512.000112" || m.Text != "latest in general" || m.Type != "message" {
+		t.Errorf("Channels[0].Latest = %s; want the message with ts 1783337512.000112 intact", res.Channels[0].Latest)
+	}
+	// Not the channel's own ts, and not the other row's message.
+	if strings.Contains(string(res.Channels[0].Latest), "partner-sync") {
+		t.Errorf("Channels[0].Latest = %s; rows are crossed", res.Channels[0].Latest)
+	}
+	if got := string(res.Channels[3].Latest); !strings.Contains(got, "1783337545.000445") {
+		t.Errorf("Channels[3].Latest = %s; want the partner-sync message", got)
+	}
+
+	// The top-level `channel` object's latest is a plain string, and
+	// keeping it typed is what makes the divergence visible.
+	if res.Channel.Latest != "17833375555555555" {
+		t.Errorf("Channel.Latest = %q; want the ts string — the `channel` object and a channels[] entry disagree about this key's type",
+			res.Channel.Latest)
+	}
+
+	// A ts string where the entry expects a message must be a LOUD
+	// failure, not a silent empty. This is the shape a `Latest string`
+	// field would have imposed on every one of the 14 observed
+	// entries.
+	const stringLatest = `{"ok":true,"channels":[{"id":"C0VIEW0001","latest":"1783337512.000112"}]}`
+	strRes, _ := mustView(t, stringLatest, "C0OPENED99")
+	if got := string(strRes.Channels[0].Latest); got != `"1783337512.000112"` {
+		t.Errorf("Channels[0].Latest = %s; raw bytes must survive whichever shape the server sends", got)
 	}
 }
 

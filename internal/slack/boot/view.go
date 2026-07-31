@@ -123,11 +123,22 @@ type History struct {
 	//     deferring costs the wiring phase nothing — whereas defining
 	//     a *second* message type here would create two shapes that
 	//     have to be kept in agreement forever.
-	//  3. Only 8 message keys were captured (user, type, ts,
-	//     client_msg_id, text, team, blocks, reactions) with their
-	//     value shapes elided. Declaring a struct from that is
-	//     inventing a contract, which is the failure this phase
-	//     exists to correct.
+	//  3. The message shape VARIES. Across the 56 messages in the two
+	//     captures there are 17 distinct keys, and only 8 are on all
+	//     56 (user, type, ts, client_msg_id, text, team, blocks,
+	//     reactions). The other 9 — thread_ts, reply_count,
+	//     reply_users, reply_users_count, latest_reply, subscribed,
+	//     is_locked, edited, attachments — appear on 4 to 16 of them.
+	//     Declaring a struct from that is inventing a contract, which
+	//     is the failure this phase exists to correct.
+	//
+	//     An earlier version of this comment said "only 8 message keys
+	//     were captured", which was true of the committed extract
+	//     (messages[0] of one sample) and false of the captures. The
+	//     conclusion is unchanged and if anything better supported: 17
+	//     keys of which 9 are optional is a stronger argument for raw
+	//     bytes than 8 fixed ones. Only the evidence was wrong — a
+	//     per-field claim about an array element needs a denominator.
 	//
 	// Honest cost, stated so it is a choice and not an accident:
 	// raw bytes mean a message whose shape slk cannot handle fails
@@ -162,14 +173,86 @@ type History struct {
 	NextTS int64 `json:"next_ts"`
 }
 
+// ViewChannelEntry is one entry in conversations.view's `channels[]`
+// array — the conversations the returned messages reference.
+//
+// It embeds Channel for the 27 keys this array shares with userBoot's
+// channels[], and adds the five that only conversations.view sends.
+// Measured across all 54 entries in the two captures:
+//
+//	is_member             54/54
+//	last_read             14/54
+//	latest                14/54
+//	unread_count          14/54
+//	unread_count_display  14/54
+//
+// The five are HERE and not on Channel deliberately. userBoot's
+// channels[] entries carry none of them — 0 of 110 observed elements —
+// so putting them on the shared type would give every userBoot channel
+// five fields that decode zero forever and read as meaningful, which
+// is the exact mistake edge.Channel's missing IsMember documents at
+// length. The traffic runs the other way too: userBoot's entries carry
+// is_frozen (110/110) and members (4/110), which view's never do, and
+// neither is modelled anywhere for the same reason in reverse.
+//
+// Why the four unread fields are worth modelling at all: without them
+// ViewResult.Channels discards the unread state of 26% of the entries
+// it is handed, and a caller that wants those counts has to make a
+// second call for numbers that arrived in this response.
+type ViewChannelEntry struct {
+	Channel
+
+	// IsMember is on every observed entry, and its 14-true-of-54 split
+	// is real data rather than a structural constant — unlike
+	// edge.Channel, where membership does not travel on the result at
+	// all.
+	IsMember bool `json:"is_member"`
+
+	// LastRead is a ts string, as on ViewChannel.
+	LastRead string `json:"last_read"`
+
+	// Latest is a whole message OBJECT here, not the ts string the
+	// top-level `channel` object carries under this same key: 14/14
+	// entries that have it send an object, 2/2 `channel` objects send
+	// a string. That divergence is why this type exists instead of
+	// ViewChannel being reused for the array — a `Latest string` field
+	// does not merely read wrong, it fails the entire response decode
+	// and loses the channel open.
+	//
+	// json.RawMessage for the same three reasons as History.Messages:
+	// nothing consumes it yet, a second message struct would be a
+	// shape to keep in agreement with slack.Message forever, and raw
+	// bytes claim nothing about a value shape the captures show in two
+	// different forms. It also preserves the absent/null/present
+	// distinction, which matters here because 40 of 54 entries omit
+	// the key entirely.
+	Latest json.RawMessage `json:"latest"`
+
+	// UnreadCount and UnreadCountDisplay are ints. They were EQUAL on
+	// all 14 observed entries that carry them, so the captures do not
+	// separate the two — the fixture gives them distinct values on
+	// purpose, because same-typed adjacent fields sharing a value are
+	// freely swappable and no assertion can tell them apart.
+	UnreadCount        int `json:"unread_count"`
+	UnreadCountDisplay int `json:"unread_count_display"`
+}
+
 // ViewChannel is conversations.view's top-level `channel` object: the
 // conversation that was actually opened.
 //
 // It embeds Channel because this object is a strict SUPERSET of a
-// channels[] entry: measured across both captures, the entry's 28 keys
-// are all present among this object's 34, with the same names and the
-// same types. That is reuse of one Slack conversation shape, not a
-// coincidence worth duplicating.
+// channels[] entry: measured across both captures, the entry's 32
+// distinct keys are all present among this object's 34. The set
+// difference in the other direction is empty, and the 2 keys this
+// object uniquely adds are is_read_only and is_thread_only. That is
+// reuse of one Slack conversation shape, not a coincidence worth
+// duplicating.
+//
+// The superset holds for key NAMES only, and one type differs:
+// `latest` is a ts string here (2/2) and a message object on a
+// channels[] entry (14/14). See ViewChannelEntry.Latest — that single
+// disagreement is why the array gets its own type rather than this
+// one.
 //
 // Embedding also buys the boolean tags real mutation coverage for
 // free: those tags are pinned by the channels[] assertions, which have
@@ -178,21 +261,18 @@ type History struct {
 // because there is exactly one `channel` object per response, and two
 // booleans sharing a value in a single object are freely swappable.
 //
-// Exactly one key differs between userBoot's channels[] and view's,
-// and neither is modelled: userBoot's carry is_frozen and view's do
-// not; view's carry is_member and userBoot's do not.
-//
-// The 6 keys this object adds over a channels[] entry are last_read,
-// latest, unread_count, unread_count_display, is_thread_only and
-// is_read_only. The four non-boolean ones are modelled below — they
-// are NOT on Channel because on a channels[] entry they would decode
-// to zero on every row forever and read as meaningful. The two
-// booleans are deliberately left out for the pinning reason above; see
-// the same argument on boot.Self.
+// is_read_only and is_thread_only are left out for that same pinning
+// reason — both were true-and-false respectively in 2/2 captures, in a
+// single object per response, so a swapped tag between them would
+// survive any assertion this package can write. See the same argument
+// on boot.Self. is_member is left off for the same reason and is
+// modelled on ViewChannelEntry instead, where 54 rows can pin it.
 type ViewChannel struct {
 	Channel
 
-	// LastRead and Latest are 17-character string ts values, not ints.
+	// LastRead and Latest are string ts values, not ints. Note that
+	// Latest is a STRING on this object and a message object on a
+	// channels[] entry; ViewChannelEntry.Latest is the other half.
 	LastRead string `json:"last_read"`
 	Latest   string `json:"latest"`
 
@@ -239,7 +319,11 @@ type ViewResult struct {
 	// Channels are the conversations the returned messages reference
 	// (channel mentions and the like), pre-resolved. 27 entries in
 	// both captures.
-	Channels []Channel `json:"channels"`
+	//
+	// ViewChannelEntry, not Channel: a view channels[] entry carries
+	// five keys a userBoot one does not, four of them unread state
+	// that would otherwise be thrown away and refetched.
+	Channels []ViewChannelEntry `json:"channels"`
 
 	// Emojis replaces the emoji.list call. It is an OBJECT keyed by
 	// emoji name with a URL value — NOT an array, despite being the

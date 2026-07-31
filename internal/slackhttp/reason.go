@@ -94,6 +94,16 @@ var defaultReasons = map[string]string{
 // requests that carry the field; an absent one puts it in a 6% bucket
 // on every single request. If a future capture covers more endpoints,
 // move them into defaultReasons and shrink this fallback's reach.
+//
+// ATTESTED is the load-bearing word, and it is now pinned rather than
+// asserted: TestGenericReasonIsAValueTheOfficialClientSends requires
+// this string to be one of the 48 _x_reason values recorded in
+// testdata/official-request-shape.json. It has to be, because this
+// constant covers every endpoint missing from the table above and so
+// rides more of slk's traffic than any single entry in it. Before that
+// test only its PRESENCE was pinned: setting it to "" failed, and
+// setting it to "slk-tui-fetch" — a string in zero captures, on nearly
+// every request slk makes — passed the whole suite.
 const genericReason = "conditional-fetch-manager"
 
 // defaultReason returns the _x_reason to send for an API method when

@@ -120,11 +120,19 @@ func (c *Client) ChannelsSearch(ctx context.Context, query string, topChannels [
 // remove.
 //
 // Note what is not modelled: a users/search profile carries
-// image_original and is_custom_image, which a users/info profile does
-// not. If Phase 2b wants avatars, that is where the URL is — but
-// adding the field belongs with the code that consumes it, and the
-// two endpoints would then disagree about whether an avatar is
-// available, so it is left out here rather than half-populated.
+// image_original and is_custom_image (42 of 60 observed results
+// each). An earlier version of this comment added "which a
+// users/info profile does not", and that was wrong — users/info
+// carries image_original on 255 of 291 results, the same key at
+// substantially the same rate. The two endpoints AGREE; see the
+// measured table on edge.User in cache.go, and the samples[:3]
+// fixture truncation that produced the mistake.
+//
+// So the reason ImageOriginal is absent from edge.User is that
+// nothing consumes it yet — not that adding it would half-populate a
+// shared type. Adding it is a one-line change to edge.User.Profile
+// that serves both endpoints at once, and the evidence for it is
+// already in hand.
 //
 // Evidence: 2 observed requests, both from one capture — see the same
 // caveat on ChannelsSearch.

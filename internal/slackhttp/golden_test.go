@@ -52,6 +52,11 @@ type requestShape struct {
 		BodyXReasonAbsentMethods []string `json:"body_x_reason_absent_methods"`
 		XReasonPlacement         string   `json:"x_reason_placement"`
 		XReasonPresentOutside    bool     `json:"x_reason_present_outside_absent_methods"`
+		// XReasonObservedValues is every distinct _x_reason the
+		// official client was seen sending — the membership set
+		// TestGenericReasonIsAValueTheOfficialClientSends checks the
+		// fallback against.
+		XReasonObservedValues []string `json:"x_reason_observed_values"`
 	} `json:"workspace_api"`
 
 	EdgeAPI struct {
@@ -83,7 +88,8 @@ func loadRequestShape(t *testing.T) requestShape {
 		len(s.ImageHeaders.Present) == 0 ||
 		len(s.WorkspaceAPI.BodyTrailingFieldOrder) == 0 ||
 		len(s.WorkspaceAPI.BodyXModeAbsentMethods) == 0 ||
-		len(s.WorkspaceAPI.BodyXReasonAbsentMethods) == 0 {
+		len(s.WorkspaceAPI.BodyXReasonAbsentMethods) == 0 ||
+		len(s.WorkspaceAPI.XReasonObservedValues) == 0 {
 		t.Fatalf("golden fixture parsed but is missing sections: %+v", s)
 	}
 	return s

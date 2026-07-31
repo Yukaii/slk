@@ -65,10 +65,21 @@ type TextBlock struct {
 // conversations the user is a member of, minus DMs, which arrive
 // separately in `ims`.
 //
-// A deliberate subset. The captured entry carries 28 keys
-// (pending_shared, previous_names, properties{}, unlinked,
-// parent_conversation, …); decoding ignores the rest and must keep
-// doing so, because Slack adds fields to this response without notice.
+// A deliberate subset. The union across all 110 observed elements is
+// 29 keys (pending_shared, properties{}, unlinked, parent_conversation,
+// …); decoding ignores the rest and must keep doing so, because Slack
+// adds fields to this response without notice.
+//
+// 29, not the 28 an earlier version of this comment claimed — that
+// number was read off a single element. Two of the 29 are not on every
+// entry: previous_names appears on 106 of 110 and members on 4 of 110.
+// A per-field claim about an array element needs a denominator, which
+// a count taken from one element cannot have.
+//
+// The 5 keys a conversations.view channels[] entry adds over these are
+// modelled on boot.ViewChannelEntry rather than here — see that type,
+// and note the traffic runs both ways: is_frozen and members are
+// userBoot-only, so neither belongs on a shared type either.
 type Channel struct {
 	ID             string `json:"id"`
 	Name           string `json:"name"`
