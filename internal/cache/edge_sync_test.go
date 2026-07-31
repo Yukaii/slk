@@ -20,12 +20,28 @@ func openEdgeSyncTestDB(t *testing.T) *DB {
 // column a later partial update wrongly clears is visible.
 func seedChannelFull(t *testing.T, db *DB, workspaceID, id string) {
 	t.Helper()
+	seedChannelMembership(t, db, workspaceID, id, true)
+}
+
+// seedChannelMembership is seedChannelFull with is_member chosen by the
+// caller. "Preserved" is only distinguishable from "set to true" or
+// "set to false" if the fixture holds rows of both kinds, so every
+// preservation assertion needs this rather than seedChannelFull.
+func seedChannelMembership(t *testing.T, db *DB, workspaceID, id string, isMember bool) {
+	t.Helper()
 	if err := db.UpsertChannel(Channel{
 		ID: id, WorkspaceID: workspaceID, Name: "original-name",
 		Type: "channel", Topic: "original topic",
-		IsMember: true, IsStarred: true, UpdatedAt: 111,
+		IsMember: isMember, IsStarred: true, UpdatedAt: 111,
 	}); err != nil {
 		t.Fatalf("UpsertChannel: %v", err)
+	}
+}
+
+func assertMembership(t *testing.T, db *DB, id string, want bool, why string) {
+	t.Helper()
+	if got := getChannelRow(t, db, id).IsMember; got != want {
+		t.Errorf("%s is_member = %v; want %v — %s", id, got, want, why)
 	}
 }
 
@@ -90,10 +106,11 @@ func TestApplyMembership_SetsAndClearsOnlyTheIDsQueried(t *testing.T) {
 		seedChannelFull(t, db, "T1", id)
 	}
 
-	// MemberChannels is a snapshot over the ids SENT, not a delta: an
-	// id that was sent and is absent is a non-membership; an id never
-	// sent says nothing. C3 was not queried and must be untouched.
-	if err := db.ApplyMembership("T1", []string{"C1", "C2"}, []string{"C1"}); err != nil {
+	// A reported member_channels is a snapshot over the ids SENT, not a
+	// delta: an id that was sent, reported on and absent is a
+	// non-membership; an id never sent says nothing. C3 was not queried
+	// and must be untouched.
+	if err := db.ApplyMembership("T1", []string{"C1", "C2"}, MembershipReported([]string{"C1"}, nil)); err != nil {
 		t.Fatalf("ApplyMembership: %v", err)
 	}
 
@@ -323,7 +340,7 @@ func TestApplyMembership_ScopedToWorkspace(t *testing.T) {
 	seedChannelFull(t, db, "T2", "C2")
 
 	// C2 belongs to T2. Naming it in a T1 batch must not clear it.
-	if err := db.ApplyMembership("T1", []string{"C1", "C2"}, nil); err != nil {
+	if err := db.ApplyMembership("T1", []string{"C1", "C2"}, MembershipReported(nil, nil)); err != nil {
 		t.Fatalf("ApplyMembership: %v", err)
 	}
 
@@ -335,25 +352,88 @@ func TestApplyMembership_ScopedToWorkspace(t *testing.T) {
 	}
 }
 
-// An absent or empty member_channels is a real answer, not a missing
-// one: it means none of the ids asked about are joined. Treating it as
-// "say nothing" means leaving every channel the user left still marked
-// as joined, which is the same class of bug as the reverse.
-func TestApplyMembership_EmptyMemberListClearsEveryQueriedID(t *testing.T) {
+// An ABSENT member_channels is not an answer. It is absent from 13 of
+// 18 observed channels/info responses, every one of which sent
+// check_membership:true — including one that asked about 11 ids and one
+// that asked about 20. Reading absence as "none of these are joined"
+// would mark the user a non-member of all 20 on an ordinary channel
+// switch, silently.
+func TestApplyMembership_AbsentMemberChannelsPreservesEveryQueriedID(t *testing.T) {
+	db := openEdgeSyncTestDB(t)
+	seedWorkspace(t, db, "T1")
+	// Both prior states are present so that "preserved" cannot be
+	// confused with "set all true" or "set all false".
+	seedChannelMembership(t, db, "T1", "C1", true)
+	seedChannelMembership(t, db, "T1", "C2", false)
+	seedChannelMembership(t, db, "T1", "C3", true)
+
+	if err := db.ApplyMembership("T1", []string{"C1", "C2"}, MembershipUnreported()); err != nil {
+		t.Fatalf("ApplyMembership: %v", err)
+	}
+
+	assertMembership(t, db, "C1", true,
+		"member_channels was absent, so the response carries no membership information and every queried id keeps what it had")
+	assertMembership(t, db, "C2", false,
+		"member_channels was absent; preserving must not mean setting every queried id to true either")
+	assertMembership(t, db, "C3", true,
+		"C3 was never queried and must be untouched")
+}
+
+// An EXPLICITLY empty member_channels — the server reported, and named
+// nobody — is a real answer: none of the ids asked about are joined.
+// Collapsing it into the absent case leaves every channel the user left
+// still marked as joined.
+func TestApplyMembership_ExplicitlyEmptyMemberChannelsClearsEveryQueriedID(t *testing.T) {
 	db := openEdgeSyncTestDB(t)
 	seedWorkspace(t, db, "T1")
 	seedChannelFull(t, db, "T1", "C1")
 	seedChannelFull(t, db, "T1", "C2")
+	seedChannelFull(t, db, "T1", "C3")
 
-	if err := db.ApplyMembership("T1", []string{"C1", "C2"}, nil); err != nil {
+	if err := db.ApplyMembership("T1", []string{"C1", "C2"}, MembershipReported(nil, nil)); err != nil {
 		t.Fatalf("ApplyMembership: %v", err)
 	}
 
-	for _, id := range []string{"C1", "C2"} {
-		if getChannelRow(t, db, id).IsMember {
-			t.Errorf("%s was queried and member_channels was empty, so it is a non-membership and must be cleared", id)
-		}
+	assertMembership(t, db, "C1", false,
+		"member_channels was reported and empty, so C1 is a genuine non-membership and must be cleared")
+	assertMembership(t, db, "C2", false,
+		"member_channels was reported and empty, so C2 is a genuine non-membership and must be cleared")
+	assertMembership(t, db, "C3", true,
+		"C3 was never queried and must be untouched")
+}
+
+// A failed id is not an answer about membership: the server could not
+// resolve the id at all. In 4 of the 5 observed responses that carried
+// member_channels, member + failed exactly accounted for every id sent
+// (52+11=63, 29+2=31, 20+0=20, 1+0=1), so folding failures into the
+// clear set would clear the majority of a batch on the strength of a
+// lookup error.
+func TestApplyMembership_FailedIDsAreNeverNonMembers(t *testing.T) {
+	db := openEdgeSyncTestDB(t)
+	seedWorkspace(t, db, "T1")
+	seedChannelMembership(t, db, "T1", "C1", false) // reported as a member
+	seedChannelMembership(t, db, "T1", "C2", true)  // failed, was a member
+	seedChannelMembership(t, db, "T1", "C3", false) // failed, was not
+	seedChannelMembership(t, db, "T1", "C4", true)  // reported on, named by neither
+	seedChannelMembership(t, db, "T1", "C5", true)  // never queried
+
+	if err := db.ApplyMembership("T1",
+		[]string{"C1", "C2", "C3", "C4"},
+		MembershipReported([]string{"C1"}, []string{"C2", "C3"}),
+	); err != nil {
+		t.Fatalf("ApplyMembership: %v", err)
 	}
+
+	assertMembership(t, db, "C1", true,
+		"C1 was named in member_channels")
+	assertMembership(t, db, "C2", true,
+		"C2 is in failed_ids; the server never resolved it, so its membership is unknown and must be preserved, not cleared")
+	assertMembership(t, db, "C3", false,
+		"C3 is in failed_ids; unknown must be preserved, so a failure must not set is_member either")
+	assertMembership(t, db, "C4", false,
+		"C4 was queried, the server reported, and named it in neither member_channels nor failed_ids — that is a genuine non-membership")
+	assertMembership(t, db, "C5", true,
+		"C5 was never queried and must be untouched")
 }
 
 // These writers are called in a loop over a revalidation batch. A
@@ -376,7 +456,9 @@ func TestEdgeWriters_PropagateDatabaseErrors(t *testing.T) {
 	if err := db.UpdateUserFromEdge(EdgeUserUpdate{ID: "U1", Name: "x", AvatarURL: "y"}); err == nil {
 		t.Error("UpdateUserFromEdge (avatar branch) on a closed database returned nil")
 	}
-	if err := db.ApplyMembership("T1", []string{"C1"}, nil); err == nil {
+	// A reported snapshot: an unreported one is a no-op by contract and
+	// would return nil here for the right reason, testing nothing.
+	if err := db.ApplyMembership("T1", []string{"C1"}, MembershipReported(nil, nil)); err == nil {
 		t.Error("ApplyMembership on a closed database returned nil")
 	}
 }
