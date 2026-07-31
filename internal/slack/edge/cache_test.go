@@ -1132,6 +1132,123 @@ func TestUsersInfo_SendsExpectedFlags(t *testing.T) {
 	}
 }
 
+// TestUsersInfo_DecodesProfileAvatar pins the correction to a claim
+// Phase 2a made and got wrong.
+//
+// That version of edge.User asserted a users/info profile carries no
+// image URL at all, and modelled none. Measured across all 291
+// users/info result objects in the 8 captures:
+//
+//	profile.avatar_hash      288/291
+//	profile.image_original   255/291   (non-empty in all 255)
+//	profile.is_custom_image  255/291
+//	profile.image_32           0/291
+//	profile.image_72           0/291
+//	profile.image_192          0/291
+//
+// Dropping the sized image_NN variants was right — a field for one
+// would decode empty forever and hand callers a blank avatar. "No
+// image anywhere" was not: image_original is an absolute URL on 88% of
+// results.
+//
+// The wrong claim came from the committed fixture rather than the
+// captures. internal/slack/testdata/phase2-api-contracts.json keeps
+// samples[:3]; two of the three users/info samples were `results: []`,
+// and the one that remained held a user with no custom image. One user
+// was generalised into a contract.
+//
+// It matters because cache.User has an avatar_url column: without this
+// field a revalidation pass has nothing to write there.
+//
+// Every asserted field carries a distinct, non-zero value on purpose —
+// including is_custom_image, which is the only bool in Profile and
+// would otherwise be indistinguishable from the two on User.
+func TestUsersInfo_DecodesProfileAvatar(t *testing.T) {
+	const wantURL = "https://avatars.slack-edge.com/2021-02-08/1783337533019_g1a2b3_original.png"
+	rec := newRecorder(t, func(int) (int, string) {
+		return 200, `{"ok":true,"results":[
+			{"id":"U04T4TH8Y","team_id":"T04T4TH8W","name":"grant","updated":1612802061,
+			 "deleted":true,"is_bot":false,
+			 "profile":{"display_name":"Grant","real_name":"Grant Ammons",
+			  "avatar_hash":"g1a2b3","is_custom_image":true,
+			  "image_original":"` + wantURL + `"}}
+		],"can_interact":{"U04T4TH8Y":true}}`
+	})
+
+	got, err := rec.client().UsersInfo(context.Background(), map[string]int64{"U04T4TH8Y": 1612802061})
+	if err != nil {
+		t.Fatalf("UsersInfo: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d users; want 1", len(got))
+	}
+	u := got[0]
+
+	if u.Profile.ImageOriginal != wantURL {
+		t.Errorf("Profile.ImageOriginal = %q; want %q. This is the avatar URL a users/info "+
+			"profile actually carries — 255 of 291 observed results — and cache.User's "+
+			"avatar_url column has nothing to write without it",
+			u.Profile.ImageOriginal, wantURL)
+	}
+	if !u.Profile.IsCustomImage {
+		t.Error("Profile.IsCustomImage = false; want true (is_custom_image is true in the fixture)")
+	}
+	// The two User-level bools are asserted alongside it so a tag
+	// swapped between them and IsCustomImage cannot go unnoticed.
+	// deleted is true and is_bot is false here, so a swap in either
+	// direction changes an answer.
+	if !u.Deleted {
+		t.Error("Deleted = true expected; got false (deleted is true in the fixture)")
+	}
+	if u.IsBot {
+		t.Error("IsBot = true; want false (is_bot is false in the fixture)")
+	}
+	// The neighbouring profile strings, so a tag pointed at the wrong
+	// key inside Profile shows up here rather than silently.
+	if u.Profile.DisplayName != "Grant" {
+		t.Errorf("Profile.DisplayName = %q; want Grant", u.Profile.DisplayName)
+	}
+	if u.Profile.RealName != "Grant Ammons" {
+		t.Errorf("Profile.RealName = %q; want Grant Ammons", u.Profile.RealName)
+	}
+}
+
+// TestUsersInfo_ProfileWithoutAnImageDecodesEmpty is the other 36 of
+// 291 — users who have never set a custom avatar. Neither key is
+// present on those profiles, and their absence must decode to the zero
+// value rather than failing the batch.
+//
+// The empty string therefore means "this user has no custom avatar",
+// never "this endpoint cannot tell you". That distinction is what
+// makes it safe for internal/cache's UpdateUserFromEdge to treat an
+// empty AvatarURL as "preserve".
+func TestUsersInfo_ProfileWithoutAnImageDecodesEmpty(t *testing.T) {
+	rec := newRecorder(t, func(int) (int, string) {
+		return 200, `{"ok":true,"results":[
+			{"id":"U0B6SR2FLG1","team_id":"T04T4TH8W","name":"nova","updated":1612802062,
+			 "profile":{"display_name":"Nova","real_name":"Nova Prime","avatar_hash":"h9z8y7"}}
+		]}`
+	})
+
+	got, err := rec.client().UsersInfo(context.Background(), map[string]int64{"U0B6SR2FLG1": 1})
+	if err != nil {
+		t.Fatalf("UsersInfo on a profile with no image keys: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d users; want 1 — a missing image_original must not drop the result", len(got))
+	}
+	if got[0].Profile.ImageOriginal != "" {
+		t.Errorf("Profile.ImageOriginal = %q; want empty", got[0].Profile.ImageOriginal)
+	}
+	if got[0].Profile.IsCustomImage {
+		t.Error("Profile.IsCustomImage = true; want false when the key is absent")
+	}
+	// The rest of the profile still has to survive.
+	if got[0].Profile.RealName != "Nova Prime" {
+		t.Errorf("Profile.RealName = %q; want Nova Prime", got[0].Profile.RealName)
+	}
+}
+
 func TestUsersInfo_NoIDsMakesNoRequest(t *testing.T) {
 	rec := newRecorder(t, alwaysEmpty)
 	c := rec.client()

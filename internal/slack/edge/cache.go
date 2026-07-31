@@ -97,11 +97,11 @@ type Channel struct {
 // avatar. That much of the original reasoning stands.
 //
 // The rest of it did not: this comment used to claim there is no image
-// URL anywhere in a users/info profile. There is. image_original is an
-// absolute URL and it is present on 88% of results. users/search
-// carries the same key at the same rate (42/60) — the two endpoints
-// AGREE, and an earlier note on UsersSearch claiming they disagree was
-// wrong for the same reason.
+// URL anywhere in a users/info profile, and modelled none. There is.
+// image_original is an absolute URL and it is present on 88% of
+// results. users/search carries the same key at the same rate (42/60)
+// — the two endpoints AGREE, and an earlier note on UsersSearch
+// claiming they disagree was wrong for the same reason.
 //
 // The claim came from the committed fixture rather than the captures.
 // internal/slack/testdata/phase2-api-contracts.json keeps samples[:3];
@@ -110,12 +110,9 @@ type Channel struct {
 // image. One user was generalised into a contract. A per-field claim
 // about an array element needs a denominator.
 //
-// ImageOriginal is therefore omitted here because NOTHING CONSUMES IT
-// YET, not because it is unavailable. Adding it is a one-line change —
-//
-//	ImageOriginal string `json:"image_original"`
-//
-// — inside Profile, and the evidence for it is already in hand.
+// ImageOriginal is now modelled below. It is what cache.User's
+// avatar_url column gets filled from; without it a revalidation pass
+// has an avatar column and no avatar to put in it.
 type User struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
@@ -126,6 +123,25 @@ type User struct {
 	Profile struct {
 		DisplayName string `json:"display_name"`
 		RealName    string `json:"real_name"`
+		// ImageOriginal is the user's avatar URL, an absolute one.
+		// Present and non-empty on 255 of the 291 observed users/info
+		// results, and on users/search too — 42 of 60 — so the two
+		// endpoints agree and this one field serves both.
+		//
+		// The 36 without it are users who have never set a custom
+		// image, which is why an empty value here means "this user has
+		// no custom avatar" and never "this endpoint cannot tell you".
+		// That is what makes it safe for a caller to treat empty as
+		// "leave the stored avatar alone".
+		//
+		// The sized variants are genuinely absent — image_32,
+		// image_72 and image_192 are each 0 of 291 — so a field for
+		// one would decode empty forever and hand callers a blank
+		// avatar. Do not add them.
+		ImageOriginal string `json:"image_original"`
+		// IsCustomImage tracks ImageOriginal exactly in the captures:
+		// present on the same 255 of 291.
+		IsCustomImage bool `json:"is_custom_image"`
 	} `json:"profile"`
 }
 

@@ -532,6 +532,57 @@ func TestUsersSearch_DecodesResults(t *testing.T) {
 	}
 }
 
+// TestUsersSearch_DecodesProfileAvatar is the users/search half of
+// TestUsersInfo_DecodesProfileAvatar, and exists to pin that the two
+// endpoints agree rather than leaving it asserted only in a comment.
+//
+// image_original and is_custom_image appear on 42 of the 60 observed
+// users/search results and on 255 of the 291 users/info results — the
+// same keys at substantially the same rate. An earlier version of the
+// UsersSearch doc comment claimed users/search carried an image URL
+// "which a users/info profile does not", which was the same
+// single-sample generalisation from the opposite direction.
+//
+// They share edge.User, so a field that only worked on one of them
+// would be a contradiction. This makes that checkable.
+func TestUsersSearch_DecodesProfileAvatar(t *testing.T) {
+	const wantURL = "https://avatars.slack-edge.com/2022-11-11/T04T4TH8W_h9z8y7_original.jpg"
+	rec := newRecorder(t, func(int) (int, string) {
+		return 200, `{"ok":true,"results":[
+			{"id":"U0B6SR2FLG1","team_id":"T04T4TH8W","name":"nova","updated":1612802062,
+			 "deleted":false,"is_bot":true,
+			 "profile":{"display_name":"Nova","real_name":"Nova Prime",
+			  "avatar_hash":"h9z8y7","is_custom_image":true,
+			  "image_original":"` + wantURL + `"}}
+		]}`
+	})
+
+	got, err := rec.client().UsersSearch(context.Background(), "nova", "", nil)
+	if err != nil {
+		t.Fatalf("UsersSearch: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d users; want 1", len(got))
+	}
+	if got[0].Profile.ImageOriginal != wantURL {
+		t.Errorf("Profile.ImageOriginal = %q; want %q — users/search carries the same key "+
+			"as users/info, on 42 of 60 observed results",
+			got[0].Profile.ImageOriginal, wantURL)
+	}
+	if !got[0].Profile.IsCustomImage {
+		t.Error("Profile.IsCustomImage = false; want true (is_custom_image is true in the fixture)")
+	}
+	// is_bot is the true-valued User bool in this fixture, where
+	// TestUsersInfo_DecodesProfileAvatar uses deleted. Asserting it
+	// alongside IsCustomImage covers the other half of a tag swap.
+	if !got[0].IsBot {
+		t.Error("IsBot = false; want true (is_bot is true in the fixture)")
+	}
+	if got[0].Deleted {
+		t.Error("Deleted = true; want false")
+	}
+}
+
 func TestUsersSearch_EmptyQueryMakesNoRequest(t *testing.T) {
 	rec := newRecorder(t, func(int) (int, string) {
 		return 200, `{"ok":true,"results":[{"id":"U1"}]}`
