@@ -24,6 +24,12 @@
 // than a parsed mute list — the caller parses it with
 // slack.ParseMutedFromAllNotificationsPrefs — and that Counts restates
 // slack.UnreadInfo and slack.ThreadsAggregate rather than reusing them.
+//
+// internal/cache IS imported, and that is not a hole in the rule: the
+// dependency runs inward, since cache imports neither bootstrap nor
+// slack. What it buys is cache.MembershipSnapshot and the
+// EdgeXFromEdge update structs travelling through the Store interface
+// with their own semantics intact — see Store.
 package bootstrap
 
 import (
@@ -32,6 +38,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/gammons/slk/internal/cache"
 	"github.com/gammons/slk/internal/slack/boot"
 	"github.com/gammons/slk/internal/slack/edge"
 )
@@ -80,32 +87,37 @@ type Revalidator interface {
 // is_starred, avatar_url and presence, none of which any edge response
 // carries.
 //
-// *cache.DB does NOT satisfy this as written, and that is deliberate
-// rather than an oversight. cache.DB.ApplyMembership takes
-// (workspaceID string, queriedIDs []string, snap cache.MembershipSnapshot);
-// MembershipSnapshot exists precisely because encoding/json cannot
-// distinguish an absent member_channels from a literal [], and those
-// are opposite answers — "the server said nothing, keep what you have"
-// versus "the server looked and named nobody, clear them all". A
-// []string here cannot carry that distinction.
+// The signatures are cache's own, verbatim, for every method except
+// MessageVersions. That is deliberate. An earlier draft of this
+// interface took ApplyMembership's membership as a []string and left
+// the adapter to reconstruct the snapshot; cache.MembershipSnapshot
+// exists precisely because encoding/json cannot distinguish an absent
+// member_channels from a literal [], and those are opposite answers —
+// "the server said nothing, keep what you have" versus "the server
+// looked and named nobody, clear them all". A []string cannot carry
+// that distinction, so the []string version pushed a heuristic into
+// the adapter, which is exactly where the bug would have lived. It is
+// resolved here instead, from edge.ChannelsInfoResult.MembershipQueried,
+// which records the ids whose batch actually answered.
 //
-// The adapter in Task 7 is what bridges it, and it must apply the
-// heuristic cache.MembershipSnapshot's own doc prescribes:
-//
-//	snap := cache.MembershipUnreported()
-//	if len(memberIDs) > 0 {
-//		snap = cache.MembershipReported(memberIDs, failedIDs)
-//	}
-//
-// Taking cache.MembershipSnapshot directly here would be the honest
-// alternative, and would mean importing internal/cache — which Task 6
-// does anyway for the UpdateFromEdge writers. Left as-is for now
-// because nothing in this package calls Store yet, and a signature
-// with a caller is easier to get right than one without.
+// *cache.DB satisfies everything here but MessageVersions, whose
+// three-argument form is narrowed below.
 type Store interface {
 	ChannelVersions(workspaceID string) (map[string]int64, error)
 	UserVersions(workspaceID string) (map[string]int64, error)
-	ApplyMembership(workspaceID string, queriedIDs, memberIDs []string) error
+	ApplyMembership(workspaceID string, queriedIDs []string, snap cache.MembershipSnapshot) error
+
+	// UpdateChannelFromEdge and UpdateUserFromEdge are the PARTIAL
+	// writers, and taking them rather than UpsertChannel/UpsertUser is
+	// the whole reason this interface is narrow. The full upserts
+	// overwrite a fixed column list, and an edge result covers a
+	// different subset of it: no is_member (0 of 36 observed
+	// channels/info results carry it — membership arrives separately,
+	// via ApplyMembership), no is_starred, no presence. Revalidating
+	// through the full upserts would blank all three on every pass,
+	// silently, surfacing as UI bugs long afterwards.
+	UpdateChannelFromEdge(u cache.EdgeChannelUpdate) error
+	UpdateUserFromEdge(u cache.EdgeUserUpdate) error
 
 	// MessageVersions returns {ts: version} for the messages slk
 	// already holds in one channel — the cached_latest_updates the
@@ -364,6 +376,12 @@ func Run(ctx context.Context, deps Deps) (*Result, error) {
 			return nil, fmt.Errorf("bootstrap: opening %s: %w", deps.OpenChannelID, err)
 		}
 	}
+
+	// Last, and it has to be last: the users this revalidates are the
+	// ones conversations.view just returned, so running it any earlier
+	// would scope the request to the open DMs alone and leave every
+	// author in the opened channel stale. See revalidate.
+	revalidate(ctx, deps, out, logf)
 
 	return out, nil
 }

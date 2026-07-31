@@ -15,11 +15,16 @@ import (
 // the Go method names on purpose: TestRun_NeverEnumerates asserts
 // against method names ("users.list"), so recording anything else would
 // make the guard unable to see the very thing it exists to catch.
+// The two edgeapi names carry the "edge:" prefix slackhttp.Counter
+// keys them by, so a call log read side by side with a counter report
+// names the same things.
 const (
-	callUserBoot = "client.userBoot"
-	callCounts   = "client.counts"
-	callView     = "conversations.view"
-	callHistory  = "conversations.history"
+	callUserBoot     = "client.userBoot"
+	callCounts       = "client.counts"
+	callView         = "conversations.view"
+	callHistory      = "conversations.history"
+	callChannelsInfo = "edge:channels/info"
+	callUsersInfo    = "edge:users/info"
 )
 
 // cannedBootResult is the userBoot response every test runs against.
@@ -203,6 +208,19 @@ func cannedViewResult() *boot.ViewResult {
 				Version: 1783337533031, Deleted: true, IsAppUser: true,
 				Profile: boot.UserProfile{RealName: "Bob Profile", DisplayName: "bob-display", AvatarHash: "bobhash"},
 			},
+			{
+				// An author with NO open DM. U_ALICE and U_BOB are
+				// both counterparties of cannedBootResult's IMs, so
+				// without this third user "revalidation scoped only to
+				// the open DMs" and "revalidation scoped to the DMs
+				// plus the opened channel's authors" send the same id
+				// set — and so does "revalidation ran before the
+				// channel was opened", which is the mutation this
+				// fixture exists to make visible.
+				ID: "U_AUTHOR_ONLY", TeamID: "T_HOME", Name: "author-only", RealName: "Author Only Toplevel",
+				Version: 1783337533034,
+				Profile: boot.UserProfile{RealName: "Author Only Profile", DisplayName: "author-only-display", AvatarHash: "authorhash"},
+			},
 		},
 		Bots: []json.RawMessage{json.RawMessage(`{"id":"B_BOT"}`)},
 		Channels: []boot.ViewChannelEntry{
@@ -343,6 +361,12 @@ type fakeDeps struct {
 	messageVersionsFor   string
 	messageVersionsCalls int
 
+	// The revalidation half — canned edge responses, the id maps that
+	// reached them, and the cache writes that came back out. Declared
+	// in revalidate_test.go so the recording sits next to the
+	// assertions that read it.
+	revalidateFake
+
 	logs []string
 
 	deps Deps
@@ -354,6 +378,12 @@ func newFakeDeps() *fakeDeps {
 		counts:  cannedCounts(),
 		viewRes: cannedViewResult(),
 		history: cannedHistory(),
+		revalidateFake: revalidateFake{
+			channelVersions: cannedChannelVersions(),
+			userVersions:    cannedUserVersions(),
+			channelsInfoRes: cannedChannelsInfo(),
+			usersInfoRes:    cannedUsersInfo(),
+		},
 	}
 	f.deps = Deps{
 		WorkspaceID: "T_HOME",
@@ -361,6 +391,7 @@ func newFakeDeps() *fakeDeps {
 		Counts:      f,
 		View:        f,
 		History:     f,
+		Revalidate:  f,
 		Store:       f,
 		Log:         f.log,
 	}
@@ -491,12 +522,8 @@ func (f *fakeDeps) MessageVersions(channelID string) (map[string]string, error) 
 	return f.cachedVersions, nil
 }
 
-// The remaining Store methods are unused until Task 6. They exist so
-// fakeDeps satisfies Store, and they record nothing for the same reason
-// MessageVersions does not: a cache read is not an API request.
-func (f *fakeDeps) ChannelVersions(string) (map[string]int64, error) { return nil, nil }
-func (f *fakeDeps) UserVersions(string) (map[string]int64, error)    { return nil, nil }
-func (f *fakeDeps) ApplyMembership(string, []string, []string) error { return nil }
+// The remaining Store methods, and the whole Revalidator surface, live
+// in revalidate_test.go alongside the tests that assert on them.
 
 // prefixEqual reports whether got starts with want.
 //
@@ -1116,13 +1143,20 @@ func TestRun_OpensTheChannelAfterCounts(t *testing.T) {
 	// counts is what tells the UI this channel has unreads, and the
 	// history that lands next is what it renders against. Opening
 	// first would paint the channel before its badge state exists.
+	//
+	// The two revalidation calls trail every sequence here, and their
+	// position is asserted rather than tolerated: the user set they
+	// send is the opened channel's authors, so revalidating before the
+	// open would scope users/info to the DM counterparties alone. See
+	// TestRevalidate_RunsAfterTheChannelIsOpened, which pins the
+	// consequence rather than the order.
 	for _, tc := range []struct {
 		name    string
 		prepare func(*fakeDeps)
 		want    []string
 	}{
-		{"view honoured", func(f *fakeDeps) { f.viewChannelID = "C_WANT" }, []string{callUserBoot, callCounts, callView}},
-		{"fallback", func(f *fakeDeps) { f.viewChannelID = "C_LASTVIEWED" }, []string{callUserBoot, callCounts, callView, callHistory}},
+		{"view honoured", func(f *fakeDeps) { f.viewChannelID = "C_WANT" }, []string{callUserBoot, callCounts, callView, callChannelsInfo, callUsersInfo}},
+		{"fallback", func(f *fakeDeps) { f.viewChannelID = "C_LASTVIEWED" }, []string{callUserBoot, callCounts, callView, callHistory, callChannelsInfo, callUsersInfo}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeDeps()
