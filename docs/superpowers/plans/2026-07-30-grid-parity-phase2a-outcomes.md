@@ -9,6 +9,26 @@ Phase 2b inherits. Companion to
 Phase 2a is **purely additive**: nothing outside the new packages calls any of
 it. Verified by grep at merge (Task 10, below).
 
+> ## Do not re-test a Grid account on this branch
+>
+> Phase 2a wires nothing. It builds the pieces for the bootstrap rewrite and
+> leaves slk's runtime behaviour **unchanged**, so it cannot fix the sign-outs
+> and cannot be evaluated by trying it. slk still enumerates exactly as before:
+> `users.list`, `conversations.list`, and `conversations.history` for every
+> channel ever visited, on boot and on every reconnect. Deleting those is
+> Phase 2b.
+>
+> Two contributors have already been signed out of their work Slack helping
+> diagnose this. Nobody should be asked to spend another sign-out on a phase
+> that changes nothing a detector can see.
+>
+> **The one exception**, and it moves in the right direction: the two
+> `internal/slackhttp` fixes below (`4df0f14`, `7a3293d`) do change the wire.
+> They stop slk sending `_x_mode` and `_x_reason` on endpoints where the
+> official client sends neither. The only such endpoint slk calls today is
+> `client.shouldReload`, once per workspace at startup, so the net effect is
+> that one boot-time request became *more* browser-like. Nothing regressed.
+
 ## What shipped
 
 | Unit | Files | What it is |
@@ -23,7 +43,7 @@ it. Verified by grep at merge (Task 10, below).
 | Channel-open parser | `internal/slack/boot/view.go` | `conversations.view` — history + users + bots + channels + emoji in one |
 | Incremental sync | `internal/slack/client.go` (append-only) | `HistoryWithVersions` — `cached_latest_updates` |
 
-~2,000 lines of implementation, ~6,400 of tests.
+2,252 lines of implementation, 7,371 of tests (`git diff --numstat`).
 
 Two `internal/slackhttp` fixes were **not in the plan** and are described under
 *Divergences* below.
@@ -193,6 +213,17 @@ key frequencies, request list lengths, scalar value distributions, the
 frequency, and the capture count. Aggregates only — no ids, no bodies, no
 tokens, with an assert-no-token-leak check on write.
 
+**The truncation bug is the thing to fix before Phase 2b, not the individual
+claims it produced.** The extractor summarises `results[0]` and keeps
+`samples[:3]`, so any field that varies *within* an array is generalised from a
+single element. That produced the `image_original` error recorded below and, on
+inspection, three smaller ones: the `channels[]` key-difference counts and the
+"only 8 message keys" claim in `view.go` are both single-element
+generalisations. Re-run the extractor computing per-key frequencies over **all**
+elements of every array, with no `samples[:N]` cap on the aggregates, and the
+whole class disappears. Until then, treat any per-field claim about an array
+element as unverified unless it has a denominator.
+
 `*.har` was added to `.gitignore` and to `.git/info/exclude`. The captures were
 sitting untracked-but-not-ignored in the worktree root, one `git add -A` from a
 public PR, carrying live `xoxc`/`xoxd` credentials and real message content.
@@ -214,6 +245,46 @@ its gofmt deviation is byte-identical to the merge-base — this branch added no
 new formatting drift and deliberately reformatted nothing.
 
 ## What Phase 2b inherits
+
+### Correction: an error this phase made, and the trap it leaves
+
+**`edge.User` models no avatar URL, and the reason recorded in the code is
+wrong.** Three comments and an earlier draft of this document claimed
+`users/info` profiles carry no image URL at all. Measured across **all 291**
+`users/info` result objects in the captures:
+
+```
+profile.avatar_hash      288/291
+profile.image_original   255/291      <- present, non-empty
+profile.is_custom_image  255/291
+profile.image_32           0/291
+```
+
+`image_32` really is absent — dropping the plan's `Image32` field was correct.
+But `image_original` is there on 88% of results, `users/search` agrees, and the
+two endpoints do **not** disagree.
+
+The cause is the same `samples[:3]` truncation this document diagnoses above for
+`channels/info` — caught one level up, missed one level down. Two of the three
+committed `users/info` samples were `results:[]`, leaving one, whose
+`results[0]` happened to be a user with no custom image. A single user was
+generalised into a contract.
+
+**The trap for Phase 2b:** `cache.User` has an `AvatarURL` column and
+`UpsertUser` does an unconditional `ON CONFLICT DO UPDATE SET avatar_url=…`. A
+2b that revalidates users through `edge.UsersInfo` and upserts the results will
+**blank `AvatarURL` for every revalidated user**, because `edge.User` carries
+no avatar. The same hazard applies to channels: `edge.Channel` deliberately has
+no `IsMember` (0/36, see above) and no `IsStarred`, while `UpsertChannel`
+overwrites `is_member` and `is_starred` unconditionally — so the obvious wiring
+silently loses membership and starred state on every revalidation.
+
+Phase 2b must either add the fields to the edge types (`image_original` is
+available; `is_member` is not, on this endpoint) or read-modify-write rather
+than upsert. **What is actually missing is a written mapping**: for each
+`cache.Channel` / `cache.User` column, which source endpoints can populate it,
+and what a source that cannot must do — preserve, not overwrite. That belongs
+in 2b's plan before any code.
 
 ### Decisions deferred to the caller
 
@@ -245,16 +316,17 @@ new formatting drift and deliberately reformatted nothing.
   perform the probe-and-compare** — if it calls `ConversationsView` and ignores
   `Channel.ID`, slk renders the wrong channel's history with no error anywhere.
   Verified fallback: `HistoryWithVersions` with `limit=28`.
+- **`conversations.view`'s `channels[]` carries unread state that `boot.Channel`
+  drops.** 14 of 54 observed entries have `last_read`, `latest`, `unread_count`
+  and `unread_count_display`; all 54 have `is_member`. None is modelled, so
+  Phase 2b would go and fetch counts it was already handed in the same response.
+  Four fields, and the evidence is in hand.
 - **`userBoot`'s `starred` and `subteams.self` were empty in 2/2 captures**, so
   their element shapes are unknown and both are `[]json.RawMessage`. The plan
   claims `userBoot` replaces `stars.list` and `usergroups.list`; **it cannot be
   confirmed to**, and slk calls both today (`client.go:1595`, `client.go:821`).
   Neither appears anywhere in the 8 captures. A capture from a workspace with a
   non-empty starred list and a non-empty usergroup set is the missing fact.
-- **`edge.User` has no avatar URL.** `users/info` profiles carry `avatar_hash`
-  but no `image_*`; `users/search` profiles *do* carry `image_original`. The two
-  endpoints disagree, and the field was left off rather than modelled as one
-  that decodes empty forever.
 - **A fixed batch size is itself a divergence.** The observed distributions are
   ragged because they are demand-driven; there is no client-side cap. A cold
   revalidation of a 10k-user workspace at a fixed 80 is 125 consecutive
