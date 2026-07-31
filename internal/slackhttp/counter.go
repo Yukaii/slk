@@ -23,6 +23,31 @@ type Counter struct {
 	n  map[string]int
 }
 
+// DefaultCounter is the process-wide tally. NewBrowserHTTPClient and
+// NewImageHTTPClient attach it to the transports they build, and it is
+// the handle cmd/slk reads at shutdown to print the count.
+//
+// A package-level counter rather than a per-client one because the
+// number the success criteria are stated in is per-BOOT, not
+// per-client: one boot drives several separate http.Clients (the API
+// client in internal/slack, the image client, the fetcher in
+// internal/image), and summing N tallies at shutdown would mean
+// plumbing N handles through to main for a diagnostic. Callers who
+// want an isolated tally already have one — set
+// BrowserTransport.Counter explicitly, which overrides this — so no
+// per-client option is offered on top of that.
+//
+// Coverage is NOT yet complete: internal/slack builds its
+// BrowserTransport as a literal rather than through a constructor
+// here, so the workspace API client — the bulk of the traffic — does
+// not tally until that literal gets `Counter: slackhttp.DefaultCounter`.
+// That is a change to another package and belongs with the task that
+// reads the number.
+//
+// It is a var so tests can substitute a fresh Counter; nothing in
+// production reassigns it.
+var DefaultCounter = &Counter{}
+
 // Record tallies one request by rawURL. Non-API URLs are ignored:
 // asset fetches (files.slack.com, *.slack-edge.com) are a different
 // concern — Layer 3 — and counting them here would drown the API
@@ -110,10 +135,9 @@ func endpointName(rawURL string) (string, bool) {
 	if slash < 0 {
 		return "", false
 	}
+	// No :port strip here: isEdgeAPIHost, host's only consumer, does
+	// its own.
 	host, path := rest[:slash], rest[slash:]
-	if i := strings.IndexByte(host, ':'); i >= 0 {
-		host = host[:i]
-	}
 	if i := strings.IndexAny(path, "?#"); i >= 0 {
 		path = path[:i]
 	}
@@ -125,8 +149,15 @@ func endpointName(rawURL string) (string, bool) {
 		}
 		return "edge:" + parts[len(parts)-2] + "/" + parts[len(parts)-1], true
 	}
-	if i := strings.Index(path, "/api/"); i >= 0 {
-		name := path[i+len("/api/"):]
+	// HasPrefix, not Index: isWorkspaceAPIPath — which decides where
+	// the envelope goes — uses a prefix, and the two must agree about
+	// what a workspace API call is. On a substring match
+	// https://evil.io/foo/api/bar tallies as the endpoint "bar",
+	// putting a non-Slack host into a count that is supposed to be of
+	// Slack API calls.
+	const apiPrefix = "/api/"
+	if strings.HasPrefix(path, apiPrefix) {
+		name := path[len(apiPrefix):]
 		if name == "" {
 			return "", false
 		}

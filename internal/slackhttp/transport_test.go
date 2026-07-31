@@ -1720,9 +1720,14 @@ func TestBrowserTransport_RecordsRequestsThatFail(t *testing.T) {
 	// The tally counts requests ISSUED, not requests that succeeded.
 	// A boot that fires 60 conversations.history calls and gets
 	// rate-limited on half of them still issued 60, and that is the
-	// number the success criteria are about. This is what pins the
-	// Record call to the TOP of RoundTrip rather than somewhere after
-	// the envelope work, which can return early with an error.
+	// number the success criteria are about.
+	//
+	// Scope: this pins "counted despite a TRANSPORT error" and nothing
+	// more. Env is nil, so the envelope block is skipped entirely and
+	// Record could sit anywhere above inner.RoundTrip and still pass
+	// here. Placement at the top of RoundTrip is pinned by
+	// TestBrowserTransport_RecordsRequestsThatDieDuringEnvelopeWork,
+	// which exercises the early error return in between.
 	var counter Counter
 	bt := &BrowserTransport{
 		Counter: &counter,
@@ -1767,5 +1772,92 @@ func TestBrowserTransport_NilURLWithCounterDoesNotPanic(t *testing.T) {
 	resp.Body.Close()
 	if got := counter.Total(); got != 0 {
 		t.Errorf("Total() = %d; want 0 — a request with no URL names no endpoint", got)
+	}
+}
+
+func TestConstructedClientsTallyToDefaultCounter(t *testing.T) {
+	// Without this, Counter is unreachable from production: the field
+	// is exported, but no constructor set it and no package-level
+	// handle existed, so nothing outside a test could obtain a tally
+	// to read. Every downstream task that quotes a call count depends
+	// on this wiring, so it is pinned behaviourally — a request made
+	// through the returned client must land in DefaultCounter — not by
+	// asserting on the struct field, which would still pass if
+	// RoundTrip stopped consulting it.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+
+	for _, tc := range []struct {
+		name string
+		ctor func(http.CookieJar) *http.Client
+	}{
+		{"browser", NewBrowserHTTPClient},
+		{"image", NewImageHTTPClient},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Swap the process-wide counter for an isolated one so
+			// this test neither reads another test's tally nor leaks
+			// into one. The constructor captures whatever
+			// DefaultCounter points at when it runs, so the swap must
+			// precede it.
+			restore := DefaultCounter
+			DefaultCounter = &Counter{}
+			defer func() { DefaultCounter = restore }()
+
+			client := tc.ctor(nil)
+			resp, err := client.Get(srv.URL + "/api/client.counts")
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			resp.Body.Close()
+
+			if got := DefaultCounter.Snapshot()["client.counts"]; got != 1 {
+				t.Errorf("DefaultCounter client.counts = %d; want 1 — the client this "+
+					"constructor returns must tally through it (full: %v)",
+					got, DefaultCounter.Snapshot())
+			}
+		})
+	}
+}
+
+// errReader fails on the first Read. It stands in for a request body
+// whose source dies mid-flight — a file handle closed underneath an
+// upload, a pipe whose writer errored.
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestBrowserTransport_RecordsRequestsThatDieDuringEnvelopeWork(t *testing.T) {
+	// This is what pins Record to the TOP of RoundTrip. The envelope
+	// work between the top and inner.RoundTrip has an error return of
+	// its own — applyEnvelopeBody fails when the body cannot be read —
+	// and a request that dies there was still ISSUED as far as the
+	// caller is concerned, so it belongs in the tally.
+	//
+	// TestBrowserTransport_RecordsRequestsThatFail cannot pin this: it
+	// passes Env: nil, so the whole envelope block is skipped and
+	// Record could sit anywhere above inner.RoundTrip and still pass.
+	// Env must be non-nil here for the same reason.
+	var counter Counter
+	bt := &BrowserTransport{
+		Counter: &counter,
+		Env:     NewEnvelope(),
+		Inner: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			t.Error("inner.RoundTrip was called; applyEnvelopeBody was supposed to fail first")
+			return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+		}),
+	}
+	req, err := http.NewRequest("POST", "https://slack.com/api/conversations.history", errReader{})
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	if _, err := bt.RoundTrip(req); err == nil {
+		t.Fatal("RoundTrip returned nil error; reading the body was supposed to fail")
+	}
+	if got := counter.Snapshot()["conversations.history"]; got != 1 {
+		t.Errorf("conversations.history = %d after the envelope work failed; want 1 — "+
+			"the tally counts requests issued, and this one was issued", got)
 	}
 }

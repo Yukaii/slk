@@ -53,8 +53,13 @@ type BrowserTransport struct {
 	// through. This transport is the single chokepoint beneath both
 	// slack-go and the hand-rolled postForm path, so it is the one
 	// place where a whole-process call count can be taken — which is
-	// what Phase 2b's success criteria are stated in. Nil by default:
-	// counting is a diagnostic, not something the client needs.
+	// what Phase 2b's success criteria are stated in.
+	//
+	// The zero value is nil — a BrowserTransport built as a literal
+	// counts nothing, which every pre-existing construction site
+	// relies on. The constructors below attach DefaultCounter, which
+	// is how the tally reaches production; set this explicitly to
+	// tally into an isolated Counter instead.
 	Counter *Counter
 }
 
@@ -155,7 +160,7 @@ func (t *BrowserTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 // Use NewImageHTTPClient.
 func NewBrowserHTTPClient(jar http.CookieJar) *http.Client {
 	return &http.Client{
-		Transport: &BrowserTransport{Inner: http.DefaultTransport},
+		Transport: &BrowserTransport{Inner: http.DefaultTransport, Counter: DefaultCounter},
 		Jar:       jar,
 	}
 }
@@ -170,7 +175,7 @@ func NewBrowserHTTPClient(jar http.CookieJar) *http.Client {
 // set wrong.
 func NewImageHTTPClient(jar http.CookieJar) *http.Client {
 	return &http.Client{
-		Transport: &BrowserTransport{Inner: http.DefaultTransport, Dest: DestImage},
+		Transport: &BrowserTransport{Inner: http.DefaultTransport, Dest: DestImage, Counter: DefaultCounter},
 		Jar:       jar,
 	}
 }

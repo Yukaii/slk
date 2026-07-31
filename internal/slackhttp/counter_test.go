@@ -167,3 +167,45 @@ func TestCounter_ReportOnZeroValue(t *testing.T) {
 		t.Errorf("Report() = %q; want %q", got, want)
 	}
 }
+
+func TestEndpointName(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		url  string
+		want string
+		ok   bool
+	}{
+		{"workspace API", "https://slack.com/api/conversations.history", "conversations.history", true},
+		{"workspace API with query", "https://slack.com/api/client.counts?_x_id=1&fp=6e", "client.counts", true},
+		{"edgeapi", "https://edgeapi.slack.com/cache/T1/users/info", "edge:users/info", true},
+
+		// The dead port-strip in endpointName was deleted because
+		// isEdgeAPIHost strips its own port. This is what says so: an
+		// edgeapi URL with an explicit port must still classify.
+		{"edgeapi with port", "https://edgeapi.slack.com:443/cache/T1/channels/info", "edge:channels/info", true},
+
+		// A diagnostic that crashes the process it observes is the
+		// worst possible failure mode, so the degenerate edgeapi
+		// shapes get their own cases. "https://edgeapi.slack.com/"
+		// splits to [""] — one element — and taking the
+		// second-to-last segment of that indexes parts[-1].
+		{"edgeapi root", "https://edgeapi.slack.com/", "", false},
+		{"edgeapi host only", "https://edgeapi.slack.com", "", false},
+		{"edgeapi one segment", "https://edgeapi.slack.com/cache", "", false},
+
+		// /api/ is matched as a PREFIX, matching isWorkspaceAPIPath.
+		// Substring matching would name this endpoint "bar" and count
+		// a non-Slack host as a Slack API call.
+		{"api not at path root", "https://evil.io/foo/api/bar", "", false},
+		{"empty api path", "https://slack.com/api/", "", false},
+		{"non-API slack path", "https://slack.com/messages/C123", "", false},
+		{"asset host", "https://files.slack.com/files-tmb/T1-F2/image_360.png", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := endpointName(tc.url)
+			if got != tc.want || ok != tc.ok {
+				t.Errorf("endpointName(%q) = (%q, %v); want (%q, %v)", tc.url, got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
