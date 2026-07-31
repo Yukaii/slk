@@ -48,6 +48,14 @@ type BrowserTransport struct {
 	// keeps the fetch/XHR behaviour every existing call site relies
 	// on.
 	Dest Dest
+
+	// Counter, if non-nil, tallies every API request that passes
+	// through. This transport is the single chokepoint beneath both
+	// slack-go and the hand-rolled postForm path, so it is the one
+	// place where a whole-process call count can be taken — which is
+	// what Phase 2b's success criteria are stated in. Nil by default:
+	// counting is a diagnostic, not something the client needs.
+	Counter *Counter
 }
 
 // Dest is the browser fetch destination a transport is imitating.
@@ -93,6 +101,13 @@ func (d Dest) headerPairs() map[string]string {
 
 // RoundTrip implements http.RoundTripper.
 func (t *BrowserTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Before any decoration, and before anything that can return
+	// early with an error: the tally counts requests ISSUED, which is
+	// the number the Phase 2b criteria are written in. Record ignores
+	// non-API URLs itself, so asset traffic does not inflate it.
+	if t.Counter != nil && req.URL != nil {
+		t.Counter.Record(req.URL.String())
+	}
 	if (req.URL != nil && isSlackHost(req.URL.Host)) || isSlackHost(req.Host) {
 		// Clone the request so we don't mutate the caller's copy — net/http's
 		// RoundTripper contract forbids in-place modification.

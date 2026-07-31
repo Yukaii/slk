@@ -1657,3 +1657,115 @@ func TestSendsXModeGuardHoldsWhenTheTablesStopNesting(t *testing.T) {
 		}
 	}
 }
+
+func TestBrowserTransport_RecordsToCounter(t *testing.T) {
+	// The transport is the single chokepoint under both slack-go and
+	// the hand-rolled postForm path, so attaching a Counter here is
+	// what makes Phase 2b's call-count criteria measurable at all.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+
+	var counter Counter
+	client := &http.Client{Transport: &BrowserTransport{
+		Inner:   http.DefaultTransport,
+		Counter: &counter,
+	}}
+
+	for _, path := range []string{"/api/conversations.history", "/api/conversations.history", "/api/client.counts"} {
+		req, err := http.NewRequest("POST", srv.URL+path, strings.NewReader("token=xoxc-abc"))
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		req.Host = "slack.com"
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("Do(%s): %v", path, err)
+		}
+		resp.Body.Close()
+	}
+
+	got := counter.Snapshot()
+	if got["conversations.history"] != 2 {
+		t.Errorf("conversations.history = %d; want 2 (full: %v)", got["conversations.history"], got)
+	}
+	if got["client.counts"] != 1 {
+		t.Errorf("client.counts = %d; want 1 (full: %v)", got["client.counts"], got)
+	}
+	if counter.Total() != 3 {
+		t.Errorf("Total() = %d; want 3 (full: %v)", counter.Total(), got)
+	}
+}
+
+func TestBrowserTransport_NilCounterDoesNotPanic(t *testing.T) {
+	// Counter is opt-in: every pre-existing construction site omits it,
+	// and the zero value of the field is a nil *Counter.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: &BrowserTransport{Inner: http.DefaultTransport}}
+	req, err := http.NewRequest("GET", srv.URL+"/api/client.counts", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Host = "slack.com"
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+}
+
+func TestBrowserTransport_RecordsRequestsThatFail(t *testing.T) {
+	// The tally counts requests ISSUED, not requests that succeeded.
+	// A boot that fires 60 conversations.history calls and gets
+	// rate-limited on half of them still issued 60, and that is the
+	// number the success criteria are about. This is what pins the
+	// Record call to the TOP of RoundTrip rather than somewhere after
+	// the envelope work, which can return early with an error.
+	var counter Counter
+	bt := &BrowserTransport{
+		Counter: &counter,
+		Inner: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, io.ErrUnexpectedEOF
+		}),
+	}
+	req, err := http.NewRequest("POST", "https://slack.com/api/conversations.history", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	if _, err := bt.RoundTrip(req); err == nil {
+		t.Fatal("RoundTrip returned nil error; the inner transport was supposed to fail")
+	}
+	if got := counter.Snapshot()["conversations.history"]; got != 1 {
+		t.Errorf("conversations.history = %d after a failed round trip; want 1 — "+
+			"the tally counts requests issued, not requests that succeeded", got)
+	}
+}
+
+func TestBrowserTransport_NilURLWithCounterDoesNotPanic(t *testing.T) {
+	// TestBrowserTransport_NilURLDoesNotPanic covers the same request
+	// shape but attaches no Counter, so it cannot reach the recording
+	// path. (*url.URL)(nil).String() dereferences its receiver, so a
+	// Counter without the nil guard turns the documented
+	// "RoundTrip called directly with a nil URL" case into a panic —
+	// a poor answer from a diagnostic that is supposed to be
+	// observing the process, not crashing it.
+	var counter Counter
+	bt := &BrowserTransport{
+		Counter: &counter,
+		Inner: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+		}),
+	}
+	req := &http.Request{Method: "POST", Host: "slack.com", Header: http.Header{}}
+
+	resp, err := bt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip with nil URL and a Counter: %v", err)
+	}
+	resp.Body.Close()
+	if got := counter.Total(); got != 0 {
+		t.Errorf("Total() = %d; want 0 — a request with no URL names no endpoint", got)
+	}
+}
