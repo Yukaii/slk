@@ -177,6 +177,12 @@ func newCookieHTTPClient(dCookie string, env *slackhttp.Envelope) *http.Client {
 		Transport: &slackhttp.BrowserTransport{
 			Inner: http.DefaultTransport,
 			Env:   env,
+			// This client carries the bulk of slk's API traffic, so
+			// without this the per-boot tally Phase 2b's success
+			// criteria are stated in would miss almost everything.
+			// NewBrowserHTTPClient attaches the same counter to the
+			// clients it builds; this literal has to opt in by hand.
+			Counter: slackhttp.DefaultCounter,
 		},
 		Jar: newCookieJar(dCookie),
 	}
