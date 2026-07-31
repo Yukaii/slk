@@ -131,6 +131,38 @@ func ids(prefix string, n int) map[string]int64 {
 	return m
 }
 
+// sortedIDs is a sorted copy, for comparing id sets whose order is
+// nondeterministic.
+//
+// Batch composition comes from ranging a Go map, so nothing may assert
+// which ids landed in which batch or in what order they appear inside
+// one. What is assertable is that a batch's id set and the set handed
+// alongside its response are the same set — hence sorting both sides
+// rather than pinning an order neither end controls.
+func sortedIDs(in []string) []string {
+	out := slices.Clone(in)
+	slices.Sort(out)
+	return out
+}
+
+// requestIDs is the sorted id set the nth (1-based) captured request
+// carried in updated_ids.
+func requestIDs(t *testing.T, reqs []capturedRequest, n int) []string {
+	t.Helper()
+	if n < 1 || n > len(reqs) {
+		t.Fatalf("asked for request %d but only %d were captured", n, len(reqs))
+	}
+	var out []string
+	for id := range reqs[n-1].updatedIDs(t) {
+		out = append(out, id)
+	}
+	slices.Sort(out)
+	if len(out) == 0 {
+		t.Fatalf("request %d carried no ids; an assertion against an empty batch proves nothing", n)
+	}
+	return out
+}
+
 // ---------------------------------------------------------------- channels
 
 func TestChannelsInfo_SendsUpdatedIDsAndDecodesResults(t *testing.T) {
@@ -535,6 +567,196 @@ func TestChannelsInfo_AccumulatesMembershipAcrossBatches(t *testing.T) {
 	}
 }
 
+// TestChannelsInfo_MembershipQueriedCoversOnlyBatchesThatReported is
+// the bug MembershipQueried exists to make impossible.
+//
+// member_channels is absent from 13 of the 18 observed channels/info
+// responses, every one of which asked for it — so a call whose batches
+// disagree is the expected case, not a corner. Accumulating across
+// them leaves a MemberChannels that is non-empty, and therefore looks
+// authoritative, while holding no answer at all for the silent batch's
+// ids. A caller applying that against the full queried set clears
+// membership for every one of them.
+//
+// So the result has to say which ids it actually covers. Batch 2 here
+// stays silent and its ids must be absent from MembershipQueried even
+// though batches 1 and 3 reported.
+func TestChannelsInfo_MembershipQueriedCoversOnlyBatchesThatReported(t *testing.T) {
+	rec := newRecorder(t, func(n int) (int, string) {
+		if n == 2 {
+			return 200, `{"ok":true,"results":[]}`
+		}
+		return 200, fmt.Sprintf(`{"ok":true,"results":[],"member_channels":["M%d"]}`, n)
+	})
+	c := rec.client()
+
+	got, err := c.ChannelsInfo(context.Background(), ids("C", channelsInfoBatchSize*2+10))
+	if err != nil {
+		t.Fatalf("ChannelsInfo: %v", err)
+	}
+	reqs := rec.requests()
+	if len(reqs) != 3 {
+		t.Fatalf("made %d requests; want 3", len(reqs))
+	}
+
+	// The reporting batches, and only those.
+	want := append(requestIDs(t, reqs, 1), requestIDs(t, reqs, 3)...)
+	slices.Sort(want)
+	if gotQueried := sortedIDs(got.MembershipQueried); !slices.Equal(gotQueried, want) {
+		t.Errorf("MembershipQueried covers %d ids; want the %d ids sent in batches 1 and 3\n"+
+			" got: %v\nwant: %v", len(gotQueried), len(want), gotQueried, want)
+	}
+	// Spelled out separately from the set equality above, because
+	// this is the specific failure that clears a user out of channels
+	// they are still in.
+	for _, id := range requestIDs(t, reqs, 2) {
+		if slices.Contains(got.MembershipQueried, id) {
+			t.Fatalf("MembershipQueried contains %s, which was sent in batch 2 — the batch "+
+				"whose response carried no member_channels. Membership is unknown for that "+
+				"id, and claiming otherwise clears it.", id)
+		}
+	}
+	// And the membership that *was* reported still accumulates.
+	if want := []string{"M1", "M3"}; !slices.Equal(got.MemberChannels, want) {
+		t.Errorf("MemberChannels = %v; want %v", got.MemberChannels, want)
+	}
+}
+
+// TestChannelsInfo_SurfacesFailedIDsWithoutMemberChannels keeps the
+// two top-level keys independent.
+//
+// They are independent on the wire — failed_ids appears in 4 of 18
+// observed responses and member_channels in 5, and nothing ties the
+// two — but the membership-presence check is an early return in the
+// merge closure, which puts every other accumulator at risk of being
+// stranded behind it. This is not hypothetical: writing that closure
+// with the FailedIDs append below the guard passes the entire rest of
+// this file, because every other fixture that carries failed_ids also
+// carries member_channels.
+//
+// The consequence is the exact hazard FailedIDs exists to prevent. An
+// unreported failure is indistinguishable from an unchanged channel,
+// so its stale record is marked fresh and never revalidated again.
+func TestChannelsInfo_SurfacesFailedIDsWithoutMemberChannels(t *testing.T) {
+	rec := newRecorder(t, func(int) (int, string) {
+		return 200, `{"ok":true,"results":[],"failed_ids":["C092E63RUUCX","C0B0QD6BH1N"]}`
+	})
+	c := rec.client()
+
+	got, err := c.ChannelsInfo(context.Background(), map[string]int64{
+		"C092E63RUUCX": 44,
+		"C0B0QD6BH1N":  55,
+	})
+	if err != nil {
+		t.Fatalf("ChannelsInfo: %v", err)
+	}
+	if want := []string{"C092E63RUUCX", "C0B0QD6BH1N"}; !slices.Equal(got.FailedIDs, want) {
+		t.Errorf("FailedIDs = %v; want %v. This response carried no member_channels, which "+
+			"says nothing about whether it carried failures — a failed id dropped here is "+
+			"marked fresh and its stale record kept forever", got.FailedIDs, want)
+	}
+	// The membership half is still unreported, which is what makes
+	// this a distinct case rather than a copy of the test above.
+	if len(got.MembershipQueried) != 0 {
+		t.Errorf("MembershipQueried = %v; want empty", got.MembershipQueried)
+	}
+}
+
+// TestChannelsInfo_AbsentMemberChannelsCoversNoIDs pins the "no
+// information" half of the presence contract. The dominant shape —
+// 13 of 18 — is a response with no member_channels key at all, and a
+// call that only saw those has learned nothing about membership for
+// any id it sent.
+func TestChannelsInfo_AbsentMemberChannelsCoversNoIDs(t *testing.T) {
+	rec := newRecorder(t, alwaysEmpty) // {"results":[],"ok":true}
+	c := rec.client()
+
+	got, err := c.ChannelsInfo(context.Background(), map[string]int64{
+		"C2QPK1V44":   11,
+		"CL0AET1L0":   22,
+		"C092E63RUUC": 33,
+	})
+	if err != nil {
+		t.Fatalf("ChannelsInfo: %v", err)
+	}
+	if len(got.MembershipQueried) != 0 {
+		t.Errorf("MembershipQueried = %v; want empty. member_channels was absent, so the "+
+			"response answered nothing about membership and covering these ids would "+
+			"turn silence into 'not a member'", got.MembershipQueried)
+	}
+}
+
+// TestChannelsInfo_ExplicitlyEmptyMemberChannelsCoversTheWholeBatch is
+// the other half, and the reason this needs more than a len() check on
+// the wire.
+//
+// encoding/json decodes an absent key and a literal [] to the same nil
+// slice, so a plain []string cannot tell "the server said nothing"
+// from "the server looked and named nobody". Those are opposite
+// answers: the first must preserve every id's membership, the second
+// must clear it. The batch was still covered.
+func TestChannelsInfo_ExplicitlyEmptyMemberChannelsCoversTheWholeBatch(t *testing.T) {
+	rec := newRecorder(t, func(int) (int, string) {
+		return 200, `{"ok":true,"results":[],"member_channels":[]}`
+	})
+	c := rec.client()
+
+	queried := map[string]int64{
+		"C2QPK1V44":   11,
+		"CL0AET1L0":   22,
+		"C092E63RUUC": 33,
+	}
+	got, err := c.ChannelsInfo(context.Background(), queried)
+	if err != nil {
+		t.Fatalf("ChannelsInfo: %v", err)
+	}
+	if len(got.MemberChannels) != 0 {
+		t.Errorf("MemberChannels = %v; want empty — the response named nobody",
+			got.MemberChannels)
+	}
+	var want []string
+	for id := range queried {
+		want = append(want, id)
+	}
+	slices.Sort(want)
+	if gotQueried := sortedIDs(got.MembershipQueried); !slices.Equal(gotQueried, want) {
+		t.Errorf("MembershipQueried = %v; want %v. member_channels was present and empty, "+
+			"which is a real answer — every queried id is a confirmed non-member — and "+
+			"reading it as 'absent' throws that answer away", gotQueried, want)
+	}
+}
+
+// TestChannelsInfo_MembershipQueriedHoldsIDsSentNotIDsReturned pins
+// which of the two id sets in play this field carries. It records
+// coverage — what the request asked about — not the answer. Filling it
+// from member_channels would make it a duplicate of that field and
+// leave the non-members and the failures uncovered, which is precisely
+// the information a caller needs in order to clear anything.
+func TestChannelsInfo_MembershipQueriedHoldsIDsSentNotIDsReturned(t *testing.T) {
+	rec := newRecorder(t, func(int) (int, string) {
+		return 200, `{"ok":true,"results":[],
+			"member_channels":["CL0AET1L0"],
+			"failed_ids":["C092E63RUUC"]}`
+	})
+	c := rec.client()
+
+	got, err := c.ChannelsInfo(context.Background(), map[string]int64{
+		"C2QPK1V44":   11, // reported on, named nowhere: a non-member
+		"CL0AET1L0":   22, // a member
+		"C092E63RUUC": 33, // a failure
+	})
+	if err != nil {
+		t.Fatalf("ChannelsInfo: %v", err)
+	}
+	want := []string{"C092E63RUUC", "CL0AET1L0", "C2QPK1V44"}
+	slices.Sort(want)
+	if gotQueried := sortedIDs(got.MembershipQueried); !slices.Equal(gotQueried, want) {
+		t.Errorf("MembershipQueried = %v; want all %v — the ids the batch SENT, including "+
+			"the non-member and the failed lookup, not the ids member_channels returned",
+			gotQueried, want)
+	}
+}
+
 // TestChannelsInfo_AllAccumulatorsPreserveRequestOrder pins ordering
 // for every accumulator on the channels path, not just one of them.
 //
@@ -783,7 +1005,8 @@ func TestChannelsInfo_PropagatesAPIError(t *testing.T) {
 	if !strings.Contains(err.Error(), "invalid_auth") {
 		t.Errorf("error = %v; want it to mention invalid_auth", err)
 	}
-	if got.Channels != nil || got.MemberChannels != nil || got.FailedIDs != nil {
+	if got.Channels != nil || got.MemberChannels != nil || got.FailedIDs != nil ||
+		got.MembershipQueried != nil {
 		t.Errorf("got = %+v; want a zero result alongside an error", got)
 	}
 }
@@ -814,7 +1037,8 @@ func TestChannelsInfo_MidBatchErrorAbortsAndDiscardsPartialResults(t *testing.T)
 	// Membership and failures accumulated by the first batch must be
 	// discarded too: a partial membership snapshot read as a complete
 	// one turns every unqueried channel into a non-membership.
-	if got.Channels != nil || got.MemberChannels != nil || got.FailedIDs != nil {
+	if got.Channels != nil || got.MemberChannels != nil || got.FailedIDs != nil ||
+		got.MembershipQueried != nil {
 		t.Errorf("got = %+v; want a zero result — partial results would look like "+
 			"'only these changed' and strand the unfetched ids", got)
 	}
@@ -1097,7 +1321,7 @@ func TestFetchInfo_DoesNotMergeAnErroredBatch(t *testing.T) {
 	err := fetchInfo(context.Background(), c, "channels/info",
 		map[string]any{"check_membership": true},
 		ids("C", channelsInfoBatchSize*2+10), channelsInfoBatchSize,
-		func(batch channelsInfoResponse) { merged = append(merged, batch) })
+		func(batch channelsInfoResponse, _ []string) { merged = append(merged, batch) })
 	if err == nil {
 		t.Fatal("fetchInfo returned nil error when the second batch failed to decode")
 	}
@@ -1112,6 +1336,61 @@ func TestFetchInfo_DoesNotMergeAnErroredBatch(t *testing.T) {
 				t.Errorf("merge %d received %+v; that row came from a response that failed "+
 					"to decode and must not be accumulated", i, ch)
 			}
+		}
+	}
+}
+
+// TestFetchInfo_HandsMergeTheIDsThatBatchSent pins the plumbing that
+// makes ChannelsInfoResult.MembershipQueried possible.
+//
+// A per-batch response can only answer about the ids that batch sent,
+// so merge has to be told which those were. Handing it the whole
+// updatedIDs map instead, or the previous batch's ids, produces a
+// result that looks batch-scoped and is not — and every assertion that
+// goes through ChannelsInfo would still pass in the single-batch case.
+// So this drives fetchInfo directly and checks all three batches.
+//
+// Each slice is retained exactly as handed over — deliberately not
+// copied — and every one of them is only checked after the last batch
+// has run. That is the second half of the contract: fetchInfo promises
+// a freshly allocated slice per batch that it keeps no reference to,
+// so a merge implementation may hold on to it.
+//
+// Copying inside merge would hide a violation of that promise. It very
+// nearly did: an earlier version of this test called sortedIDs() on
+// the way in, and a fetchInfo that filled one reused buffer per call
+// instead of allocating per batch passed the whole suite. Both merge
+// implementations in this package happen to copy on receipt, so
+// nothing observable broke — until some future one does not.
+func TestFetchInfo_HandsMergeTheIDsThatBatchSent(t *testing.T) {
+	rec := newRecorder(t, alwaysEmpty)
+	c := rec.client()
+
+	var seen [][]string
+	err := fetchInfo(context.Background(), c, "channels/info",
+		map[string]any{"check_membership": true},
+		ids("C", channelsInfoBatchSize*2+10), channelsInfoBatchSize,
+		func(_ channelsInfoResponse, queried []string) {
+			seen = append(seen, queried)
+		})
+	if err != nil {
+		t.Fatalf("fetchInfo: %v", err)
+	}
+
+	reqs := rec.requests()
+	if len(reqs) != 3 {
+		t.Fatalf("made %d requests; want 3", len(reqs))
+	}
+	if len(seen) != 3 {
+		t.Fatalf("merge ran %d times; want 3", len(seen))
+	}
+	for i := range reqs {
+		want := requestIDs(t, reqs, i+1)
+		// sortedIDs sorts a clone. Sorting seen[i] in place would
+		// scramble the very aliasing this test is here to detect.
+		if got := sortedIDs(seen[i]); !slices.Equal(got, want) {
+			t.Errorf("merge %d was handed %d ids; want the %d ids request %d actually sent\n"+
+				" got: %v\nwant: %v", i+1, len(got), len(want), i+1, got, want)
 		}
 	}
 }

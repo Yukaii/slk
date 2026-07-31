@@ -3,6 +3,7 @@ package edge
 import (
 	"context"
 	"maps"
+	"slices"
 )
 
 // Batch sizes for the conditional-revalidation endpoints.
@@ -149,10 +150,35 @@ type ChannelsInfoResult struct {
 	// all 5 observed responses carrying it had `"results":[]` — so it
 	// is learned without ever enumerating.
 	//
-	// It is a snapshot over the ids this call sent, not a delta. An id
-	// that was sent and is absent here is one the user is not a member
-	// of; an id that was never sent says nothing either way.
+	// It is a snapshot, not a delta, and it is authoritative for
+	// exactly the ids in MembershipQueried and no others. Within that
+	// set, an id absent from here is one the user is not a member of.
+	// An id outside it — never sent, or sent in a batch whose response
+	// stayed silent — says nothing either way, and MemberChannels
+	// being non-empty does not change that. Read the two fields
+	// together or not at all.
 	MemberChannels []string
+	// MembershipQueried holds the ids that were sent in batches whose
+	// response carried member_channels. Membership is authoritative
+	// for exactly these ids and no others.
+	//
+	// This exists because member_channels is absent from 13 of the 18
+	// observed channels/info responses, all of which requested it —
+	// so "absent" must mean "no information", not "none are members".
+	// Accumulating across batches would otherwise produce a result
+	// that looks authoritative while holding no answer for the ids in
+	// a batch that stayed silent, and a caller applying it against the
+	// full queried set would clear membership for all of them.
+	//
+	// Empty here therefore means "this call learned nothing about
+	// membership", which is the common outcome, not an error. Non-empty
+	// alongside an empty MemberChannels is also a real answer — the
+	// server looked and named nobody — and is exactly the case a
+	// len(MemberChannels) > 0 test gets backwards.
+	//
+	// Ids appear in batch order; within a batch the order is whatever
+	// ranging the id map produced, and carries no meaning.
+	MembershipQueried []string
 	// FailedIDs holds the ids the server could not resolve. Ignoring
 	// this is a correctness hazard rather than a lost nicety: absence
 	// from Channels otherwise means "unchanged, still fresh", so a
@@ -165,11 +191,28 @@ type ChannelsInfoResult struct {
 // channelsInfoResponse is one channels/info batch on the wire.
 //
 // member_channels and failed_ids are each absent from most responses
-// (observed 5/18 and 4/18 respectively). Absence decodes to a nil
-// slice and means empty, never an error.
+// (observed 5/18 and 4/18 respectively). Absence is not an error.
+//
+// MemberChannels is a *[]string rather than a []string, and that is
+// the whole point of this type. encoding/json decodes an absent key
+// and a literal [] to the identical nil slice, but they are opposite
+// answers: absent means the server said nothing about membership and
+// every queried id must keep what it had, while [] means the server
+// looked and named nobody, so every queried id is a confirmed
+// non-member. A plain []string cannot express that difference, so a
+// caller is left inferring presence from len() — which reads an empty
+// report as silence and quietly leaves stale join flags behind.
+//
+// A pointer is the smallest thing that distinguishes them: nil for
+// absent, non-nil for present, with the element count carrying the
+// answer. `"member_channels":null` also lands on nil, which is
+// correct — a null is no more an answer than an absent key.
+//
+// FailedIDs stays a plain []string deliberately. Nothing is inferred
+// from its emptiness: an id is either named as failed or it is not.
 type channelsInfoResponse struct {
 	Results        []Channel `json:"results"`
-	MemberChannels []string  `json:"member_channels"`
+	MemberChannels *[]string `json:"member_channels"`
 	FailedIDs      []string  `json:"failed_ids"`
 }
 
@@ -189,10 +232,24 @@ func (c *Client) ChannelsInfo(ctx context.Context, updatedIDs map[string]int64) 
 	var out ChannelsInfoResult
 	err := fetchInfo(ctx, c, "channels/info", map[string]any{
 		"check_membership": true,
-	}, updatedIDs, channelsInfoBatchSize, func(batch channelsInfoResponse) {
+	}, updatedIDs, channelsInfoBatchSize, func(batch channelsInfoResponse, queried []string) {
 		out.Channels = append(out.Channels, batch.Results...)
-		out.MemberChannels = append(out.MemberChannels, batch.MemberChannels...)
+		// Accumulated above the membership guard, deliberately.
+		// failed_ids and member_channels are independent keys — 4 of
+		// 18 and 5 of 18 observed responses — so a batch can report
+		// failures and no membership, and stranding these behind an
+		// early return loses them silently. See
+		// TestChannelsInfo_SurfacesFailedIDsWithoutMemberChannels.
 		out.FailedIDs = append(out.FailedIDs, batch.FailedIDs...)
+		// Guarded on presence, not on content. A batch that reported
+		// an empty member_channels still answered about its ids, and
+		// a batch that reported nothing must not have its ids claimed
+		// — see ChannelsInfoResult.MembershipQueried.
+		if batch.MemberChannels == nil {
+			return
+		}
+		out.MemberChannels = append(out.MemberChannels, *batch.MemberChannels...)
+		out.MembershipQueried = append(out.MembershipQueried, queried...)
 	})
 	if err != nil {
 		return ChannelsInfoResult{}, err
@@ -223,7 +280,12 @@ func (c *Client) UsersInfo(ctx context.Context, updatedIDs map[string]int64) ([]
 	err := fetchInfo(ctx, c, "users/info", map[string]any{
 		"check_interaction":          true,
 		"include_profile_only_users": true,
-	}, updatedIDs, usersInfoBatchSize, func(batch usersInfoResponse) {
+	}, updatedIDs, usersInfoBatchSize, func(batch usersInfoResponse, _ []string) {
+		// The queried id set is discarded. users/info has no
+		// membership analogue, and nothing else on that response is
+		// scoped to the ids it was asked about, so there is nothing
+		// here to attribute — the parameter exists for channels/info's
+		// sake and rides along on the shared helper.
 		out = append(out, batch.Results...)
 	})
 	if err != nil {
@@ -254,8 +316,25 @@ func (c *Client) UsersInfo(ctx context.Context, updatedIDs map[string]int64) ([]
 // merge closure where it is plain to read. So the generic earns its
 // place, just on a different axis than before.
 //
-// merge is called once per successful batch, in request order, and
-// never after an error. A failed batch fails the whole call and the
+// merge is called once per successful batch, in request order, with
+// the decoded response and the ids that batch sent, and never after an
+// error.
+//
+// That second argument is what lets a caller attribute a per-batch
+// answer to the right ids. channels/info needs it: member_channels is
+// scoped to the batch that asked, and is absent from 13 of 18 observed
+// responses, so a caller accumulating across batches must be able to
+// record which ids a reporting batch actually covered. Passing it to
+// every merge keeps that out of a per-endpoint branch — the
+// `endpoint == "channels/info"` comparison this design already
+// rejected once — and users/info simply ignores it.
+//
+// The slice is freshly allocated per batch and handed over: fetchInfo
+// keeps no reference and never mutates it, so merge may retain it. Its
+// order is whatever ranging the id map produced and means nothing;
+// only the set does.
+//
+// A failed batch fails the whole call and the
 // caller discards what already merged: returning partial results with
 // a nil error would be indistinguishable from "only these entries
 // changed", so a caller would mark the unfetched ids current and never
@@ -277,7 +356,7 @@ func fetchInfo[Resp any](
 	flags map[string]any,
 	updatedIDs map[string]int64,
 	batchSize int,
-	merge func(Resp),
+	merge func(Resp, []string),
 ) error {
 	batch := make(map[string]int64, min(batchSize, len(updatedIDs)))
 
@@ -286,11 +365,25 @@ func fetchInfo[Resp any](
 		maps.Copy(payload, flags)
 		payload["updated_ids"] = batch
 
+		// A fresh slice of the batch's keys, taken before the request
+		// goes out, for two reasons.
+		//
+		// Handing over batch itself would tie merge to a map whose
+		// lifetime is tangled with the request body's — payload holds
+		// the same map, and batch is replaced below.
+		//
+		// And slices.Collect allocates per batch rather than filling
+		// one reused buffer, which matters more than it looks:
+		// reusing a buffer is invisible today because both merge
+		// implementations copy on receipt, and would silently corrupt
+		// any future one that retains what it is handed.
+		queried := slices.Collect(maps.Keys(batch))
+
 		var resp Resp
 		if err := c.call(ctx, endpoint, payload, &resp); err != nil {
 			return err
 		}
-		merge(resp)
+		merge(resp, queried)
 		// A fresh map rather than clear(): payload still references
 		// this one. clear() happens to be safe today only because
 		// call marshals the body synchronously before returning — no
