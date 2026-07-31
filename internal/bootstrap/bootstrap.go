@@ -106,6 +106,21 @@ type Store interface {
 	ChannelVersions(workspaceID string) (map[string]int64, error)
 	UserVersions(workspaceID string) (map[string]int64, error)
 	ApplyMembership(workspaceID string, queriedIDs, memberIDs []string) error
+
+	// MessageVersions returns {ts: version} for the messages slk
+	// already holds in one channel — the cached_latest_updates the
+	// conversations.history fallback sends so the server can return
+	// only what changed.
+	//
+	// ONE argument, deliberately, where cache.MessageVersions takes
+	// (channelID, oldestTS, latestTS). The window is the Task 7
+	// adapter's job because it is a property of the request being
+	// made, not of the cache: an unbounded window puts an arbitrarily
+	// large map into a request body, which is both a slow request and
+	// exactly the sort of outlier Grid's anomaly detection scores.
+	// Widening this to three arguments would push that choice out to
+	// every caller and invite "" / "9".
+	MessageVersions(channelID string) (map[string]string, error)
 }
 
 // Unread is one channel's unread state from client.counts.
@@ -212,6 +227,51 @@ type Result struct {
 	// workspace with nothing unread — deliberately, since the failure
 	// is logged and the difference is cosmetic.
 	Counts Counts
+
+	// OpenedChannelID is the conversation Messages belongs to. It is
+	// always the channel that was ASKED for (Deps.OpenChannelID) and
+	// never the id the server answered with — see openChannel: when
+	// those two disagree the response is discarded, so reporting the
+	// server's value would name a conversation whose messages are not
+	// here.
+	//
+	// Empty means no channel was opened.
+	OpenedChannelID string
+
+	// Messages is the opened channel's history, newest-window-first as
+	// Slack sends it. Raw for the reasons boot.History.Messages
+	// documents; both the conversations.view and the
+	// conversations.history path land here.
+	Messages []json.RawMessage
+
+	// HasMore reports whether the returned window was truncated, i.e.
+	// whether there is older scrollback to page to.
+	HasMore bool
+
+	// UnchangedTS and LatestUpdates are the incremental-sync
+	// bookkeeping from the conversations.history fallback:
+	// UnchangedTS lists the cached timestamps the server confirms are
+	// still current, LatestUpdates is the {ts: version} map to send
+	// back as cached_latest_updates next time.
+	//
+	// Both are empty on the conversations.view path, which sends no
+	// cached_latest_updates and so returns no verdict on them.
+	UnchangedTS   []string
+	LatestUpdates map[string]string
+
+	// Users, ViewChannels and Emojis are the sections
+	// conversations.view returns ALONGSIDE the history: the message
+	// authors (replacing a per-author users.info fan-out), the
+	// conversations those messages mention, and the custom emoji they
+	// use (replacing emoji.list).
+	//
+	// All three are empty on the conversations.history fallback, which
+	// returns messages and nothing else. That is the real cost of the
+	// fallback and the reason conversations.view is tried first: on
+	// that path the caller has to resolve authors and emoji itself.
+	Users        []boot.User
+	ViewChannels []boot.ViewChannelEntry
+	Emojis       map[string]string
 }
 
 // Deps is everything Run needs. Every field is required unless its
@@ -287,5 +347,106 @@ func Run(ctx context.Context, deps Deps) (*Result, error) {
 		out.Counts = counts
 	}
 
+	// The first channel. Counts comes first because it is what tells
+	// the UI this channel has unreads, and the history that lands
+	// below is what gets rendered against that state.
+	if deps.OpenChannelID != "" {
+		if err := checkOpenChannelDeps(deps); err != nil {
+			return nil, err
+		}
+		// Set from what was ASKED for, before the call, so that no
+		// path can report a channel other than the one requested.
+		out.OpenedChannelID = deps.OpenChannelID
+		if err := openChannel(ctx, deps, out, logf); err != nil {
+			// Fatal: both paths to the channel failed. Returning nil
+			// here would render an EMPTY channel, which looks exactly
+			// like a quiet one.
+			return nil, fmt.Errorf("bootstrap: opening %s: %w", deps.OpenChannelID, err)
+		}
+	}
+
 	return out, nil
+}
+
+// checkOpenChannelDeps rejects the nil interfaces opening a channel
+// needs, for the same reason Run checks Boot and Counts: Deps is built
+// field by field at a call site, and a forgotten field is a nil
+// interface whose first method call panics.
+//
+// History and Store are required even though the conversations.view
+// success path never touches them. A boot that works only while the
+// UNVERIFIED primary path keeps working is the failure this whole task
+// is about: the fallback has to be wired before it is needed, not
+// discovered missing at the moment Slack ignores the channel param.
+func checkOpenChannelDeps(deps Deps) error {
+	switch {
+	case deps.View == nil:
+		return errors.New("bootstrap: Deps.View is required to open a channel")
+	case deps.History == nil:
+		return errors.New("bootstrap: Deps.History is required to open a channel")
+	case deps.Store == nil:
+		return errors.New("bootstrap: Deps.Store is required to open a channel")
+	}
+	return nil
+}
+
+// openChannel loads the first channel's history, preferring
+// conversations.view and falling back to conversations.history.
+//
+// The `channel` param on conversations.view is UNVERIFIED: no captured
+// request carried one, and the client got back whatever it had last
+// viewed. So the response's Channel.ID is compared to what was asked
+// for, and a mismatch is treated exactly like an error. Skipping that
+// comparison means rendering another conversation's messages under
+// this channel's name, with nothing anywhere reporting a problem.
+//
+// The fallback is conversations.history with cached_latest_updates,
+// which IS fully verified (14 of 14 captured requests) — not a plain
+// history fetch, which would re-download scrollback slk already holds.
+// On Enterprise Grid, where conversations.view was never captured at
+// all, the fallback may well be the ordinary path.
+func openChannel(ctx context.Context, deps Deps, out *Result, logf func(string, ...any)) error {
+	want := deps.OpenChannelID
+
+	view, err := deps.View.ConversationsView(ctx, want)
+	switch {
+	case err != nil:
+		logf("bootstrap: conversations.view failed (%v); falling back to conversations.history", err)
+	case view == nil:
+		// Not something Slack can send — boot.ConversationsView
+		// returns nil only alongside an error — but it is what a
+		// mis-written adapter returns, and dereferencing it takes the
+		// whole TUI down.
+		logf("bootstrap: conversations.view returned no result; falling back to conversations.history")
+	case view.Channel.ID != want: // ViewChannel embeds boot.Channel, so .ID resolves through it
+		logf("bootstrap: conversations.view ignored the channel param (asked %s, got %s); falling back to conversations.history",
+			want, view.Channel.ID)
+	default:
+		out.Messages = view.History.Messages
+		out.Users = view.Users
+		out.ViewChannels = view.Channels
+		out.Emojis = view.Emojis
+		out.HasMore = view.History.HasMore
+		return nil
+	}
+
+	cached, err := deps.Store.MessageVersions(want)
+	if err != nil {
+		// Not fatal: an empty map means "we vouch for nothing", which
+		// is the shape the client sends when it holds nothing. The
+		// value returned next to the error is discarded — vouching for
+		// versions slk does not hold makes the server withhold
+		// messages slk never received.
+		logf("bootstrap: reading cached message versions for %s: %v", want, err)
+		cached = nil
+	}
+	hist, err := deps.History.HistoryWithVersions(ctx, want, cached)
+	if err != nil {
+		return err
+	}
+	out.Messages = hist.Messages
+	out.HasMore = hist.HasMore
+	out.UnchangedTS = hist.UnchangedTS
+	out.LatestUpdates = hist.LatestUpdates
+	return nil
 }

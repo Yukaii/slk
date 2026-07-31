@@ -18,6 +18,8 @@ import (
 const (
 	callUserBoot = "client.userBoot"
 	callCounts   = "client.counts"
+	callView     = "conversations.view"
+	callHistory  = "conversations.history"
 )
 
 // cannedBootResult is the userBoot response every test runs against.
@@ -166,6 +168,131 @@ func cannedCounts() Counts {
 	}
 }
 
+// cannedViewResult is the conversations.view response the fake returns.
+//
+// Distinct, non-zero in every section for the reason cannedBootResult
+// gives, and with one extra hazard of its own: Users, Channels and
+// Emojis are three SEPARATE fields that openChannel copies in three
+// separate statements, so a fixture where two of them shared a value
+// would hide a dropped one. They have different Go types, so a swap
+// would not compile — a DROP is the whole mutation space here, and a
+// drop is only visible against a non-empty expectation.
+//
+// Channel.ID is left empty on purpose: the fake stamps it from
+// f.viewChannelID, which is the knob every test in this file turns to
+// say "the server honoured the channel param" or "it did not".
+func cannedViewResult() *boot.ViewResult {
+	return &boot.ViewResult{
+		History: boot.History{
+			Messages: []json.RawMessage{
+				json.RawMessage(`{"ts":"1700000010.000100","user":"U_ALICE","text":"from conversations.view"}`),
+				json.RawMessage(`{"ts":"1700000011.000100","user":"U_BOB","text":"also from conversations.view"}`),
+			},
+			HasMore:            true,
+			MutationTimestamps: boot.MutationTimestamps{Latest: "1783337533019174", Updated: "1783337533019175", HistoryInvalid: "1783337533019176"},
+			NextTS:             1700000009,
+		},
+		Users: []boot.User{
+			{
+				ID: "U_ALICE", TeamID: "T_HOME", Name: "alice", RealName: "Alice Toplevel",
+				Version: 1783337533030, IsBot: true,
+				Profile: boot.UserProfile{RealName: "Alice Profile", DisplayName: "alice-display", AvatarHash: "alicehash"},
+			},
+			{
+				ID: "U_BOB", TeamID: "T_OTHER", Name: "bob", RealName: "Bob Toplevel",
+				Version: 1783337533031, Deleted: true, IsAppUser: true,
+				Profile: boot.UserProfile{RealName: "Bob Profile", DisplayName: "bob-display", AvatarHash: "bobhash"},
+			},
+		},
+		Bots: []json.RawMessage{json.RawMessage(`{"id":"B_BOT"}`)},
+		Channels: []boot.ViewChannelEntry{
+			{
+				Channel:  boot.Channel{ID: "C_MENTIONED", Name: "mentioned", Version: 1783337533032},
+				IsMember: true, LastRead: "1700000003.000300",
+				UnreadCount: 4, UnreadCountDisplay: 2,
+			},
+			{
+				Channel:  boot.Channel{ID: "C_MENTIONED_2", Name: "mentioned-two", Version: 1783337533033},
+				LastRead: "1700000004.000400",
+				Latest:   json.RawMessage(`{"ts":"1700000004.000400"}`),
+				// Distinct from each other AND from the entry above:
+				// all four unread ints are freely swappable if any two
+				// of them share a value.
+				UnreadCount: 9, UnreadCountDisplay: 6,
+			},
+		},
+		Emojis: map[string]string{
+			"party-parrot": "https://emoji.example.invalid/party-parrot.gif",
+			"shipit":       "https://emoji.example.invalid/shipit.png",
+		},
+		ResponseMetadata: boot.ViewResponseMetadata{NextCursor: "next-cursor-value"},
+	}
+}
+
+// poisonedViewResult is what the fake returns ALONGSIDE a view error,
+// and its Channel.ID is the channel that was ASKED FOR on purpose.
+//
+// Same reasoning as poisonedCounts, sharpened: a nil result next to the
+// error would make "ignore the view error" a mutant that dies on a nil
+// dereference, which is a crash rather than a test failure and tells a
+// reader nothing. A fully populated result whose channel id MATCHES
+// makes the mutant take the success path and copy these messages onto
+// the Result, where an assertion can see it. Slack returns a populated
+// body next to ok:false, so this is the realistic shape too.
+func poisonedViewResult(channelID string) *boot.ViewResult {
+	res := cannedViewResult()
+	res.Channel.ID = channelID
+	res.History.Messages = []json.RawMessage{json.RawMessage(`{"ts":"9999999999.999999","text":"POISON from a failed conversations.view"}`)}
+	return res
+}
+
+// cannedHistory is the conversations.history fallback's response.
+//
+// Its messages differ from cannedViewResult's so that "Result.Messages
+// was filled from the other path" is a visible failure rather than a
+// coincidence, and HasMore is true on BOTH fixtures so that a dropped
+// assignment on either path is visible (a false there would be
+// indistinguishable from never assigning it).
+func cannedHistory() History {
+	return History{
+		Messages: []json.RawMessage{
+			json.RawMessage(`{"ts":"1700000020.000200","user":"U_ALICE","text":"from conversations.history"}`),
+		},
+		UnchangedTS:   []string{"1700000001.000100", "1700000002.000100"},
+		LatestUpdates: map[string]string{"1700000020.000200": "1783024685.163200"},
+		HasMore:       true,
+	}
+}
+
+// poisonedHistory is what the fake returns alongside a history error.
+func poisonedHistory() History {
+	return History{
+		Messages:      []json.RawMessage{json.RawMessage(`{"ts":"9999999999.999999","text":"POISON from a failed conversations.history"}`)},
+		UnchangedTS:   []string{"9999999999.999999"},
+		LatestUpdates: map[string]string{"9999999999.999999": "9999999999.999999"},
+		HasMore:       true,
+	}
+}
+
+// poisonedVersions is what the fake's MessageVersions returns alongside
+// an error: a map that must never reach the wire.
+func poisonedVersions() map[string]string {
+	return map[string]string{"9999999999.999999": "9999999999.999999"}
+}
+
+// rawStrings renders raw message bodies as text for failure messages.
+//
+// %#v on a []json.RawMessage prints every byte in hex, which turns a
+// one-line "wrong path's messages" failure into 40 lines a reader has
+// to decode by hand.
+func rawStrings(msgs []json.RawMessage) []string {
+	out := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, string(m))
+	}
+	return out
+}
+
 // fakeDeps is the whole test harness: it records an ordered call log,
 // returns the canned responses above, and injects a per-dependency
 // error.
@@ -184,6 +311,38 @@ type fakeDeps struct {
 	counts    Counts
 	countsErr error
 
+	// viewRes is the body conversations.view returns. Tests mutate it
+	// in place (HasMore, say) before calling Run.
+	viewRes *boot.ViewResult
+	// viewChannelID is stamped onto viewRes.Channel.ID at call time:
+	// equal to the requested channel means "the server honoured the
+	// unverified param", anything else means it did not.
+	viewChannelID string
+	// viewRequestedChannel is what Run actually sent as the channel
+	// param. "" is a real, distinct answer here — it is the captured
+	// request — so it cannot be conflated with "not called".
+	viewRequestedChannel string
+	viewErr              error
+	// viewNilResult makes the fake return (nil, nil), which is what a
+	// broken adapter looks like from inside Run.
+	viewNilResult bool
+
+	history                 History
+	historyErr              error
+	historyRequestedChannel string
+	historyCachedVersions   map[string]string
+
+	// cachedVersions is what the Store hands back for the opened
+	// channel, i.e. the messages slk already holds.
+	cachedVersions    map[string]string
+	cachedVersionsErr error
+	// messageVersionsFor records the channel the Store was asked
+	// about. Note MessageVersions is NOT recorded in calls: calls is
+	// an API-request log that TestRun_BootCallBudget counts against a
+	// 10-request budget, and a local cache read is not a request.
+	messageVersionsFor   string
+	messageVersionsCalls int
+
 	logs []string
 
 	deps Deps
@@ -193,11 +352,16 @@ func newFakeDeps() *fakeDeps {
 	f := &fakeDeps{
 		bootRes: cannedBootResult(),
 		counts:  cannedCounts(),
+		viewRes: cannedViewResult(),
+		history: cannedHistory(),
 	}
 	f.deps = Deps{
 		WorkspaceID: "T_HOME",
 		Boot:        f,
 		Counts:      f,
+		View:        f,
+		History:     f,
+		Store:       f,
 		Log:         f.log,
 	}
 	return f
@@ -287,6 +451,52 @@ func (f *fakeDeps) Counts(context.Context) (Counts, error) {
 	}
 	return f.counts, nil
 }
+
+func (f *fakeDeps) ConversationsView(_ context.Context, channelID string) (*boot.ViewResult, error) {
+	f.record(callView)
+	f.mu.Lock()
+	f.viewRequestedChannel = channelID
+	f.mu.Unlock()
+	if f.viewErr != nil {
+		return poisonedViewResult(channelID), f.viewErr
+	}
+	if f.viewNilResult {
+		return nil, nil
+	}
+	// ViewChannel embeds boot.Channel, so .ID resolves through it.
+	f.viewRes.Channel.ID = f.viewChannelID
+	return f.viewRes, nil
+}
+
+func (f *fakeDeps) HistoryWithVersions(_ context.Context, channelID string, cached map[string]string) (History, error) {
+	f.record(callHistory)
+	f.mu.Lock()
+	f.historyRequestedChannel = channelID
+	f.historyCachedVersions = cached
+	f.mu.Unlock()
+	if f.historyErr != nil {
+		return poisonedHistory(), f.historyErr
+	}
+	return f.history, nil
+}
+
+func (f *fakeDeps) MessageVersions(channelID string) (map[string]string, error) {
+	f.mu.Lock()
+	f.messageVersionsFor = channelID
+	f.messageVersionsCalls++
+	f.mu.Unlock()
+	if f.cachedVersionsErr != nil {
+		return poisonedVersions(), f.cachedVersionsErr
+	}
+	return f.cachedVersions, nil
+}
+
+// The remaining Store methods are unused until Task 6. They exist so
+// fakeDeps satisfies Store, and they record nothing for the same reason
+// MessageVersions does not: a cache read is not an API request.
+func (f *fakeDeps) ChannelVersions(string) (map[string]int64, error) { return nil, nil }
+func (f *fakeDeps) UserVersions(string) (map[string]int64, error)    { return nil, nil }
+func (f *fakeDeps) ApplyMembership(string, []string, []string) error { return nil }
 
 // prefixEqual reports whether got starts with want.
 //
@@ -534,6 +744,514 @@ func TestRun_CarriesCountsOntoTheResult(t *testing.T) {
 	res, err := Run(context.Background(), f.Deps())
 	if err != nil {
 		t.Fatalf("Run: %v", err)
+	}
+	if !reflect.DeepEqual(res.Counts, cannedCounts()) {
+		t.Errorf("Result.Counts = %#v; want %#v", res.Counts, cannedCounts())
+	}
+}
+
+func TestRun_OpensTheRequestedChannel(t *testing.T) {
+	f := newFakeDeps()
+	f.deps.OpenChannelID = "C_WANT"
+	f.viewChannelID = "C_WANT" // server honoured the param
+
+	res, err := Run(context.Background(), f.Deps())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if f.viewRequestedChannel != "C_WANT" {
+		t.Errorf("conversations.view was sent channel=%q; want C_WANT", f.viewRequestedChannel)
+	}
+	if res.OpenedChannelID != "C_WANT" {
+		t.Errorf("OpenedChannelID = %q; want C_WANT", res.OpenedChannelID)
+	}
+	if f.called(callHistory) {
+		t.Error("fell back to conversations.history even though view honoured the channel param")
+	}
+	if len(res.Messages) == 0 {
+		t.Error("no messages from conversations.view")
+	}
+}
+
+func TestRun_ViewPathCarriesEverySection(t *testing.T) {
+	// The point of conversations.view is that four sections arrive in
+	// ONE response: history, the users it references, the channels it
+	// references and the custom emoji it uses. Each is copied onto the
+	// Result by its own statement, so each is independently droppable
+	// while everything still compiles and every other test still
+	// passes — and a dropped Users section means the very users.info
+	// fan-out this phase exists to delete comes back at render time.
+	f := newFakeDeps()
+	f.deps.OpenChannelID = "C_WANT"
+	f.viewChannelID = "C_WANT"
+
+	res, err := Run(context.Background(), f.Deps())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := cannedViewResult()
+	for _, tc := range []struct {
+		field string
+		got   any
+		want  any
+	}{
+		{"Messages", rawStrings(res.Messages), rawStrings(want.History.Messages)},
+		{"HasMore", res.HasMore, want.History.HasMore},
+		{"Users", res.Users, want.Users},
+		{"ViewChannels", res.ViewChannels, want.Channels},
+		{"Emojis", res.Emojis, want.Emojis},
+	} {
+		if !reflect.DeepEqual(tc.got, tc.want) {
+			t.Errorf("Result.%s = %#v; want %#v", tc.field, tc.got, tc.want)
+		}
+	}
+}
+
+func TestRun_FallsBackWhenViewIgnoresTheChannelParam(t *testing.T) {
+	// The unverified-param failure mode. The server answers 200 with a
+	// perfectly good response for the WRONG conversation. Without the
+	// id comparison slk renders someone else's channel and nothing
+	// anywhere reports an error.
+	f := newFakeDeps()
+	f.deps.OpenChannelID = "C_WANT"
+	f.viewChannelID = "C_LASTVIEWED" // param ignored
+
+	res, err := Run(context.Background(), f.Deps())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !f.called(callHistory) {
+		t.Error("view returned the wrong channel and Run did not fall back to conversations.history")
+	}
+	if res.OpenedChannelID != "C_WANT" {
+		t.Errorf("OpenedChannelID = %q; want C_WANT — the fallback must open the channel that was asked for", res.OpenedChannelID)
+	}
+	// The other half of the same bug: falling back but still keeping
+	// the wrong conversation's messages renders C_LASTVIEWED's history
+	// under C_WANT's name, which is the exact outcome the comparison
+	// exists to prevent.
+	if !reflect.DeepEqual(res.Messages, cannedHistory().Messages) {
+		t.Errorf("Result.Messages = %q; want the fallback's %q — the ignored view's messages must not survive", rawStrings(res.Messages), rawStrings(cannedHistory().Messages))
+	}
+	if f.historyRequestedChannel != "C_WANT" {
+		t.Errorf("fallback asked conversations.history for %q; want C_WANT", f.historyRequestedChannel)
+	}
+}
+
+func TestRun_ViewIgnoringTheChannelParamIsLogged(t *testing.T) {
+	// A silent fallback is a Grid-only performance cliff nobody can
+	// diagnose: the channel opens correctly, so the only symptom is an
+	// extra request per open and a missing users/emoji section.
+	f := newFakeDeps()
+	f.deps.OpenChannelID = "C_WANT"
+	f.viewChannelID = "C_LASTVIEWED"
+
+	if _, err := Run(context.Background(), f.Deps()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(f.logged()) == 0 {
+		t.Error("view ignored the channel param and Run logged nothing")
+	}
+}
+
+func TestRun_FallsBackWhenViewErrors(t *testing.T) {
+	f := newFakeDeps()
+	f.deps.OpenChannelID = "C_WANT"
+	f.viewErr = errors.New("unknown_method")
+
+	res, err := Run(context.Background(), f.Deps())
+	if err != nil {
+		t.Fatalf("Run: view failure must fall back, not fail the boot: %v", err)
+	}
+	if !f.called(callHistory) {
+		t.Error("view errored and Run did not fall back")
+	}
+	if res.OpenedChannelID != "C_WANT" {
+		t.Errorf("OpenedChannelID = %q; want C_WANT", res.OpenedChannelID)
+	}
+	// The fake answers the error with a fully populated body whose
+	// channel id MATCHES, exactly as Slack answers ok:false with a
+	// populated body. A caller that checks only the id and not the
+	// error would accept it.
+	if !reflect.DeepEqual(res.Messages, cannedHistory().Messages) {
+		t.Errorf("Result.Messages = %q; want the fallback's %q — a failed view's body must be discarded", rawStrings(res.Messages), rawStrings(cannedHistory().Messages))
+	}
+}
+
+func TestRun_FallsBackWhenViewReturnsNoResult(t *testing.T) {
+	// (nil, nil) is not something Slack can send — boot.ConversationsView
+	// returns a nil result only alongside an error — but it IS what a
+	// mis-written Task 7 adapter returns, and dereferencing it inside
+	// a Bubble Tea program is a stack trace over a torn-down terminal.
+	f := newFakeDeps()
+	f.deps.OpenChannelID = "C_WANT"
+	f.viewNilResult = true
+
+	res, err := Run(context.Background(), f.Deps())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !f.called(callHistory) {
+		t.Error("view returned no result and Run did not fall back")
+	}
+	if !reflect.DeepEqual(res.Messages, cannedHistory().Messages) {
+		t.Errorf("Result.Messages = %q; want the fallback's %q", rawStrings(res.Messages), rawStrings(cannedHistory().Messages))
+	}
+}
+
+func TestRun_FallbackCarriesEveryField(t *testing.T) {
+	// On Enterprise Grid, where no capture of conversations.view
+	// exists at all, this is plausibly the COMMON path. UnchangedTS
+	// and LatestUpdates are the incremental-sync bookkeeping: drop
+	// LatestUpdates and the next open vouches for nothing and
+	// re-downloads the whole window, which is the behaviour this phase
+	// removes.
+	f := newFakeDeps()
+	f.deps.OpenChannelID = "C_WANT"
+	f.viewErr = errors.New("unknown_method")
+
+	res, err := Run(context.Background(), f.Deps())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := cannedHistory()
+	for _, tc := range []struct {
+		field string
+		got   any
+		want  any
+	}{
+		{"Messages", rawStrings(res.Messages), rawStrings(want.Messages)},
+		{"HasMore", res.HasMore, want.HasMore},
+		{"UnchangedTS", res.UnchangedTS, want.UnchangedTS},
+		{"LatestUpdates", res.LatestUpdates, want.LatestUpdates},
+	} {
+		if !reflect.DeepEqual(tc.got, tc.want) {
+			t.Errorf("Result.%s = %#v; want %#v", tc.field, tc.got, tc.want)
+		}
+	}
+}
+
+func TestRun_FallbackDiscardsTheRejectedViewSections(t *testing.T) {
+	// Found by mutation testing: an implementation can fall back
+	// correctly for the messages and STILL keep the rejected
+	// response's Users, Channels and Emojis, and every other test in
+	// this file passes.
+	//
+	// It is the same bug as rendering the wrong channel's messages,
+	// one field over. On the ignored-param path those users are the
+	// authors of ANOTHER conversation, so slk would show a member list
+	// and author avatars belonging to a channel the user is not
+	// looking at — and on the error path they come from a body Slack
+	// attached to a failure. A response rejected as untrustworthy has
+	// to contribute nothing; picking the parts that look harmless out
+	// of it is how "harmless" gets decided by whoever wrote the line.
+	for _, tc := range []struct {
+		name    string
+		prepare func(*fakeDeps)
+	}{
+		{"channel param ignored", func(f *fakeDeps) { f.viewChannelID = "C_LASTVIEWED" }},
+		{"view errored", func(f *fakeDeps) { f.viewErr = errors.New("unknown_method") }},
+		{"view returned no result", func(f *fakeDeps) { f.viewNilResult = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeDeps()
+			f.deps.OpenChannelID = "C_WANT"
+			tc.prepare(f)
+
+			res, err := Run(context.Background(), f.Deps())
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if len(res.Users) != 0 {
+				t.Errorf("Result.Users = %#v; want none — they were parsed out of a response Run rejected", res.Users)
+			}
+			if len(res.ViewChannels) != 0 {
+				t.Errorf("Result.ViewChannels = %#v; want none — they were parsed out of a response Run rejected", res.ViewChannels)
+			}
+			if len(res.Emojis) != 0 {
+				t.Errorf("Result.Emojis = %#v; want none — they were parsed out of a response Run rejected", res.Emojis)
+			}
+		})
+	}
+}
+
+func TestRun_CarriesHasMoreFalse(t *testing.T) {
+	// The companion to the two has-more assertions above, which both
+	// expect true: without a false case, "out.HasMore = true" is a
+	// surviving mutant on either path. has_more decides whether the UI
+	// offers to page further back, so a hardcoded true means an
+	// infinite scrollback on a channel with 3 messages in it.
+	for _, tc := range []struct {
+		name    string
+		prepare func(*fakeDeps)
+	}{
+		{"view path", func(f *fakeDeps) { f.viewChannelID = "C_WANT"; f.viewRes.History.HasMore = false }},
+		{"fallback path", func(f *fakeDeps) { f.viewErr = errors.New("unknown_method"); f.history.HasMore = false }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeDeps()
+			f.deps.OpenChannelID = "C_WANT"
+			tc.prepare(f)
+
+			res, err := Run(context.Background(), f.Deps())
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if res.HasMore {
+				t.Error("Result.HasMore = true; the response said false")
+			}
+		})
+	}
+}
+
+func TestRun_FallbackSendsCachedVersions(t *testing.T) {
+	// The fallback is conversations.history WITH cached_latest_updates
+	// — the incremental-sync primitive. Falling back to a plain
+	// history fetch would re-download scrollback slk already holds,
+	// which is the behaviour this phase removes.
+	f := newFakeDeps()
+	f.deps.OpenChannelID = "C_WANT"
+	f.viewErr = errors.New("unknown_method")
+	f.cachedVersions = map[string]string{"1700000001.000100": "1783024685.163100"}
+
+	if _, err := Run(context.Background(), f.Deps()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(f.historyCachedVersions) != 1 {
+		t.Errorf("history was sent %d cached versions; want the 1 slk holds", len(f.historyCachedVersions))
+	}
+	if !reflect.DeepEqual(f.historyCachedVersions, f.cachedVersions) {
+		t.Errorf("history was sent %#v; want %#v", f.historyCachedVersions, f.cachedVersions)
+	}
+	if f.messageVersionsFor != "C_WANT" {
+		t.Errorf("cached versions were read for channel %q; want C_WANT — another channel's versions vouch for messages this request will not return", f.messageVersionsFor)
+	}
+}
+
+func TestRun_ViewPathReadsNoCachedVersions(t *testing.T) {
+	// conversations.view sends no cached_latest_updates, so reading
+	// them on the success path is a cache scan whose result is thrown
+	// away — and the Task 7 adapter's read is a bounded SQL query, not
+	// a free one.
+	f := newFakeDeps()
+	f.deps.OpenChannelID = "C_WANT"
+	f.viewChannelID = "C_WANT"
+
+	if _, err := Run(context.Background(), f.Deps()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if f.messageVersionsCalls != 0 {
+		t.Errorf("view succeeded and Run still read cached message versions %d time(s)", f.messageVersionsCalls)
+	}
+}
+
+func TestRun_CachedVersionsFailureIsNotFatal(t *testing.T) {
+	// An empty map means "we vouch for nothing", which is exactly what
+	// the client sends on a cold cache. A cache read failure must
+	// degrade to a full window, not to no channel.
+	f := newFakeDeps()
+	f.deps.OpenChannelID = "C_WANT"
+	f.viewErr = errors.New("unknown_method")
+	f.cachedVersionsErr = errors.New("database is locked")
+
+	res, err := Run(context.Background(), f.Deps())
+	if err != nil {
+		t.Fatalf("Run: a cached-versions read failure must not fail the boot: %v", err)
+	}
+	if !f.called(callHistory) {
+		t.Error("cached versions failed and Run skipped the history fallback entirely")
+	}
+	if len(f.historyCachedVersions) != 0 {
+		t.Errorf("history was sent %#v; the read FAILED, so its return value must be discarded — vouching for versions we do not hold means the server withholds messages slk never received", f.historyCachedVersions)
+	}
+	if len(res.Messages) == 0 {
+		t.Error("no messages after a degraded fallback")
+	}
+	if len(f.logged()) == 0 {
+		t.Error("the cached-versions read failed and Run logged nothing")
+	}
+}
+
+func TestRun_FallbackFailureIsFatal(t *testing.T) {
+	// Both paths to the opened channel have now failed. Returning nil
+	// here would render an EMPTY channel — visually identical to a
+	// quiet one — and slk would look like it works.
+	f := newFakeDeps()
+	f.deps.OpenChannelID = "C_WANT"
+	f.viewErr = errors.New("unknown_method")
+	cause := errors.New("channel_not_found")
+	f.historyErr = cause
+
+	res, err := Run(context.Background(), f.Deps())
+	if err == nil {
+		t.Fatal("both conversations.view and conversations.history failed and Run returned a nil error")
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf("Run error = %v; want it to wrap %v", err, cause)
+	}
+	if res != nil {
+		t.Errorf("Run returned a non-nil Result (%+v) alongside error %v; a caller can and will render it", res, err)
+	}
+}
+
+func TestRun_NoOpenChannelSkipsBothCalls(t *testing.T) {
+	// First run on a fresh workspace with nothing restored: there is
+	// no channel to open, and inventing one would be an extra request.
+	f := newFakeDeps()
+	f.deps.OpenChannelID = ""
+
+	res, err := Run(context.Background(), f.Deps())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if f.called(callView) || f.called(callHistory) {
+		t.Errorf("opened a channel with none requested (sequence: %v)", f.calls)
+	}
+	if res.OpenedChannelID != "" {
+		t.Errorf("OpenedChannelID = %q; want empty — nothing was opened", res.OpenedChannelID)
+	}
+}
+
+func TestRun_OpensTheChannelAfterCounts(t *testing.T) {
+	// counts is what tells the UI this channel has unreads, and the
+	// history that lands next is what it renders against. Opening
+	// first would paint the channel before its badge state exists.
+	for _, tc := range []struct {
+		name    string
+		prepare func(*fakeDeps)
+		want    []string
+	}{
+		{"view honoured", func(f *fakeDeps) { f.viewChannelID = "C_WANT" }, []string{callUserBoot, callCounts, callView}},
+		{"fallback", func(f *fakeDeps) { f.viewChannelID = "C_LASTVIEWED" }, []string{callUserBoot, callCounts, callView, callHistory}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeDeps()
+			f.deps.OpenChannelID = "C_WANT"
+			tc.prepare(f)
+
+			if _, err := Run(context.Background(), f.Deps()); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if !reflect.DeepEqual(f.calls, tc.want) {
+				t.Errorf("call sequence = %v; want %v", f.calls, tc.want)
+			}
+		})
+	}
+}
+
+func TestRun_BootCallBudgetWithAChannelOpen(t *testing.T) {
+	// Success criterion 1 again, on the path that actually costs
+	// requests: TestRun_BootCallBudget runs with no channel to open,
+	// so it cannot see either of the calls this task adds. The
+	// fallback path is the expensive one — two requests for one
+	// channel — and it is the path Enterprise Grid may always take.
+	for _, tc := range []struct {
+		name    string
+		prepare func(*fakeDeps)
+	}{
+		{"view honoured", func(f *fakeDeps) { f.viewChannelID = "C_WANT" }},
+		{"fallback", func(f *fakeDeps) { f.viewChannelID = "C_LASTVIEWED" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeDeps()
+			f.deps.OpenChannelID = "C_WANT"
+			tc.prepare(f)
+
+			if _, err := Run(context.Background(), f.Deps()); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if len(f.calls) > 10 {
+				t.Errorf("boot issued %d calls; budget is 10 (sequence: %v)", len(f.calls), f.calls)
+			}
+		})
+	}
+}
+
+func TestRun_OpeningAChannelIsStillNotAFanOut(t *testing.T) {
+	// TestRun_NeverEnumerates allows at most one conversations.history
+	// — the opened channel's fallback. Assert the fallback IS that
+	// one, so a belt-and-braces "view AND history" double fetch on the
+	// success path cannot hide inside the allowance.
+	f := newFakeDeps()
+	f.deps.OpenChannelID = "C_WANT"
+	f.viewChannelID = "C_LASTVIEWED"
+
+	if _, err := Run(context.Background(), f.Deps()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if n := f.countPrefix(callHistory); n != 1 {
+		t.Errorf("boot made %d conversations.history calls; want exactly 1 (sequence: %v)", n, f.calls)
+	}
+	if n := f.countPrefix(callView); n != 1 {
+		t.Errorf("boot made %d conversations.view calls; want exactly 1 (sequence: %v)", n, f.calls)
+	}
+}
+
+func TestRun_MissingChannelOpenDependenciesAreErrors(t *testing.T) {
+	// Same reasoning as the Boot and Counts guards: these three are
+	// nil only because a Deps literal in cmd/slk/main.go forgot a
+	// field, and calling through a nil interface panics.
+	//
+	// All three are checked BEFORE conversations.view is attempted,
+	// including Store and History, which the view success path never
+	// touches. A boot that works only while the unverified primary
+	// path keeps working is the Grid failure this task exists to
+	// prevent: the fallback must be wired before it is needed, not
+	// discovered missing at the moment it is.
+	for _, tc := range []struct {
+		name string
+		nilf func(*Deps)
+	}{
+		{"View", func(d *Deps) { d.View = nil }},
+		{"History", func(d *Deps) { d.History = nil }},
+		{"Store", func(d *Deps) { d.Store = nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeDeps()
+			f.deps.OpenChannelID = "C_WANT"
+			f.viewChannelID = "C_WANT"
+			tc.nilf(&f.deps)
+
+			res, err := Run(context.Background(), f.Deps())
+			if err == nil {
+				t.Fatalf("Run with no %s dependency returned nil error", tc.name)
+			}
+			if res != nil {
+				t.Errorf("Run returned a non-nil Result (%+v) alongside error %v", res, err)
+			}
+		})
+	}
+}
+
+func TestRun_MissingChannelOpenDependenciesAreFineWithNoChannel(t *testing.T) {
+	// The other half: nothing is opened, so nothing needs them. A
+	// guard at the top of Run instead of inside the branch would make
+	// a workspace with no restored channel refuse to boot.
+	f := newFakeDeps()
+	f.deps.OpenChannelID = ""
+	f.deps.View, f.deps.History, f.deps.Store = nil, nil, nil
+
+	if _, err := Run(context.Background(), f.Deps()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestRun_ChannelOpenDoesNotDisturbTheUserBootFields(t *testing.T) {
+	// openChannel writes into the same *Result the userBoot mapping
+	// filled. A stray assignment there — or a rebuilt Result — loses
+	// the channel list on every boot that opens a channel, i.e. every
+	// real one.
+	f := newFakeDeps()
+	f.deps.OpenChannelID = "C_WANT"
+	f.viewChannelID = "C_WANT"
+
+	res, err := Run(context.Background(), f.Deps())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := cannedBootResult()
+	if !reflect.DeepEqual(res.Channels, want.Channels) {
+		t.Errorf("Result.Channels = %#v; want %#v", res.Channels, want.Channels)
 	}
 	if !reflect.DeepEqual(res.Counts, cannedCounts()) {
 		t.Errorf("Result.Counts = %#v; want %#v", res.Counts, cannedCounts())
