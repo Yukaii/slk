@@ -66,6 +66,24 @@ func revalidate(ctx context.Context, deps Deps, out *Result, logf func(string, .
 // revalidateChannels conditionally refreshes the conversations the
 // sidebar will render: userBoot's channels plus its ims, and nothing
 // else in the cache.
+//
+// The ims are included on purpose even though channels/info cannot
+// resolve them. Measured across the captures: of 193 ids the official
+// client sent to this endpoint, 22 were IM ids, and **all 22 came back
+// in failed_ids** — none appeared in results, none in member_channels.
+// So the official client sends them and they always fail, and matching
+// that is the point of this package.
+//
+// Two consequences worth knowing before anyone "optimises" ims out of
+// this set, which would be a divergence from the client:
+//
+//   - No IM is ever written by UpdateChannelFromEdge, because IMs never
+//     come back as results. A DM's cached name and type cannot be
+//     corrupted from here.
+//   - Every IM lands in FailedIDs, and ApplyMembership preserves failed
+//     ids rather than clearing them. That is the only reason DMs keep
+//     is_member across a boot. Removing the failed-id exclusion would
+//     mark every DM a non-membership on the next revalidation.
 func revalidateChannels(ctx context.Context, deps Deps, out *Result, logf func(string, ...any)) {
 	ids := make([]string, 0, len(out.Channels)+len(out.IMs))
 	for _, ch := range out.Channels {
