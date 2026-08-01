@@ -15,31 +15,55 @@ one that can plausibly stop the sign-outs, and the first that can break slk.**
 2. [Phase 2a outcomes](../plans/2026-07-30-grid-parity-phase2a-outcomes.md) — what shipped, and eleven places the captures overruled the plan. Its "What Phase 2b inherits" section is the direct input to this spec.
 3. `internal/slack/edge`, `internal/slack/boot`, `internal/cache/versions.go` — the real interfaces this builds on.
 
-## Correction to the original spec: slk does not call `conversations.list`
+## The original spec was right about `conversations.list` — I was wrong
 
-The Layer 2 design says slk enumerates three ways and cites
-`conversations.list` at `main.go:2177`. That is wrong. `GetAllChannels`, the
-only wrapper for `conversations.list`, has **zero callers anywhere in the
-repo** — it is dead code. The nearest real call is `main.go:2124`, which calls
-`GetChannels` — that is `users.conversations`: joined channels only,
-substantially the set `client.userBoot` already returns. (`main.go:2177` today
-is read-state persistence; several of the original spec's line citations have
-drifted, and the three others this document inherited were also stale and have
-been re-derived.)
+An earlier revision of this document claimed slk never calls
+`conversations.list`, on the grounds that its wrapper was dead code. **That was
+an error, and it was propagated into the Phase 2b plan and the Phase 2a
+outcomes doc before a measurement caught it.**
 
-What slk actually emits:
+The mistake: the Layer 2 design cited `conversations.list` at `main.go:2177`,
+which had drifted to unrelated code. Searching for a wrapper named
+`GetAllChannels` — a name inferred from the design's prose, never verified —
+returned nothing, and "no callers" was concluded from "no such symbol". The
+real function is **`GetAllPublicChannels`** (`internal/slack/client.go:497`).
 
-| Original claim | Reality |
+Measured on a real two-workspace boot, 2026-08-01:
+
+```
+API requests: 180 total across 18 endpoints
+    106  conversations.history
+     22  users.list
+     16  subscriptions.thread.getView
+      4  conversations.list          <- live, not dead
+      ...
+```
+
+A stack dump named the caller outright:
+
+```
+internal/slack.(*Client).GetAllPublicChannels   client.go:515
+main.fetchBrowseableChannels                    main.go:2238
+created by main.run.func11                      main.go:1787
+```
+
+`fetchBrowseableChannels` runs in a background goroutine at boot and pages
+`conversations.list` at `Limit: 1000` to populate the channel finder with
+channels the user has **not** joined. Its own doc comment concedes it is
+"significantly slower than GetChannels for large workspaces (potentially
+thousands of channels)".
+
+So slk enumerates all three ways the original design said, and this is the one
+that most literally matches "fetch every public channel including unjoined":
+
+| Original claim | Measured |
 |---|---|
-| `users.list`, ~50 pages | **Real.** `main.go:2077`, background goroutine, every boot |
-| `conversations.list`, all public channels | **Never called.** Dead code |
-| per-channel `conversations.history` | **Real.** `triggerBackfill`, on boot *and every reconnect* |
+| `users.list`, ~50 pages | **Real** — 22 calls across two workspaces |
+| `conversations.list`, all public channels | **Real** — 4 calls, `Limit: 1000` per page |
+| per-channel `conversations.history` | **Real** — 106 calls in a 4-second boot |
 
-The case for 2b is unchanged — `triggerBackfill` is the worst offender because
-it fires on every laptop sleep, wifi change and VPN flap, not once a day — but
-the deletion list is shorter than specced and the "6 calls instead of ~400"
-headline must be recomputed against measured reality rather than asserted. See
-*Verification*.
+`edge.ChannelsSearch` is its replacement, so deleting it belongs with the
+finder work, not with the cleanup task. See *Deletions*.
 
 ## Scope decisions
 
@@ -126,7 +150,7 @@ Jitter is not: inventing a shape with no evidence behind it is the Phase 1
 - **`BackfillCandidates`** as a runtime path (`reconnect_backfill.go:142`).
 - **`client.GetUsers`** / the `users.list` sweep (`main.go:2077`).
 - **Boot-time `subscriptions.thread.getView`** — deferred to first open of the Threads view.
-- **`GetAllChannels`** (`client.go:484`) — dead `conversations.list` wrapper, no callers.
+- **`GetAllPublicChannels`** (`client.go:497`) and its caller `fetchBrowseableChannels` (`main.go:2238`, spawned at `main.go:1787`) — the live `conversations.list` enumeration. Deleted **with** the finder move to `edge.ChannelsSearch`, not before it, or the finder loses unjoined channels with nothing to replace them.
 
 The existing comment at `main.go:3752` rationalises boot-time backfill as
 "harmless — most `GetHistorySince` calls return zero messages quickly." True for

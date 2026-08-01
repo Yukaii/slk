@@ -1720,7 +1720,7 @@ channel, with everything else marked stale for lazy revalidation."
 
 ---
 
-## Task 10: Defer `subscriptions.thread.getView`, delete dead `conversations.list`
+## Task 10: Defer boot-time `subscriptions.thread.getView`
 
 **Files:**
 - Modify: `cmd/slk/main.go`, `internal/slack/client.go`
@@ -1729,19 +1729,14 @@ Two small cleanups that need no new tests beyond the existing suite staying gree
 
 - [ ] **Step 1:** Move the boot-time `subscriptions.thread.getView` call to the first open of the Threads view. Find it via `rg -n 'subscriptions.thread.getView' cmd/ internal/`. Confirm the Threads view still populates on first open and that reopening does not refetch on every keystroke.
 
-- [ ] **Step 2:** Delete `func (c *Client) GetAllChannels` from `internal/slack/client.go:484`. It wraps `conversations.list` and has **zero callers anywhere in the repo** — verified with `rg 'GetAllChannels' --type go .`, which returns only the definition. The original Layer 2 spec claimed slk calls it on every start; it does not.
-
-Re-run that `rg` before deleting, in case Tasks 7-9 introduced a caller.
+- [ ] **Step 2:** *(moved to Task 11)* An earlier revision of this plan said to delete a dead `conversations.list` wrapper here. **There is no dead wrapper.** The real function is `GetAllPublicChannels` (`client.go:497`), it is live, and it is deleted in Task 11 alongside the finder move that replaces it. See the correction at the top of the design doc.
 
 - [ ] **Step 3: Verify and commit**
 
 ```bash
 go build ./... && go test ./... -race && golangci-lint run ./...
 git add cmd/slk/main.go internal/slack/client.go
-git commit -m "feat(slk): defer thread subscriptions, drop dead conversations.list
-
-GetAllChannels had zero callers -- the original spec's claim that slk
-enumerates public channels on every start was wrong."
+git commit -m "feat(slk): defer thread subscriptions to first Threads-view open"
 ```
 
 ---
@@ -1767,6 +1762,17 @@ Test the debounce directly, with a fake clock or an injected timer — not `time
 - [ ] **Step 2: Implement**
 
 - Channel finder → `edge.ChannelsSearch(ctx, query, topChannels)`, debounced ~300 ms, `topChannels` from `internal/cache/frecent.go`.
+
+  **Then delete the enumeration it replaces — in this task, not before it:**
+  `fetchBrowseableChannels` (`cmd/slk/main.go:2238`), its `go` spawn at
+  `main.go:1787`, and `Client.GetAllPublicChannels` (`internal/slack/client.go:497`).
+  That is the live `conversations.list` walk — 4 calls at `Limit: 1000` per page
+  on a measured two-workspace boot — and its only job is showing the finder
+  channels the user has not joined. `ChannelsSearch` returns exactly those,
+  server-side, so the capability survives. Deleting it any earlier would drop
+  unjoined channels from the finder with nothing in their place.
+
+  Add a test asserting a finder query issues **zero** `conversations.list`.
 - Mention picker → existing per-channel membership first, then `edge.UsersSearch(ctx, query, currentChannel, topUsers)` debounced, with `currentChannel` set to the open channel.
 
 Cancel the in-flight request when a newer query supersedes it — `edge` already propagates `ctx`, and Phase 2a pinned that with a test, so cancellation works if you pass a per-query context.
