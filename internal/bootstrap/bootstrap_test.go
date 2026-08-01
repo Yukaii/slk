@@ -1099,25 +1099,71 @@ func TestRun_CachedVersionsFailureIsNotFatal(t *testing.T) {
 	}
 }
 
-func TestRun_FallbackFailureIsFatal(t *testing.T) {
-	// Both paths to the opened channel have now failed. Returning nil
-	// here would render an EMPTY channel — visually identical to a
-	// quiet one — and slk would look like it works.
+func TestRun_ChannelOpenFailureIsNotFatal(t *testing.T) {
+	// Both paths to the opened channel have now failed, and the
+	// workspace still connects.
+	//
+	// This REPLACES TestRun_FallbackFailureIsFatal, which asserted the
+	// opposite. That test's reasoning was that a nil error next to no
+	// messages renders an EMPTY channel, visually identical to a quiet
+	// one — true, and not worth the price. The price is the whole
+	// workspace: every other conversation, the sidebar, unread state
+	// and the user's own identity are independent of this one
+	// channel's scrollback, and failing the boot throws all of them
+	// away to avoid one ambiguous message pane.
+	//
+	// The path also matters. conversations.view has never been
+	// captured on Enterprise Grid — the environment this phase exists
+	// for — so an unknown_method there followed by any history hiccup
+	// is exactly how a Grid user would meet this. "This channel looks
+	// empty" is a recoverable Tuesday; "slk will not connect" is not.
 	f := newFakeDeps()
 	f.deps.OpenChannelID = "C_WANT"
 	f.viewErr = errors.New("unknown_method")
-	cause := errors.New("channel_not_found")
-	f.historyErr = cause
+	f.historyErr = errors.New("channel_not_found")
 
 	res, err := Run(context.Background(), f.Deps())
-	if err == nil {
-		t.Fatal("both conversations.view and conversations.history failed and Run returned a nil error")
+	if err != nil {
+		t.Fatalf("Run: one channel's scrollback failed to load and the whole workspace refused to connect: %v", err)
 	}
-	if !errors.Is(err, cause) {
-		t.Errorf("Run error = %v; want it to wrap %v", err, cause)
+	if res == nil {
+		t.Fatal("Run returned a nil Result; the workspace cannot be built from it")
 	}
-	if res != nil {
-		t.Errorf("Run returned a non-nil Result (%+v) alongside error %v; a caller can and will render it", res, err)
+	// Usable, not merely non-nil: everything userBoot returned has to
+	// survive, or the caller has a Result it cannot render a sidebar
+	// from and the nil error is a lie.
+	if res.Self.ID != cannedBootResult().Self.ID {
+		t.Errorf("Result.Self.ID = %q; want %q — the userBoot fields must survive a failed channel open", res.Self.ID, cannedBootResult().Self.ID)
+	}
+	if len(res.Channels) != len(cannedBootResult().Channels) {
+		t.Errorf("Result.Channels has %d entries; want %d", len(res.Channels), len(cannedBootResult().Channels))
+	}
+	if !reflect.DeepEqual(res.Counts, cannedCounts()) {
+		t.Errorf("Result.Counts = %#v; want %#v — unread state is independent of one channel's history", res.Counts, cannedCounts())
+	}
+	// Still the channel that was ASKED for. The caller keys its
+	// message pane off this, and reporting "" would silently reopen
+	// whatever the UI had before.
+	if res.OpenedChannelID != "C_WANT" {
+		t.Errorf("OpenedChannelID = %q; want C_WANT — the open was attempted and requested that channel", res.OpenedChannelID)
+	}
+	// The fallback answers its error with a fully populated poisoned
+	// body, exactly as Slack answers ok:false with one. Empty here
+	// means "no scrollback", which is the honest answer; the poison
+	// would be another channel's messages under C_WANT's name.
+	if len(res.Messages) != 0 {
+		t.Errorf("Result.Messages = %q; want empty — a failed history's body must be discarded, not rendered", rawStrings(res.Messages))
+	}
+	if len(res.UnchangedTS) != 0 || len(res.LatestUpdates) != 0 {
+		t.Errorf("Result.UnchangedTS = %v, LatestUpdates = %v; want both empty — a failed history vouches for nothing", res.UnchangedTS, res.LatestUpdates)
+	}
+	if res.HasMore {
+		t.Error("Result.HasMore is true after a failed open; there is no window to page back from")
+	}
+	// Non-fatal but not silent. This is the only signal that a Grid
+	// workspace is opening every channel empty.
+	if len(f.logged()) == 0 {
+		t.Error("both paths to the channel failed and Run logged nothing")
 	}
 }
 

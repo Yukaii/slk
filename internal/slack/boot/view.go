@@ -336,11 +336,12 @@ type ViewResult struct {
 	//
 	// Channel.ID is the single most load-bearing field this parser
 	// exposes, and the plan's spec omitted it entirely. See
-	// ConversationsView: the `channel` request param is UNVERIFIED,
-	// and the captured request sent none and got back whatever
-	// conversation the user last looked at. Channel.ID is how a caller
-	// finds out which conversation it actually got, and therefore
-	// whether the probe worked or it must fall back.
+	// ConversationsView: the `channel` request param is verified on
+	// two non-Grid workspaces as of 2026-08-01 and remains UNVERIFIED
+	// on Enterprise Grid, and the captured requests sent none and got
+	// back whatever conversation the user last looked at. Channel.ID
+	// is how a caller finds out which conversation it actually got,
+	// and therefore whether the probe worked or it must fall back.
 	Channel ViewChannel `json:"channel"`
 
 	ResponseMetadata ViewResponseMetadata `json:"response_metadata"`
@@ -366,7 +367,7 @@ type viewResponse struct {
 // conversations.history plus a users.info per distinct author plus
 // emoji.list.
 //
-// # The channel param is UNVERIFIED
+// # The channel param: verified off Grid, unverified on it
 //
 // Read this before relying on channelID.
 //
@@ -377,14 +378,24 @@ type viewResponse struct {
 // channelID is empty, reproducing the captured request byte for byte
 // in the latter case.
 //
-// That a `channel` param is honoured is an ASSUMPTION. It is very
-// likely — it is the obvious parameter name and every neighbouring
-// conversations.* method takes one — but likely is not measured, and
-// this package's whole reason for existing is to stop guessing at
-// Slack's wire format. Nothing here should be read as evidence that it
-// works.
+// VERIFIED 2026-08-01, and what that does and does not settle:
 //
-// So callers MUST be able to detect the assumption failing, and there
+//   - Known: two live NON-GRID workspaces both honoured the param.
+//     Each boot opened a specific channel and got that channel back —
+//     ViewResult.Channel.ID equalled the requested id, and neither run
+//     logged the caller's "ignored the channel param" fallback line.
+//     Until then this was an unmeasured assumption, however obvious
+//     the parameter name.
+//   - NOT known: Enterprise Grid. conversations.view has never been
+//     captured there under any parameters, and Grid is the environment
+//     this package exists for. Two observations off Grid say nothing
+//     about the method existing on it, let alone about this param.
+//
+// So the caller's probe-and-compare stays mandatory, unchanged. Two
+// samples on the easy environment are not a contract, and the failure
+// they would miss is the silent one below.
+//
+// Callers MUST be able to detect the assumption failing, and there
 // are two distinct failure modes:
 //
 //   - Loud: Slack rejects the param and answers ok:false. This returns

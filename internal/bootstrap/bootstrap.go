@@ -247,13 +247,22 @@ type Result struct {
 	// server's value would name a conversation whose messages are not
 	// here.
 	//
-	// Empty means no channel was opened.
+	// Empty means no channel was REQUESTED. It is set whenever one
+	// was, including when loading it failed outright and Messages is
+	// therefore empty — the caller should open this conversation
+	// either way, since the alternative is silently reopening
+	// whatever it had before.
 	OpenedChannelID string
 
 	// Messages is the opened channel's history, newest-window-first as
 	// Slack sends it. Raw for the reasons boot.History.Messages
 	// documents; both the conversations.view and the
 	// conversations.history path land here.
+	//
+	// Empty alongside a non-empty OpenedChannelID means the load
+	// failed on both paths: the channel exists and was asked for, and
+	// slk has no scrollback for it. That is logged, not returned as an
+	// error — see Run's "What is fatal".
 	Messages []json.RawMessage
 
 	// HasMore reports whether the returned window was truncated, i.e.
@@ -313,6 +322,34 @@ type Deps struct {
 // rather than tidiness, and it is the same rule boot.UserBoot follows:
 // a caller handed both a Result and an error can use the Result, and a
 // workspace assembled from a failed boot renders like a real one.
+//
+// # What is fatal
+//
+// Only two things: a nil required dependency, and client.userBoot.
+// userBoot is fatal because every step below it is keyed by what it
+// returned — there is no workspace without a self, a team and a
+// conversation list, so there is nothing to degrade to.
+//
+// Everything else degrades and is logged:
+//
+//   - client.counts fails: Result.Counts stays zero, badges are
+//     missing, the workspace works.
+//   - opening the channel fails on BOTH conversations.view and the
+//     conversations.history fallback: Result.Messages stays empty,
+//     OpenedChannelID is still the channel that was asked for, the
+//     workspace works. See openChannel.
+//
+// The channel open was fatal until 2026-08-01 and is deliberately no
+// longer. The argument for fatal was that an empty Messages renders an
+// empty channel, indistinguishable from a quiet one. That is true and
+// it is the smaller harm: one conversation's scrollback is independent
+// of every other conversation, the sidebar, unread state and the
+// user's identity, and refusing to connect throws all of them away to
+// avoid one ambiguous message pane. It matters most on Enterprise
+// Grid, where conversations.view has never been captured at all, so an
+// unknown_method there is a plausible steady state rather than an
+// outage — and "this channel looks empty" is recoverable in a way
+// "slk will not connect" is not.
 func Run(ctx context.Context, deps Deps) (*Result, error) {
 	logf := deps.Log
 	if logf == nil {
@@ -370,10 +407,14 @@ func Run(ctx context.Context, deps Deps) (*Result, error) {
 		// path can report a channel other than the one requested.
 		out.OpenedChannelID = deps.OpenChannelID
 		if err := openChannel(ctx, deps, out, logf); err != nil {
-			// Fatal: both paths to the channel failed. Returning nil
-			// here would render an EMPTY channel, which looks exactly
-			// like a quiet one.
-			return nil, fmt.Errorf("bootstrap: opening %s: %w", deps.OpenChannelID, err)
+			// Non-fatal: both paths to the channel failed, and the
+			// cost of that is one empty message pane. Failing the
+			// boot instead would cost the whole workspace — see Run's
+			// "What is fatal". Messages stays empty and
+			// OpenedChannelID stays what was asked for, so the caller
+			// opens the right conversation with no scrollback rather
+			// than silently reopening a different one.
+			logf("bootstrap: opening %s: %v (continuing with an empty channel)", deps.OpenChannelID, err)
 		}
 	}
 
@@ -411,18 +452,36 @@ func checkOpenChannelDeps(deps Deps) error {
 // openChannel loads the first channel's history, preferring
 // conversations.view and falling back to conversations.history.
 //
-// The `channel` param on conversations.view is UNVERIFIED: no captured
-// request carried one, and the client got back whatever it had last
-// viewed. So the response's Channel.ID is compared to what was asked
-// for, and a mismatch is treated exactly like an error. Skipping that
-// comparison means rendering another conversation's messages under
-// this channel's name, with nothing anywhere reporting a problem.
+// An error from here is NOT fatal to the boot — see Run's "What is
+// fatal". It means the opened channel has no scrollback, not that the
+// workspace is unusable. When it returns an error, out is left
+// untouched: no half-populated Messages, no LatestUpdates vouching for
+// versions slk does not hold.
+//
+// # The `channel` param on conversations.view
+//
+// Status: VERIFIED on 2026-08-01 against two live non-Grid
+// workspaces. Both honoured it — Channel.ID came back equal to the
+// requested id, and neither boot logged the "falling back" line. Prior
+// to that observation no captured request carried a `channel` param at
+// all and the client got back whatever it had last viewed, so this was
+// a pure assumption.
+//
+// Still UNVERIFIED on Enterprise Grid, which is the environment this
+// entire phase exists for and the one where conversations.view has
+// never been captured under any parameters.
+//
+// So the probe-and-compare below STAYS, and is not downgraded to an
+// assertion or removed. Two non-Grid observations are not the
+// contract, the failure they would miss is silent (a 200 full of
+// another conversation's messages, rendered under this channel's
+// name), and since the double failure became non-fatal the fallback
+// costs one extra request rather than a workspace.
 //
 // The fallback is conversations.history with cached_latest_updates,
 // which IS fully verified (14 of 14 captured requests) — not a plain
 // history fetch, which would re-download scrollback slk already holds.
-// On Enterprise Grid, where conversations.view was never captured at
-// all, the fallback may well be the ordinary path.
+// On Enterprise Grid the fallback may well be the ordinary path.
 func openChannel(ctx context.Context, deps Deps, out *Result, logf func(string, ...any)) error {
 	want := deps.OpenChannelID
 
