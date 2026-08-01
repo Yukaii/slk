@@ -211,6 +211,41 @@ func (c *Client) apiHTTPClient() *http.Client {
 	return newCookieHTTPClient(c.cookie, c.envelope)
 }
 
+// HTTPClient returns the HTTP client this Client sends every request
+// through — the same one apiHTTPClient hands the internal call sites.
+//
+// It exists for one caller: edge.New, which takes an *http.Client and
+// documents that it must be one built with slackhttp.BrowserTransport.
+// Handing it a plain &http.Client{} instead compiles, runs, and sends
+// every edgeapi request with Go's default User-Agent, none of Chrome's
+// header set and no _x_app_name/fp envelope — the exact divergence this
+// phase exists to remove, visible nowhere in slk's own output. Routing
+// through apiHTTPClient rather than returning c.httpClient directly
+// also means a Client built as a literal in a test still gets an
+// envelope-carrying client rather than nil.
+//
+// A second, wanted consequence: this client's transport holds
+// slackhttp.DefaultCounter, so edgeapi calls appear in the shutdown
+// request tally alongside the workspace API's.
+func (c *Client) HTTPClient() *http.Client {
+	return c.apiHTTPClient()
+}
+
+// PostForm is postForm, exported.
+//
+// boot.UserBoot and boot.ConversationsView take a boot.PostFunc, whose
+// signature is exactly postForm's. internal/slack/boot is a
+// stdlib-only parser that cannot import this package, and
+// internal/bootstrap must not either (see that package's comment on
+// import direction), so the wiring in cmd/slk needs a method value it
+// can pass. This is that method value and nothing else: no defaulting,
+// no reshaping, no second token injection. Anything added here would be
+// a request-shape change invisible at the call sites that already use
+// postForm.
+func (c *Client) PostForm(ctx context.Context, method string, form url.Values) ([]byte, error) {
+	return c.postForm(ctx, method, form)
+}
+
 // Envelope returns the client's Slack telemetry envelope, or nil for a
 // Client constructed directly (tests). Callers use it to read or update
 // session-scoped values such as the build timestamp; the same pointer is

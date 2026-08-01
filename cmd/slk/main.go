@@ -21,6 +21,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/gammons/slk/internal/avatar"
+	"github.com/gammons/slk/internal/bootstrap"
 	"github.com/gammons/slk/internal/cache"
 	"github.com/gammons/slk/internal/config"
 	"github.com/gammons/slk/internal/debuglog"
@@ -2035,6 +2036,37 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		wctx.LastVisitedByChannel = visits
 	}
 
+	// The boot sequence: client.userBoot, client.counts,
+	// conversations.view for the restored channel (falling back to
+	// conversations.history), and conditional revalidation of the
+	// cache against edgeapi. See internal/bootstrap.
+	//
+	// This runs AFTER the channel-visits load because
+	// mostRecentlyVisitedChannel reads wctx.LastVisitedByChannel,
+	// which that load fills. It is the same expression the UI is
+	// handed as WorkspaceReadyMsg.LastChannelID, so the channel
+	// bootstrap opens is the channel the sidebar restores rather than
+	// a second, differently-chosen one. Empty is legal and means "open
+	// nothing" — a fresh profile with no recorded visits.
+	//
+	// The old enumeration paths below (GetUsers, GetChannels,
+	// GetUnreadCounts, and the reconnect backfill) still run. That is
+	// deliberate for this commit: they are deleted one at a time in
+	// the tasks that follow, each next to the call that replaces it,
+	// so no intermediate commit leaves slk unable to boot. Until then
+	// slk does both, and the request tally goes UP.
+	res, err := bootstrap.Run(ctx, newBootstrapDeps(client, db, token.AccessToken,
+		mostRecentlyVisitedChannel(wctx.LastVisitedByChannel)))
+	if err != nil {
+		return nil, fmt.Errorf("bootstrapping %s: %w", token.TeamName, err)
+	}
+	// Order matters between these two: applyBootUsers fills
+	// wctx.BotUserIDs, which buildChannelItem reads to bucket app DMs,
+	// and hydrateFirstSight writes the cache rows the sidebar's
+	// channel list is later reconciled against.
+	applyBootUsers(wctx, res)
+	hydrateFirstSight(db, client.TeamID(), res)
+
 	// Initialize Slack-native section store if enabled. Bootstrap is
 	// best-effort: failure is logged, the field stays nil, and the
 	// resolver falls through to config-glob behavior. Doing this
@@ -2075,9 +2107,16 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 	// unmuted (the conservative default). pref_change WS events for
 	// muted_channels can still rebuild the store mid-session via
 	// MuteStore.ApplyPrefChange even if this initial fetch failed.
+	//
+	// The source is client.userBoot's prefs, not a users.prefs.get
+	// round trip: userBoot already returned all_notifications_prefs
+	// (and muted_channels on the workspaces that still ship it), so
+	// the second call asked the same server the same question. See
+	// bootMutedChannels, which merges the two exactly as
+	// slackclient.GetMutedChannels does.
 	{
 		store := service.NewMuteStore()
-		if err := store.Bootstrap(ctx, client); err != nil {
+		if err := store.Bootstrap(ctx, bootMutedChannels{res}); err != nil {
 			log.Printf("mute store bootstrap for %s failed: %v (channels will render as unmuted until first pref_change)", token.TeamName, err)
 		} else {
 			ids := store.MutedChannels()
