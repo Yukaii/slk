@@ -1618,7 +1618,70 @@ Replace `OnConnect`'s behaviour with the bounded handler:
 2. The **active channel only**, via the normal open path with `cached_latest_updates`.
 3. Mark every other channel stale so it revalidates on next open.
 
-- [ ] **Step 3: The offline check (manual, and it may change the design)**
+### MEASURED 2026-08-01 — the offline check is done, and it changed the design
+
+Run on a real two-workspace setup (105 and 39 channels): slk started, wifi
+dropped, a message posted and marked unread from another client, wifi restored.
+`slk-debug.log` captured. Three findings, all of which move this task.
+
+**1. The WebSocket does NOT replay missed messages. `client.counts` stays.**
+
+After the reconnect `hello` at 06:49:05, the socket delivered ~160
+`presence_change` events and *nothing else*. The only `message` event in the
+whole session arrived at 06:49:53 with an event ts of its own moment — a live
+post after reconnect, not a replay. No `channel_marked` replayed either, so the
+mark-as-unread was lost too.
+
+The spec inferred from slk's socket params (`sync_desync=1`, `ms_latest=true`,
+`flannel=3`, `lazy_channels=1`) that slk "strongly suggests it gets the same
+missed-event delivery" as the official client. **That inference is wrong.** Keep
+the `client.counts` call; do not drop it.
+
+**2. slk never refreshes `client.counts` on reconnect today — this task fixes a
+live bug, not just a fingerprint.**
+
+`OnConnect` (`main.go:3721`) does presence/DND, a section rebootstrap, the
+backfill and a membership refresh. It does **not** call `client.counts`, which
+is boot-only. That is precisely why the unread never appeared: the count is
+stale and the socket did not replay the event. The bounded handler this task
+introduces is a user-visible fix.
+
+**3. The backfill is more expensive and less useful than the spec said, and the
+cost is not where the plan put it.**
+
+Measured over one ~3-minute session:
+
+```
+per-channel conversations.history calls:  288
+  returned 0 messages:                    250  (86%)
+  returned >0:                             38
+
+reconnect sweep, T04T4TH8W (105 channels):
+  channel-phase       total_msgs=0     dur_ms=2711      <- 2.7s, found NOTHING
+  subscription-phase  subs=1000        dur_ms=132248    <- 132s
+  total_dur_ms=132249
+
+  ListThreadSubscriptions: hit hard cap 1000, stopping   (x4 across the session)
+```
+
+Four reconnect sweeps ran (two workspaces x initial + reconnect), totalling
+**~6 minutes** of backfill for a 90-second outage that produced no new messages.
+
+The spec's rationalisation — "most `GetHistorySince` calls return zero messages
+quickly" — is confirmed at 86%, and its conclusion is confirmed wrong: the
+request count is the cost.
+
+**But the channel backfill is not the expensive part. The thread-subscription
+phase is, by 50x** (132s vs 2.7s), and it hits a 1000-item hard cap every time.
+The plan treats deferring `subscriptions.thread.getView` as a minor Task 10
+cleanup. It is the single most expensive thing slk does on reconnect.
+
+**Consequence for this task:** the subscription phase must be removed from the
+reconnect path *here*, alongside `triggerBackfill`, not deferred to Task 10.
+Task 10 keeps only the boot-time deferral. Add a test asserting the reconnect
+handler triggers no thread-subscription enumeration.
+
+- [ ] **Step 3 (superseded — the check above is done; keep this for the method)**
 
 The spec leaves one question open: whether slk needs step 1 at all. The official client does zero.
 
