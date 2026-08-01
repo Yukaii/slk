@@ -1826,6 +1826,22 @@ func run() error {
 
 	_, err = p.Run()
 
+	// Dump the API request tally before anything else at shutdown.
+	//
+	// Phase 2b's success criteria are call counts -- "a boot issues
+	// <= 10 API calls, with zero users.list and zero per-channel
+	// conversations.history fan-out" -- and nothing in slk could
+	// report them. Reconstructing the numbers from a debug log only
+	// worked at all because triggerBackfill happens to log per
+	// channel; there was no way to see users.list or a total.
+	//
+	// Nobody is testing slk against a real Enterprise Grid account
+	// until the whole grid-parity series lands, so this is the only
+	// feedback loop the work has.
+	if debuglog.Enabled() {
+		debuglog.General("shutdown API request tally:\n%s", slackhttp.DefaultCounter.Report())
+	}
+
 	// Clean up connection managers
 	for _, wctx := range workspaces {
 		if wctx.ConnMgr != nil {
