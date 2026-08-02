@@ -1710,6 +1710,22 @@ func run() error {
 				cfg:             cfg,
 				wsCtx:           wctx,
 				backfillGate:    dedupeGate{window: 30 * time.Second},
+				// The reconnect refresh, deliberately NOT the
+				// ChannelService.Fetch closure: that one also marks the
+				// channel read, which is right when the user just
+				// clicked into it and wrong here, where slk is catching
+				// up on messages that arrived while it was offline and
+				// the user may not have looked at the terminal for
+				// hours.
+				refreshChannel: func(ctx context.Context, channelID string) {
+					msgItems := fetchChannelMessages(wctx.Client, channelID, db, wctx.UserNames, tsFormat, avatarCache, router)
+					state, _ := db.GetChannelReadState(channelID)
+					p.Send(ui.MessagesLoadedMsg{
+						ChannelID:  channelID,
+						Messages:   msgItems,
+						LastReadTS: state.LastReadTS,
+					})
+				},
 			}
 			wctx.RTMHandler = handler
 			wctx.ConnMgr = slackclient.NewConnectionManager(wctx.Client, handler)
@@ -1821,7 +1837,7 @@ func run() error {
 			if wctx == nil || wctx.RTMHandler == nil {
 				continue
 			}
-			wctx.RTMHandler.triggerBackfill("wake")
+			wctx.RTMHandler.syncOnReconnect("wake")
 		}
 	}).Run(wakeCtx)
 
@@ -2126,6 +2142,32 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		// it in later, and IsMuted is a safe no-op while not ready.
 		wctx.MuteStore = store
 	}
+
+	// Thread subscriptions, once per connect.
+	//
+	// This used to ride along on the reconnect backfill, which meant
+	// it also ran on every reconnect — measured at 132 seconds per
+	// pass against the channel phase's 2.7, hitting its 1000-item hard
+	// cap every time. It is now a boot-time fetch and nothing else.
+	//
+	// Background because the Threads view is not what the user is
+	// looking at on the first frame; the list renders from cache and
+	// ThreadsListDirtyMsg refreshes it when this lands.
+	go func() {
+		s := &threadSubscriptionSync{
+			client:      client,
+			db:          db,
+			workspaceID: client.TeamID(),
+			availableCb: func(available bool) { wctx.SubscriptionsAvailable = available },
+		}
+		if err := s.sync(ctx); err != nil {
+			debuglog.Backfill("team=%s boot subscription sync err=%v", client.TeamID(), err)
+			return
+		}
+		if p != nil {
+			p.Send(ui.ThreadsListDirtyMsg{TeamID: client.TeamID()})
+		}
+	}()
 
 	// There is deliberately no workspace-wide user fetch here.
 	//
@@ -3463,9 +3505,18 @@ type rtmEventHandler struct {
 	wsCtx *WorkspaceContext
 
 	// backfillGate enforces a 30 s minimum between reconnect-driven
-	// backfill passes. Per-handler so each workspace has its own gate.
+	// catch-up passes. Per-handler so each workspace has its own gate.
 	// Initialized at construction with window = 30 * time.Second.
 	backfillGate dedupeGate
+
+	// refreshChannel reloads one channel from the server through the
+	// same path a channel switch uses, and pushes the result into the
+	// UI. The reconnect handler calls it for the channel on screen and
+	// for nothing else — that is the whole of slk's post-reconnect
+	// network work, alongside one client.counts.
+	//
+	// nil in tests that construct a handler for unrelated events.
+	refreshChannel func(ctx context.Context, channelID string)
 }
 
 func (h *rtmEventHandler) OnMessage(channelID, userID, ts, text, threadTS, subtype string, edited bool, files []slack.File, blocks slack.Blocks, attachments []slack.Attachment, botID, username string) {
@@ -3774,17 +3825,17 @@ func (h *rtmEventHandler) OnConnect() {
 		}
 	}
 
-	// Reconnect backfill: catch up on messages missed while the WS
-	// was dead. The 30 s dedupe in backfillGate prevents disconnect
-	// flaps from spawning overlapping passes. Runs in its own
-	// goroutine so the WS read loop isn't blocked on HTTP work.
+	// Bounded reconnect catch-up: client.counts, the channel on
+	// screen, and a staleness mark on everything else. The 30 s dedupe
+	// in backfillGate prevents disconnect flaps from spawning
+	// overlapping passes. Runs in its own goroutine so the WS read
+	// loop isn't blocked on HTTP work.
 	//
 	// Note on first-connect: the initial WS connect also fires
-	// OnConnect, so backfill runs at startup too. This is harmless —
-	// synced_at for freshly-bootstrapped channels is current, so most
-	// GetHistorySince calls return zero messages quickly. The 4-wide
-	// concurrency cap bounds the cost.
-	h.triggerBackfill("reconnect")
+	// OnConnect, so this runs at startup too, right after
+	// bootstrap.Run has already fetched counts. That is one duplicated
+	// request, against the ~300 the old sweep issued in the same spot.
+	h.syncOnReconnect("reconnect")
 
 	// Force-stale the active channel's membership cache and re-fetch.
 	// The WS may have missed member_joined/left deltas during the
@@ -3800,7 +3851,7 @@ func (h *rtmEventHandler) OnConnect() {
 	}
 }
 
-// triggerBackfill kicks off a reconnect-style backfill pass for this
+// syncOnReconnect kicks off the bounded catch-up pass for this
 // workspace, subject to the per-handler 30 s dedupe gate. Called by
 // OnConnect on every WS reconnect AND by the wake detector when the
 // system wakes from sleep (where the WS may not have torn down — a
@@ -3809,12 +3860,11 @@ func (h *rtmEventHandler) OnConnect() {
 // explicit trigger).
 //
 // The dedupe gate is shared with OnConnect, so a wake event that
-// happens to coincide with a real WS reconnect runs the backfill
-// exactly once.
+// coincides with a real WS reconnect runs the pass exactly once.
 //
-// Returns true if the backfill was started, false if the gate
-// suppressed it.
-func (h *rtmEventHandler) triggerBackfill(trigger string) bool {
+// Returns true if the pass was started, false if the gate suppressed
+// it.
+func (h *rtmEventHandler) syncOnReconnect(trigger string) bool {
 	if h.wsCtx == nil || h.db == nil || h.wsCtx.Client == nil {
 		return false
 	}
@@ -3822,16 +3872,18 @@ func (h *rtmEventHandler) triggerBackfill(trigger string) bool {
 		debuglog.Backfill("team=%s trigger=%s skipped reason=dedupe", h.workspaceID, trigger)
 		return false
 	}
-	wctx := h.wsCtx
-	workspaceID := h.workspaceID
-	program := h.program
-	db := h.db
+	sync := &reconnectSync{
+		client:         h.wsCtx.Client,
+		db:             h.db,
+		workspaceID:    h.workspaceID,
+		program:        h.program,
+		activeChannel:  h.activeChannelID,
+		refreshChannel: h.refreshChannel,
+	}
 	go func() {
-		bf := newBackfiller(
-			wctx.Client, db, workspaceID, wctx.Client.UserID(), program, 4, 500,
-			func(available bool) { wctx.SubscriptionsAvailable = available },
-		)
-		_ = bf.run(context.Background())
+		if err := sync.run(context.Background()); err != nil {
+			debuglog.Backfill("team=%s trigger=%s reconnect-sync err=%v", sync.workspaceID, trigger, err)
+		}
 	}()
 	return true
 }
