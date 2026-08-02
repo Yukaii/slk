@@ -108,13 +108,13 @@ type WorkspaceContext struct {
 	UserNames  map[string]string
 	// AvatarURLs maps userID -> avatar image URL. Populated from the
 	// local users cache at connect time (synchronous, before any
-	// goroutines spin up) and refreshed from the background
-	// client.GetUsers fetch and on-demand resolveUser calls. Read by
+	// goroutines spin up), from conversations.view's users array via
+	// applyBootUsers, and from on-demand resolveUser calls. Read by
 	// the AvatarFunc closure on the UI goroutine to trigger a lazy
 	// avatar Preload when an avatar slot first renders empty.
 	//
 	// sync.Map (not a plain map) because writes happen from background
-	// goroutines (GetUsers fetch, resolveUser) while reads happen on
+	// goroutines (resolveUser, the unresolved-DM sweep) while reads happen on
 	// the bubbletea Update goroutine. The lookup-or-trigger pattern
 	// (LoadOrStore-style) doesn't apply here — we only call Load — but
 	// we still need a concurrent map to avoid Go's "concurrent map
@@ -125,10 +125,10 @@ type WorkspaceContext struct {
 	// handles in mpdm channel names like `mpdm-grant--myles--ray-1`.
 	UserNamesByHandle map[string]string
 	// BotUserIDs is the set of user IDs known to be Slack apps or bots.
-	// Populated from the local cache on startup and refreshed by the
-	// background users.list fetch and any on-demand resolveUser calls.
-	// Used during channel construction to bucket app DMs into a separate
-	// "Apps" sidebar section.
+	// Populated from the local cache on startup, from
+	// conversations.view's users array via applyBootUsers, and by any
+	// on-demand resolveUser calls. Used during channel construction to
+	// bucket app DMs into a separate "Apps" sidebar section.
 	BotUserIDs map[string]bool
 	// SectionStore holds the user's Slack-native sidebar sections for
 	// this workspace. Nil when use_slack_sections is disabled, the
@@ -884,7 +884,7 @@ func run() error {
 	// goroutine for every message authored row. The fast path is a
 	// straight map lookup; on miss, we trigger a background Preload
 	// keyed by the workspace's AvatarURLs (populated at connect time
-	// from the local user cache and refreshed by the GetUsers fetch).
+	// from the local user cache and from the boot response).
 	// The avatar.Cache's inflight dedup ensures only one Preload runs
 	// per userID regardless of how many redraws hit the miss path
 	// before completion. On completion, Cache.SetOnReady (wired below
@@ -901,8 +901,8 @@ func run() error {
 			return rendered
 		}
 		// Cache miss: trigger a lazy Preload using the URL the
-		// workspace recorded at connect time (or that GetUsers
-		// refreshed). No router-active = pre-workspace-ready render;
+		// workspace recorded at connect time (or that resolveUser
+		// filled in). No router-active = pre-workspace-ready render;
 		// AvatarReadyMsg will invalidate once the avatar lands.
 		wctx := router.Active()
 		if wctx == nil || wctx.AvatarURLs == nil {
@@ -2049,8 +2049,8 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 	// a second, differently-chosen one. Empty is legal and means "open
 	// nothing" — a fresh profile with no recorded visits.
 	//
-	// The old enumeration paths below (GetUsers, GetChannels,
-	// GetUnreadCounts, and the reconnect backfill) still run. That is
+	// The old enumeration paths below (GetChannels, GetUnreadCounts,
+	// and the reconnect backfill) still run. That is
 	// deliberate for this commit: they are deleted one at a time in
 	// the tasks that follow, each next to the call that replaces it,
 	// so no intermediate commit leaves slk unable to boot. Until then
@@ -2127,53 +2127,29 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		wctx.MuteStore = store
 	}
 
-	// Background user fetch
-	go func() {
-		users, err := client.GetUsers(ctx)
-		if err != nil {
-			return
-		}
-		for _, u := range users {
-			name := u.Profile.DisplayName
-			if name == "" {
-				name = u.RealName
-			}
-			if name == "" {
-				name = u.Name
-			}
-			wctx.UserNames[u.ID] = name
-			if u.Name != "" {
-				wctx.UserNamesByHandle[u.Name] = name
-			}
-			isBot := u.IsBot || u.IsAppUser
-			if isBot {
-				wctx.BotUserIDs[u.ID] = true
-			}
-			// Slack Connect / shared-channel guests have a TeamID
-			// that differs from this workspace's home TeamID. Empty
-			// TeamID is treated as internal (under-detect rather than
-			// falsely flag). Mirrors userResolver.Request semantics.
-			isExternal := u.TeamID != "" && u.TeamID != client.TeamID()
-			db.UpsertUser(cache.User{
-				ID:          u.ID,
-				WorkspaceID: client.TeamID(),
-				Name:        u.Name,
-				DisplayName: name,
-				AvatarURL:   u.Profile.Image32,
-				Presence:    "away",
-				IsBot:       isBot,
-				IsExternal:  isExternal,
-			})
-			// Record the avatar URL for lazy fetch (mirrors the cached-
-			// user seed above). The eager Preload was the second wave
-			// of the startup avatar burst — equally large on big
-			// workspaces — and is replaced by on-demand fetches driven
-			// by AvatarFunc.
-			if u.Profile.Image32 != "" {
-				wctx.AvatarURLs.Store(u.ID, u.Profile.Image32)
-			}
-		}
-	}()
+	// There is deliberately no workspace-wide user fetch here.
+	//
+	// A users.list sweep used to run in the background at this point,
+	// paginating the entire directory — ~50 pages on a 10k-user
+	// workspace — to fill UserNames, UserNamesByHandle, BotUserIDs and
+	// the users cache. The official web client issues users.list zero
+	// times across all 8 captures, and it is the clearest single
+	// "scraping" signal slk emitted. Four sources cover the same
+	// ground without it:
+	//
+	//   - the cache seed above (db.ListUsers), which holds everyone
+	//     slk has ever resolved on this workspace;
+	//   - applyBootUsers, from conversations.view's users array — the
+	//     authors of the messages about to be rendered;
+	//   - edge.UsersInfo revalidation inside bootstrap.Run, which
+	//     refreshes those records by version;
+	//   - resolveUser, which fetches a single users.info on a miss and
+	//     writes it to the cache, so each unknown user costs one call
+	//     once rather than the whole directory every boot.
+	//
+	// The visible difference is that a name slk has never seen renders
+	// as its user ID for the moment before resolveUser answers, rather
+	// than for the (much longer) moment before the sweep finished.
 
 	// Fetch channels
 	channels, err := client.GetChannels(ctx)

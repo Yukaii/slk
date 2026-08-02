@@ -201,10 +201,6 @@ func (m *mockSlackAPI) GetBotInfoContext(ctx context.Context, parameters slack.G
 	return nil, fmt.Errorf("bot not found")
 }
 
-func (m *mockSlackAPI) GetUsersContext(ctx context.Context, options ...slack.GetUsersOption) ([]slack.User, error) {
-	return nil, nil
-}
-
 func (m *mockSlackAPI) GetEmoji() (map[string]string, error) {
 	if m.getEmojiFn != nil {
 		return m.getEmojiFn()

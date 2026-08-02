@@ -28,7 +28,10 @@ type SlackAPI interface {
 	GetConversationHistory(params *slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error)
 	GetConversationReplies(params *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error)
 	SearchMessagesContext(ctx context.Context, query string, params slack.SearchParameters) (*slack.SearchMessages, error)
-	GetUsersContext(ctx context.Context, options ...slack.GetUsersOption) ([]slack.User, error)
+	// Deliberately absent: GetUsersContext (users.list). See
+	// TestSlackAPI_DeclaresNoWorkspaceEnumeration — the whole
+	// directory is never fetched, only individual users on demand via
+	// GetUserInfo.
 	GetUserGroupsContext(ctx context.Context, options ...slack.GetUserGroupsOption) ([]slack.UserGroup, error)
 	GetUsersInConversationContext(ctx context.Context, params *slack.GetUsersInConversationParameters) ([]string, string, error)
 	GetUserInfo(user string) (*slack.User, error)
@@ -847,15 +850,6 @@ func (c *Client) GetHistorySince(ctx context.Context, channelID, oldest string, 
 		}
 		cursor = resp.ResponseMetaData.NextCursor
 	}
-}
-
-// GetUsers retrieves all users in the workspace.
-func (c *Client) GetUsers(ctx context.Context) ([]slack.User, error) {
-	users, err := c.api.GetUsersContext(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting users: %w", err)
-	}
-	return users, nil
 }
 
 // GetUserGroups retrieves the workspace's usergroups (the @team
