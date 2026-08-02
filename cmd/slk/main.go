@@ -150,13 +150,17 @@ type WorkspaceContext struct {
 	// us the workspace has zero unread threads, we trust that and
 	// suppress the heuristic-derived flags entirely.
 	ThreadsHasUnreads bool
+	// ThreadSubsOnce gates the workspace's one
+	// subscriptions.thread.getView fetch, fired on the first open of
+	// the Threads view. See ensureThreadSubscriptions.
+	ThreadSubsOnce sync.Once
 	// SubscriptionsAvailable indicates whether the most recent
-	// runSubscriptionPhase attempt succeeded in fetching Slack's
+	// threadSubscriptionSync attempt succeeded in fetching Slack's
 	// authoritative thread-subscription list. true on bootstrap
-	// (optimistic — no banner during the brief pre-bootstrap
-	// window) and after every successful subscription phase; false
-	// after a failed one. The UI uses it to decide whether to draw
-	// the "Threads list unavailable" banner.
+	// (optimistic — no banner before the first Threads-view open, by
+	// which point nothing has been attempted) and after every
+	// successful sync; false after a failed one. The UI uses it to
+	// decide whether to draw the "Threads list unavailable" banner.
 	SubscriptionsAvailable bool
 	Channels               []sidebar.ChannelItem
 	// FinderItems is the merged list shown in the Ctrl+T finder. Initially
@@ -1484,6 +1488,25 @@ func run() error {
 					SubscriptionsAvailable: wctx.SubscriptionsAvailable,
 				}
 			},
+			// First open of the Threads view for this workspace is what
+			// pays for subscriptions.thread.getView, instead of every
+			// boot and (before that) every reconnect. Returns
+			// immediately; the list renders from cache and refreshes
+			// via ThreadsListDirtyMsg when the fetch lands.
+			EnsureSubscriptions: func(teamID ids.TeamID) {
+				wctx := router.Active()
+				if wctx == nil || string(teamID) != wctx.TeamID {
+					return
+				}
+				ensureThreadSubscriptions(ctx, &wctx.ThreadSubsOnce,
+					&threadSubscriptionSync{
+						client:      wctx.Client,
+						db:          db,
+						workspaceID: wctx.TeamID,
+						availableCb: func(available bool) { wctx.SubscriptionsAvailable = available },
+					},
+					func() { p.Send(ui.ThreadsListDirtyMsg{TeamID: wctx.TeamID}) })
+			},
 			ChannelLastRead: func(channelID ids.ChannelID) string {
 				wctx := router.Active()
 				if wctx == nil {
@@ -2143,31 +2166,12 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		wctx.MuteStore = store
 	}
 
-	// Thread subscriptions, once per connect.
-	//
-	// This used to ride along on the reconnect backfill, which meant
-	// it also ran on every reconnect — measured at 132 seconds per
-	// pass against the channel phase's 2.7, hitting its 1000-item hard
-	// cap every time. It is now a boot-time fetch and nothing else.
-	//
-	// Background because the Threads view is not what the user is
-	// looking at on the first frame; the list renders from cache and
-	// ThreadsListDirtyMsg refreshes it when this lands.
-	go func() {
-		s := &threadSubscriptionSync{
-			client:      client,
-			db:          db,
-			workspaceID: client.TeamID(),
-			availableCb: func(available bool) { wctx.SubscriptionsAvailable = available },
-		}
-		if err := s.sync(ctx); err != nil {
-			debuglog.Backfill("team=%s boot subscription sync err=%v", client.TeamID(), err)
-			return
-		}
-		if p != nil {
-			p.Send(ui.ThreadsListDirtyMsg{TeamID: client.TeamID()})
-		}
-	}()
+	// Thread subscriptions are deliberately NOT fetched here. They are
+	// pulled on the first open of the Threads view, by
+	// ensureThreadSubscriptions via the threads list fetcher. See that
+	// function for why: the call paginates to a 1000-item hard cap,
+	// ~62 requests per workspace on a real account, and the Threads
+	// view is not on screen at boot.
 
 	// There is deliberately no workspace-wide user fetch here.
 	//

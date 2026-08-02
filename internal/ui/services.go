@@ -157,6 +157,17 @@ type ThreadService interface {
 	// ThreadsListLoadedMsg).
 	ListFetch(teamID ids.TeamID) tea.Msg
 
+	// EnsureSubscriptions makes sure the workspace's thread
+	// subscriptions have been fetched from Slack at least once this
+	// session, in the background.
+	//
+	// Separate from ListFetch because ListFetch is cache-only and runs
+	// on workspace-ready (for the sidebar's Threads badge), whereas
+	// this issues subscriptions.thread.getView, which paginates to a
+	// 1000-item hard cap — measured at ~62 requests per workspace.
+	// Only opening the Threads view is worth that.
+	EnsureSubscriptions(teamID ids.TeamID)
+
 	// ChannelLastRead returns the parent channel's last_read_ts so
 	// the thread panel can render a "── new ──" boundary. Optional;
 	// returning "" disables the unread boundary in the thread panel.
@@ -167,12 +178,13 @@ type ThreadService interface {
 // NewThreadService. Any field may be nil; the resulting service
 // no-ops that operation (and returns the zero value for read paths).
 type ThreadServiceFuncs struct {
-	Fetch           ThreadFetchFunc
-	CacheRead       ThreadCacheReadFunc
-	Mark            ThreadMarkFunc
-	SendReply       ThreadReplySendFunc
-	ListFetch       ThreadsListFetchFunc
-	ChannelLastRead func(channelID ids.ChannelID) string
+	Fetch               ThreadFetchFunc
+	CacheRead           ThreadCacheReadFunc
+	Mark                ThreadMarkFunc
+	SendReply           ThreadReplySendFunc
+	ListFetch           ThreadsListFetchFunc
+	EnsureSubscriptions func(teamID ids.TeamID)
+	ChannelLastRead     func(channelID ids.ChannelID) string
 }
 
 // NewThreadService builds a ThreadService from a ThreadServiceFuncs
@@ -224,6 +236,13 @@ func (t threadAdapter) ListFetch(teamID ids.TeamID) tea.Msg {
 		return nil
 	}
 	return t.fns.ListFetch(teamID)
+}
+
+func (t threadAdapter) EnsureSubscriptions(teamID ids.TeamID) {
+	if t.fns.EnsureSubscriptions == nil {
+		return
+	}
+	t.fns.EnsureSubscriptions(teamID)
 }
 
 func (t threadAdapter) ChannelLastRead(channelID ids.ChannelID) string {

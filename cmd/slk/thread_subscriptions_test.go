@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gammons/slk/internal/cache"
 	slackclient "github.com/gammons/slk/internal/slack"
@@ -152,5 +153,83 @@ func TestThreadSubscriptions_SuccessTriggersAvailabilityCallback(t *testing.T) {
 	}
 	if len(calls) != 1 || !calls[0] {
 		t.Fatalf("expected one callback with available=true, got %v", calls)
+	}
+}
+
+func TestEnsureThreadSubscriptions_FetchesOncePerWorkspace(t *testing.T) {
+	// The Threads view refetches its list on activation and on every
+	// ThreadsListDirtyMsg — including the one this sync itself sends —
+	// so an ungated trigger here would either loop or fire on every
+	// interaction. subscriptions.thread.getView paginates to a
+	// 1000-item hard cap, measured at 62 requests per workspace on a
+	// real account, which makes "once" the difference between a
+	// deferred cost and a much worse one.
+	db := newTestDB(t)
+	fake := &fakeSubscriptions{response: []slackclient.ThreadSubscriptionView{
+		subView("C1", "1700000100.000000", "1700000150.000000", "p1", "U2", true),
+	}}
+	var once sync.Once
+	done := make(chan struct{}, 8)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ensureThreadSubscriptions(context.Background(), &once,
+				newSubscriptionSync(db, fake, nil),
+				func() { done <- struct{}{} })
+		}()
+	}
+	wg.Wait()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first open never completed a subscription sync")
+	}
+
+	fake.mu.Lock()
+	calls := fake.calls
+	fake.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("ListThreadSubscriptions called %d times; want 1 — the Threads view opens, refreshes and reopens constantly", calls)
+	}
+	if len(done) != 0 {
+		t.Errorf("%d extra completions; the notify must fire once, or every one re-triggers the list fetch", len(done))
+	}
+}
+
+func TestEnsureThreadSubscriptions_FailureDoesNotNotify(t *testing.T) {
+	// A ThreadsListDirtyMsg after a failed fetch would send the view
+	// back to the same cache it already rendered, for nothing.
+	db := newTestDB(t)
+	fake := &fakeSubscriptions{err: errors.New("boom")}
+	var once sync.Once
+	notified := make(chan struct{}, 1)
+
+	ensureThreadSubscriptions(context.Background(), &once,
+		newSubscriptionSync(db, fake, nil),
+		func() { notified <- struct{}{} })
+
+	// Give the goroutine room to do the wrong thing.
+	deadline := time.After(300 * time.Millisecond)
+	for {
+		fake.mu.Lock()
+		calls := fake.calls
+		fake.mu.Unlock()
+		if calls == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("the sync never ran")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	select {
+	case <-notified:
+		t.Error("notified the UI after a failed fetch")
+	case <-time.After(100 * time.Millisecond):
 	}
 }

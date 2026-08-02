@@ -158,7 +158,7 @@ type (
 		TeamID    string
 		Summaries []cache.ThreadSummary
 		// SubscriptionsAvailable reflects whether the most recent
-		// runSubscriptionPhase succeeded in fetching the authoritative
+		// subscription sync succeeded in fetching the authoritative
 		// thread-subscription list. The threads view renders a banner
 		// when false (Task 10 wires the renderer).
 		SubscriptionsAvailable bool
