@@ -31,6 +31,7 @@ import (
 	"github.com/gammons/slk/internal/notify"
 	"github.com/gammons/slk/internal/service"
 	slackclient "github.com/gammons/slk/internal/slack"
+	"github.com/gammons/slk/internal/slack/edge"
 	"github.com/gammons/slk/internal/slack/membership"
 	"github.com/gammons/slk/internal/slackdesktop"
 	"github.com/gammons/slk/internal/slackhttp"
@@ -102,7 +103,11 @@ func (a sectionsProviderAdapter) OrderedSlackSections() []sidebar.SectionMeta {
 
 // WorkspaceContext holds all state for a single connected workspace.
 type WorkspaceContext struct {
-	Client     *slackclient.Client
+	Client *slackclient.Client
+	// Edge is the edgeapi client for this workspace: the
+	// conditional-revalidation and server-side-search endpoints. Nil
+	// only if construction failed, and every caller nil-checks.
+	Edge       *edge.Client
 	ConnMgr    *slackclient.ConnectionManager
 	RTMHandler *rtmEventHandler
 	UserNames  map[string]string
@@ -163,9 +168,10 @@ type WorkspaceContext struct {
 	// decide whether to draw the "Threads list unavailable" banner.
 	SubscriptionsAvailable bool
 	Channels               []sidebar.ChannelItem
-	// FinderItems is the merged list shown in the Ctrl+T finder. Initially
-	// contains only joined channels; the BrowseableChannelsLoadedMsg pipeline
-	// extends it with non-joined public channels in the background.
+	// FinderItems is the list shown in the Ctrl+T finder: the channels
+	// the user has joined. Channels they have not joined are not held
+	// here at all — they arrive per query from the finder's debounced
+	// channels/search and live only in the finder component.
 	FinderItems   []channelfinder.Item
 	TeamID        string
 	TeamName      string
@@ -1110,6 +1116,18 @@ func run() error {
 			SyncedAt: func(channelID ids.ChannelID) int64 {
 				return db.GetChannelSyncedAt(string(channelID))
 			},
+			// The finder's non-joined results. Debounced by the App
+			// (see scheduleChannelSearch) and only ever called for a
+			// non-empty query, so this runs once per typing pause
+			// rather than once per boot per workspace, which is what
+			// the conversations.list walk it replaced did.
+			SearchRemote: func(query string) []channelfinder.Item {
+				wctx := router.Active()
+				if wctx == nil {
+					return nil
+				}
+				return searchChannelsRemote(ctx, wctx.Edge, wctx.LastVisitedByChannel, query)
+			},
 			MembershipFetch: func(channelID ids.ChannelID) {
 				wctx := router.Active()
 				if wctx == nil || wctx.Membership == nil {
@@ -1821,11 +1839,6 @@ func run() error {
 				})
 			}(wctx.TeamID)
 
-			// Background fetch of all public channels so the finder can show
-			// channels the user is not yet a member of. Slow on big workspaces;
-			// must not block initial workspace readiness.
-			go fetchBrowseableChannels(ctx, wctx, p)
-
 			// Resolve unknown DM user names in background
 			if len(wctx.UnresolvedDMs) > 0 {
 				go func() {
@@ -1981,7 +1994,13 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 	}()
 
 	wctx := &WorkspaceContext{
-		Client:               client,
+		Client: client,
+		// Same construction as newBootstrapDeps makes for
+		// revalidation, and for the same reason it must be
+		// client.HTTPClient(): edge.New needs the
+		// BrowserTransport-carrying client, and a plain one differs
+		// only in what goes on the wire.
+		Edge:                 edge.New(token.AccessToken, client.TeamID(), client.HTTPClient()),
 		TeamID:               client.TeamID(),
 		TeamName:             token.TeamName,
 		UserID:               client.UserID(),
@@ -2283,55 +2302,11 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 	// Finder items are built alongside the sidebar items in the loop above
 	// (see buildChannelItem). The user is a member of every channel returned
 	// by GetChannels (it's backed by users.conversations), so those entries
-	// have Joined=true. A separate background fetch surfaces non-joined
-	// public channels for browsing -- see startBrowseableChannelsFetch.
+	// have Joined=true. Channels the user has NOT joined are found on
+	// demand by the finder's debounced channels/search -- see
+	// searchChannelsRemote -- rather than enumerated up front.
 
 	return wctx, nil
-}
-
-// fetchBrowseableChannels fetches every public channel in the workspace and
-// sends a BrowseableChannelsLoadedMsg to the TUI with the entries the user
-// has NOT joined. Joined entries are skipped to avoid duplicates with the
-// existing finder list. Runs in a background goroutine; failures are logged
-// but otherwise ignored (the finder simply continues to show only joined
-// channels).
-func fetchBrowseableChannels(ctx context.Context, wctx *WorkspaceContext, p *tea.Program) {
-	channels, err := wctx.Client.GetAllPublicChannels(ctx)
-	if err != nil {
-		log.Printf("warning: fetching browseable channels for %s: %v", wctx.TeamName, err)
-		return
-	}
-
-	// Build set of joined IDs so we can skip them.
-	joined := make(map[string]struct{}, len(wctx.Channels))
-	for _, ch := range wctx.Channels {
-		joined[ch.ID] = struct{}{}
-	}
-
-	browseable := make([]channelfinder.Item, 0, len(channels))
-	for _, ch := range channels {
-		if _, ok := joined[ch.ID]; ok {
-			continue
-		}
-		browseable = append(browseable, channelfinder.Item{
-			ID:          ch.ID,
-			Name:        ch.Name,
-			Type:        "channel",
-			Joined:      false,
-			LastVisited: wctx.LastVisitedByChannel[ch.ID],
-		})
-	}
-
-	// Persist on the workspace context so future workspace switches preserve
-	// the merged list.
-	wctx.FinderItems = append(wctx.FinderItems, browseable...)
-
-	if p != nil {
-		p.Send(ui.BrowseableChannelsLoadedMsg{
-			TeamID: wctx.TeamID,
-			Items:  browseable,
-		})
-	}
 }
 
 // extractAttachments converts slack-go File entries into the UI's

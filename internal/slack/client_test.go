@@ -168,10 +168,6 @@ func (m *mockSlackAPI) SearchMessagesContext(ctx context.Context, query string, 
 	return &slack.SearchMessages{}, nil
 }
 
-func (m *mockSlackAPI) GetConversations(params *slack.GetConversationsParameters) ([]slack.Channel, string, error) {
-	return nil, "", nil
-}
-
 func (m *mockSlackAPI) GetConversationsForUser(params *slack.GetConversationsForUserParameters) ([]slack.Channel, string, error) {
 	return nil, "", nil
 }

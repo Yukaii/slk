@@ -26,6 +26,13 @@ func TestSlackAPI_DeclaresNoWorkspaceEnumeration(t *testing.T) {
 			"channel's authors), edge.UsersInfo revalidation of the cache, and " +
 			"on-demand users.info via resolveUser for the misses.",
 		"GetUsers": "users.list; see GetUsersContext",
+		"GetConversations": "conversations.list, which walked every public channel in the " +
+			"workspace at Limit: 1000 -- 4 requests on a measured two-workspace boot, " +
+			"growing with the workspace, run in the background whether or not the user " +
+			"ever opened the channel finder. The finder now asks edgeapi's " +
+			"channels/search for the query the user actually typed, debounced. Note " +
+			"GetConversationsForUser (users.conversations, the joined list) is a " +
+			"different endpoint and is still here.",
 	}
 
 	iface := reflect.TypeOf((*SlackAPI)(nil)).Elem()

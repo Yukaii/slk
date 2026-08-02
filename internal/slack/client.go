@@ -23,12 +23,12 @@ import (
 // SlackAPI defines the subset of the Slack API we use.
 // This interface enables mocking in tests.
 type SlackAPI interface {
-	GetConversations(params *slack.GetConversationsParameters) ([]slack.Channel, string, error)
 	GetConversationsForUser(params *slack.GetConversationsForUserParameters) ([]slack.Channel, string, error)
 	GetConversationHistory(params *slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error)
 	GetConversationReplies(params *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error)
 	SearchMessagesContext(ctx context.Context, query string, params slack.SearchParameters) (*slack.SearchMessages, error)
-	// Deliberately absent: GetUsersContext (users.list). See
+	// Deliberately absent: GetConversations (conversations.list) and
+	// GetUsersContext (users.list). See
 	// TestSlackAPI_DeclaresNoWorkspaceEnumeration — the whole
 	// directory is never fetched, only individual users on demand via
 	// GetUserInfo.
@@ -524,66 +524,12 @@ func (c *Client) GetChannels(ctx context.Context) ([]slack.Channel, error) {
 	return allChannels, nil
 }
 
-// GetAllPublicChannels retrieves all public channels in the workspace via
-// conversations.list, including ones the user is NOT a member of. This is used
-// to populate the channel finder so users can join / switch to public channels
-// they haven't joined yet.
-//
-// Note: this is significantly slower than GetChannels for large workspaces
-// (potentially thousands of channels). Callers should run it in the background
-// after the joined-channel list is loaded.
-func (c *Client) GetAllPublicChannels(ctx context.Context) ([]slack.Channel, error) {
-	var allChannels []slack.Channel
-	cursor := ""
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		params := &slack.GetConversationsParameters{
-			Types:           []string{"public_channel"},
-			Limit:           1000,
-			Cursor:          cursor,
-			ExcludeArchived: true,
-		}
-
-		channels, nextCursor, err := c.api.GetConversations(params)
-		if err != nil {
-			if rlErr, ok := err.(*slack.RateLimitedError); ok {
-				wait := rlErr.RetryAfter
-				if wait == 0 {
-					wait = 30 * time.Second
-				}
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(wait):
-				}
-				continue
-			}
-			return nil, fmt.Errorf("listing public channels: %w", err)
-		}
-
-		allChannels = append(allChannels, channels...)
-
-		if nextCursor == "" {
-			break
-		}
-		cursor = nextCursor
-	}
-
-	return allChannels, nil
-}
-
 // GetUsersInConversation returns all user IDs that are members of the
 // given conversation (channel, DM, group DM, or shared channel). Paginates
 // 1000 IDs per page. On 429 responses, sleeps the server-advised RetryAfter
 // (defaulting to 30s if zero) and retries the same page; honors ctx
 // cancellation both between iterations and during the rate-limit sleep.
-// Mirrors GetAllPublicChannels' loop structure.
+// Mirrors the paginate-until-empty-cursor loop structure.
 func (c *Client) GetUsersInConversation(ctx context.Context, channelID string) ([]string, error) {
 	var all []string
 	cursor := ""

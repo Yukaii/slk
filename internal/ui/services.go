@@ -30,6 +30,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/gammons/slk/internal/ids"
+	"github.com/gammons/slk/internal/ui/channelfinder"
 	"github.com/gammons/slk/internal/ui/messages"
 	"github.com/gammons/slk/internal/ui/reactionpicker"
 )
@@ -422,6 +423,18 @@ type ChannelService interface {
 	// NewMessageFailedMsg on error; both carry requestID so the
 	// reducer can drop late results from cancelled submits.
 	OpenConversation(userIDs []string, requestID uint64) tea.Cmd
+
+	// SearchRemote asks the server which channels match query,
+	// including ones the user has not joined, and blocks until it
+	// answers. Callers run it from a tea.Cmd, debounced — see
+	// App.scheduleChannelSearch.
+	//
+	// It replaced a background conversations.list walk that ran at
+	// boot on every workspace, whether or not the finder was ever
+	// opened. Returning nil (no client, or a failed request) leaves
+	// the finder showing local matches only, which is what it showed
+	// before this existed.
+	SearchRemote(query string) []channelfinder.Item
 }
 
 // ChannelServiceFuncs is the closure bundle accepted by
@@ -439,6 +452,7 @@ type ChannelServiceFuncs struct {
 	RecordVisit      ChannelVisitRecorder
 	MembershipFetch  func(channelID ids.ChannelID)
 	OpenConversation func(userIDs []string, requestID uint64) tea.Cmd
+	SearchRemote     func(query string) []channelfinder.Item
 }
 
 // NewChannelService builds a ChannelService from a
@@ -523,6 +537,13 @@ func (c channelAdapter) MembershipFetch(channelID ids.ChannelID) {
 		return
 	}
 	c.fns.MembershipFetch(channelID)
+}
+
+func (c channelAdapter) SearchRemote(query string) []channelfinder.Item {
+	if c.fns.SearchRemote == nil {
+		return nil
+	}
+	return c.fns.SearchRemote(query)
 }
 
 func (c channelAdapter) OpenConversation(userIDs []string, requestID uint64) tea.Cmd {
