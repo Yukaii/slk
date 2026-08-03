@@ -235,10 +235,21 @@ type Result struct {
 	LegacyMutedRaw string
 
 	// Counts is the unread state. It is the zero value when
-	// client.counts failed, which is not distinguishable from a
-	// workspace with nothing unread — deliberately, since the failure
-	// is logged and the difference is cosmetic.
+	// client.counts failed, which on its own is not distinguishable
+	// from a workspace with nothing unread — hence CountsOK.
 	Counts Counts
+
+	// CountsOK reports whether the client.counts call succeeded.
+	//
+	// The distinction is not cosmetic for anyone applying Counts as a
+	// full snapshot. slk resets every channel in the workspace to read
+	// and then marks the ones counts reported unread, so an empty
+	// Unreads slice is either "everything is read", which must be
+	// applied, or "we never found out", which must not be — the second
+	// one silently wipes every unread dot with nothing to restore them
+	// from. Callers that only read Counts.Unreads additively can
+	// ignore this.
+	CountsOK bool
 
 	// OpenedChannelID is the conversation Messages belongs to. It is
 	// always the channel that was ASKED for (Deps.OpenChannelID) and
@@ -394,6 +405,7 @@ func Run(ctx context.Context, deps Deps) (*Result, error) {
 		logf("bootstrap: counts: %v (continuing without unread state)", err)
 	} else {
 		out.Counts = counts
+		out.CountsOK = true
 	}
 
 	// The first channel. Counts comes first because it is what tells

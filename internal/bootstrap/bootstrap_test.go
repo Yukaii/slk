@@ -648,6 +648,23 @@ func TestRun_CountsFailureIsNotFatal(t *testing.T) {
 	if res == nil {
 		t.Fatal("Run returned nil Result")
 	}
+	if res.CountsOK {
+		t.Error("CountsOK is true after a failed counts call; callers use it to tell 'everything is read' from 'we did not find out', and getting that backwards wipes every unread dot in the sidebar with no data to restore them from")
+	}
+}
+
+func TestRun_CountsSuccessIsFlagged(t *testing.T) {
+	// The other half of the same distinction: an empty Unreads slice
+	// from a SUCCESSFUL call legitimately means everything is read,
+	// and must be applied.
+	f := newFakeDeps()
+	res, err := Run(context.Background(), f.Deps())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.CountsOK {
+		t.Error("CountsOK is false after a successful counts call; the caller would skip applying the snapshot and leave last session's dots on screen")
+	}
 }
 
 func TestRun_CountsFailureDiscardsTheValue(t *testing.T) {

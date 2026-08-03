@@ -2267,12 +2267,19 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		wctx.FinderItems = append(wctx.FinderItems, finderItem)
 	}
 
-	// Fetch unread counts
-	unreadCounts, threadsAgg, ucErr := client.GetUnreadCounts()
-	if ucErr != nil {
-		debuglog.Cache("workspace_unread_bootstrap: team=%s GetUnreadCounts failed: %v", token.TeamName, ucErr)
+	// Unread counts come from the boot response rather than a second
+	// client.counts call. bootstrap.Run has already made exactly this
+	// request; asking again asked the same server the same question,
+	// and it did so once per workspace.
+	//
+	// res.CountsOK carries what the error return used to: a FAILED
+	// call and a workspace with nothing unread both produce an empty
+	// slice, and only the second may be applied as a snapshot.
+	unreadCounts, ucOK := res.Counts.Unreads, res.CountsOK
+	if !ucOK {
+		debuglog.Cache("workspace_unread_bootstrap: team=%s client.counts failed during bootstrap; leaving read state as cached", token.TeamName)
 	}
-	wctx.ThreadsHasUnreads = threadsAgg.HasUnreads
+	wctx.ThreadsHasUnreads = res.Counts.Threads.HasUnreads
 	// Boot applies an authoritative FULL snapshot: reset every channel
 	// in the workspace to read, then set the ones client.counts reports
 	// unread. This runs BEFORE the WebSocket goes live (ConnMgr.Run is
@@ -2283,7 +2290,7 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 	// unreads legitimately means "everything is read" and must clear
 	// stale dots carried over from a prior session. A FAILED call must
 	// NOT reset — that would wipe every dot with no data to restore.
-	if ucErr == nil {
+	if ucOK {
 		updates := make([]cache.ChannelReadStateUpdate, 0, len(unreadCounts))
 		for _, u := range unreadCounts {
 			updates = append(updates, cache.ChannelReadStateUpdate{
@@ -2320,7 +2327,7 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 			}
 		}
 		debuglog.Cache("workspace_unread_bootstrap: team=%s total=%d muted=%d threads_has_unreads=%v threads_unread=%d",
-			token.TeamName, len(wctx.Channels), mutedChans, threadsAgg.HasUnreads, threadsAgg.UnreadCount)
+			token.TeamName, len(wctx.Channels), mutedChans, res.Counts.Threads.HasUnreads, res.Counts.Threads.UnreadCount)
 	}
 
 	// Finder items are built alongside the sidebar items in the loop above
@@ -3804,6 +3811,11 @@ func (h *rtmEventHandler) OnUserTyping(channelID, userID string) {
 }
 
 func (h *rtmEventHandler) OnConnect() {
+	// connected doubles as "has this handler ever connected". It is
+	// never cleared on disconnect, deliberately: what the catch-up
+	// below needs to know is whether bootstrap.Run has already covered
+	// this session, not whether the socket is up right now.
+	firstConnect := !h.connected
 	h.connected = true
 	h.program.Send(ui.ConnectionStateMsg{State: int(statusbar.StateConnected)})
 	if h.wsCtx != nil {
@@ -3834,11 +3846,17 @@ func (h *rtmEventHandler) OnConnect() {
 	// overlapping passes. Runs in its own goroutine so the WS read
 	// loop isn't blocked on HTTP work.
 	//
-	// Note on first-connect: the initial WS connect also fires
-	// OnConnect, so this runs at startup too, right after
-	// bootstrap.Run has already fetched counts. That is one duplicated
-	// request, against the ~300 the old sweep issued in the same spot.
-	h.syncOnReconnect("reconnect")
+	// Skipped on the first connect, which fires moments after
+	// connectWorkspace returns. bootstrap.Run has just done the same
+	// work — client.counts, and the restored channel's history — so
+	// running it again asked the same server the same questions, once
+	// per workspace, and marked every other channel stale seconds
+	// after boot had populated them.
+	if firstConnect {
+		debuglog.Backfill("team=%s first connect: skipping catch-up, bootstrap.Run already covered it", h.workspaceID)
+	} else {
+		h.syncOnReconnect("reconnect")
+	}
 
 	// Force-stale the active channel's membership cache and re-fetch.
 	// The WS may have missed member_joined/left deltas during the
