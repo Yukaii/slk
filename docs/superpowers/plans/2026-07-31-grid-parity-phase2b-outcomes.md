@@ -248,6 +248,64 @@ now, not a blocker.
 - **`GetHistorySince` was kept** despite losing its only caller. The
   per-channel primitive is not the bug; the loop over channels was.
 
+## The boot budget: why it is 18 and not 10
+
+Criterion 1 asks for ≤ 10 API calls per boot. After removing the duplicated
+`client.counts`, the duplicated first-connect catch-up and the duplicated
+`emoji.list`, a two-workspace session is 37 requests — call it 18 per
+workspace. The remaining calls sort into three groups, and only one of them is
+ordinary work.
+
+**Removed this session** (each was asking a question already answered):
+
+| call | was | now | replaced by |
+|---|---|---|---|
+| `client.counts` | 3/ws | 1/ws | `bootstrap.Result.Counts` + `CountsOK` |
+| `conversations.history` | 1.5/ws | 0.5/ws | first connect no longer repeats the catch-up |
+| `emoji.list` | 1/ws | 0.5/ws | `conversations.view`'s `emojis` |
+
+`emoji.list` is 0.5 rather than 0 because the workspace whose
+`conversations.view` took the history fallback gets no emoji map with it, and
+the background fetch still covers that case. That is the documented cost of the
+fallback, working as intended.
+
+**Blocked on capture evidence, not on effort:**
+
+- `usergroups.list` (1/ws). `boot.Result.Subteams` is documented as replacing
+  it, but its element type is `[]json.RawMessage` because **both captures show
+  `"self": []`** — an empty list on the captured workspace. There is no evidence
+  for what a populated entry looks like, so mapping it to
+  `map[id]handle` means inventing a contract. Needs a capture from a workspace
+  that actually has usergroups.
+- `stars.list` (1/ws). Same shape of problem: `boot.Result.Starred` is
+  `[]json.RawMessage` with the element shape unmodelled.
+
+Inventing either is the Phase 1 `sec-ch-ua` mistake and the Phase 2a avatar
+mistake, in that order. Do not guess these; capture them.
+
+**Real work, no blocker:**
+
+- `users.conversations` (1.5/ws) — `Client.GetChannels`. `userBoot` already
+  returned `channels` and `ims`, and `bootstrap.Result` already exposes both.
+  The work is a `boot.Channel` → `sidebar.ChannelItem` conversion, because
+  `buildChannelItem` takes a `slack.Channel`. This is the sidebar's source of
+  truth, so it is the riskiest single change left in this area.
+- `conversations.members` (1/ws) — should become `edge:users/list`, which is
+  what the official client uses and which returns user records inline.
+- `dnd.info` (1/ws) — `bootstrap.Result.DND` already carries it. The call site
+  is `bootstrapPresenceAndDND`, which runs from `OnConnect` on every connect and
+  genuinely needs fresh data on a *re*connect, so this one needs the same
+  first-connect awareness the catch-up now has.
+
+**Ordinary work, leave alone:** `client.userBoot`, `client.counts`,
+`conversations.view`, `users.channelSections.list` (2/ws is pagination, not
+duplication), `auth.test`, `client.shouldReload`, `edge:channels/info`,
+`edge:users/info`, `users.getPresence`.
+
+Best case without new captures is roughly 18 → 14 per workspace. Criterion 1 is
+not reachable without either the two capture-blocked calls or a decision that
+some of the "ordinary" set is not worth its request.
+
 ## Not verified
 
 Four things need a human at a terminal and are **not** claimed:

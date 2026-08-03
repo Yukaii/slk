@@ -1822,7 +1822,7 @@ func run() error {
 				UserNames:        wctx.UserNames,
 				ExternalUsers:    external,
 				UserID:           wctx.UserID,
-				CustomEmoji:      wctx.CustomEmoji,  // empty at this point; filled by the goroutine below
+				CustomEmoji:      wctx.CustomEmoji,  // from conversations.view, or filled by the goroutine below
 				UserGroups:       wctx.UserGroups(), // empty at this point; filled by the goroutine below
 				SectionsProvider: sectionsProviderAdapter{store: wctx.SectionStore},
 				InitialActive:    isInitial,
@@ -1834,6 +1834,11 @@ func run() error {
 			// emoji picker entries. Best-effort: failure leaves the picker
 			// using built-ins only.
 			go func(teamID string) {
+				// Nothing to fetch when conversations.view already
+				// returned them, which is the normal path.
+				if len(wctx.CustomEmoji) > 0 {
+					return
+				}
 				emojis, err := wctx.Client.ListCustomEmoji(ctx)
 				if err != nil {
 					return
@@ -2147,6 +2152,14 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 	// and hydrateFirstSight writes the cache rows the sidebar's
 	// channel list is later reconciled against.
 	applyBootUsers(wctx, res)
+	// conversations.view returns the workspace's custom emoji next to
+	// the history it was asked for, which is what emoji.list would
+	// have gone and fetched separately. Empty on the
+	// conversations.history fallback and when no channel was opened —
+	// the background fetch below still covers those.
+	if len(res.Emojis) > 0 {
+		wctx.CustomEmoji = res.Emojis
+	}
 	hydrateFirstSight(db, client.TeamID(), res)
 
 	// Initialize Slack-native section store if enabled. Bootstrap is
