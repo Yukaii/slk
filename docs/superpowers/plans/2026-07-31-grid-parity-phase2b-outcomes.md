@@ -2,6 +2,13 @@
 
 ## Should a Grid tester try this yet?
 
+**Not yet, but the blocker below is fixed.** See *Status of the cold-cache
+regression* at the end of this section for the after-numbers; the remaining
+reasons to wait are the four unverified manual checks, not a known burst.
+
+The rest of this section is kept as written, because how the bug was found and
+what it looked like matters more than the fact that it is now gone.
+
 **No.** One measurement taken while writing this document says so, and it is
 the most important thing here:
 
@@ -186,7 +193,36 @@ resolution never starts; bound `userResolver.Request` with a worker pool so
 whatever misses remain cannot burst; route those misses through `UsersInfo`
 batches rather than one request each.
 
-**This is Phase 2c's first task, and it blocks any Grid test.**
+### Status of the cold-cache regression — FIXED 2026-08-03
+
+Two changes, in `membership.Manager` and `userResolver`:
+
+1. `backgroundFetch` no longer calls `resolver.Request` for every member. The
+   member id list is still fetched and cached — one bounded call per channel,
+   and the mention picker's in-channel ordering reads it — but slk no longer
+   asks who each of those people *is*. A test that asserted the old behaviour
+   (`TestBackgroundFetchTriggersResolverForEachID`) was replaced by its inverse;
+   it was encoding the bug.
+2. `userResolver.Request` acquires from an 8-slot semaphore inside its
+   goroutine, so it still returns immediately to its caller (it is called from
+   the render path and from WS event handlers) but cannot open an unbounded
+   number of round trips. Removing the semaphore in a mutation run produced a
+   measured peak of 58 concurrent requests from 60 calls; with it, 8.
+
+Same cold-cache protocol, 35-second boot:
+
+| | before | after |
+|---|---|---|
+| `users.info` | 40,523 | **200** |
+| `conversations.members` | 42 | 3 |
+| **total** | **40,604** | **242** |
+
+The remaining 200 are the render path resolving message authors and DM
+counterparties against an empty cache, now rate-bounded. That is proportional
+to what is on screen rather than to workspace membership, which is the property
+that matters. Batching them through `edge:users/info` and moving the member
+list to `edge:users/list` are both still worth doing — they are optimisations
+now, not a blocker.
 
 ## What contradicted the plan
 

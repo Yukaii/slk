@@ -47,35 +47,44 @@ boot-time thread-subscription sweep are all gone, three of them removed from the
 interfaces that could reach them so they cannot come back without failing a
 test. A 25-second two-workspace session went from 270 API requests to 44.
 
-**THE NEXT THING TO FIX, BEFORE ANYTHING ELSE:** on a *cold cache* a 35-second
-boot **starts 40,523 `users.info` requests — one per distinct channel member**
-(`select count(distinct user_id) from channel_members` returns 40,527 on the
-same workspace). `membership.Manager` asks the user resolver for every member of
-every channel it fetches (`internal/slack/membership/manager.go:165`), and the
-resolver spawns one goroutine and one request per cache miss
-(`cmd/slk/main.go:318`); the `users.list` sweep used to fill that cache before
-the manager got going. Deleting the sweep did not create the fan-out, it removed
-the thing hiding it.
+**The cold-cache `users.info` fan-out is FIXED (2026-08-03).** It is recorded
+here because the way it was found is the most useful thing in this document.
 
-**Say "started", not "issued".** The counter records at `RoundTrip` entry
-(`internal/slackhttp/transport.go:110`), so that figure is requests *initiated*;
-with no worker pool they all enter the transport at once and queue. How many
-reached Slack in 35s is unknown and much smaller. The number establishes the
-fan-out's shape, not a delivered request count.
+On a cold cache a 35-second boot used to start **40,523 `users.info` requests**,
+one per distinct channel member (`select count(distinct user_id) from
+channel_members` returned 40,527 on the same workspace). `membership.Manager`
+asked the user resolver about every member of every channel it fetched, and the
+resolver spawned one goroutine and one request per cache miss. The `users.list`
+sweep used to fill that cache before the manager got going, so deleting the
+sweep in Task 8 did not create the fan-out — it removed what was hiding it.
+Warm cache: 2 requests, which is why four tasks went by without noticing.
 
-Warm cache: 2 requests, which is why four tasks went by without noticing. Only
-an empty cache triggers it — i.e. a fresh install, which is exactly what a new
-Grid tester has.
+Fixed by deleting the per-member resolution (`membership.Manager.backgroundFetch`
+still fetches and caches the id list, which is one bounded call per channel) and
+bounding `userResolver.Request` with an 8-slot semaphore acquired inside its
+goroutine. Same protocol after: `users.info` **200**, total **242**.
 
-**The captures say this work is unnecessary, not merely inefficient.** Counted
-across all 8: `/api/users.info` **0**, `/api/conversations.members` **0**,
-`/api/users.list` **0**. The official client uses `edge:users/list` for one
-channel at a time with `count: 30, present_first: true` (full user records
+**Two lessons worth carrying forward:**
+
+- **Measure cold first, not last.** Every measurement across four tasks was
+  taken against a warm cache holding 42,992 users that the deleted sweep had put
+  there. The instrument was blind to the only case that matters — a fresh
+  install — and it was Task 12's checklist that finally pointed it there.
+- **`slackhttp.Counter` records at `RoundTrip` entry** (`transport.go:110`), so
+  its numbers are requests *initiated*. With an unbounded fan-out most of those
+  40,523 never reached Slack; they queued. Say "started", not "issued", and
+  never quote such a figure as delivered traffic.
+
+**The captures say the old work was unnecessary, not merely inefficient.**
+Counted across all 8: `/api/users.info` **0**, `/api/conversations.members`
+**0**, `/api/users.list` **0**. The official client uses `edge:users/list` for
+one channel at a time with `count: 30, present_first: true` (full user records
 inline, no resolution step), `edge:channels/membership` to test a specific set
 of users, and batched `edge:users/info` to revalidate — 291 records in 30
 responses. `internal/slack/edge` already implements all three, tested, and
-`membership.Manager` uses none of them. The fix is wiring. See the Phase 2b
-outcomes doc for the order of work.
+`membership.Manager` still uses none of them. Moving to `edge:users/list` and
+batching the remaining resolver misses are now optimisations rather than
+blockers; see the Phase 2b outcomes doc.
 
 ## Corrections to the original design, made during the work
 
@@ -180,8 +189,9 @@ them.
 - **The cache column mapping** is the most likely source of silent damage. `edge` results cover different column subsets than `UpsertChannel`/`UpsertUser` write, so revalidation goes through the partial writers in `internal/cache/edge_sync.go`. If avatars, membership or starred state start disappearing, look there first.
 - **`Result.Messages` is fetched and discarded.** `conversations.view` is currently pure cost — the channel still renders through the old cache + `GetHistory` path. Tasks 8-11 wire it. The `[]slack.Message` → `[]json.RawMessage` conversion in `cmd/slk/bootstrap_adapters.go` is lossy and unvalidated against a real render.
 - **Cold-cache convergence takes two boots.** The partial writers are UPDATE-only, so on an empty cache they find no rows; first-sight hydration inserts at version 0 and the next boot re-requests in full. Bytes, not correctness.
-- **The cold-cache `users.info` fan-out** is the standing risk that matters
-  most; see *Where we are*. Any measurement taken against a warm cache — which
-  is every measurement in this document and the Phase 2b outcomes doc except
-  the one that found it — says nothing about it.
+- **Warm-cache measurements say nothing about a cold cache.** That is how the
+  40k fan-out survived four tasks. Any claim about slk's call pattern needs a
+  run against an empty cache: copy `~/.local/share/slk/tokens` into a temp
+  `XDG_DATA_HOME`, leave the rest absent, boot, and delete the token copy
+  afterwards.
 - **Nobody has tested any of this on Enterprise Grid**, and nobody should until all three phases land. Two contributors have already been signed out helping diagnose the original problem. The Phase 2a outcomes doc leads with this and so should any summary.

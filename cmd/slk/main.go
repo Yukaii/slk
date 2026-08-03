@@ -260,6 +260,20 @@ func (r *workspaceRouter) ByID(teamID string) *WorkspaceContext {
 	return r.all[teamID]
 }
 
+// userResolverConcurrency caps how many users.info round trips the
+// resolver has open at once.
+//
+// The number is a rate bound, not a throughput target. Before it,
+// Request spawned one goroutine per unresolved user with nothing
+// between it and the transport, and a cold cache turned that into a
+// 40,000-request burst -- one per distinct channel member -- all
+// entering RoundTrip within moments of each other. The membership
+// fan-out that produced that particular burst is gone, but Request is
+// still reachable from the render path, the unresolved-DM sweep and
+// inbound messages, so the bound stays. Eight is well under what a
+// browser opens to one host and far more than a person generates.
+const userResolverConcurrency = 8
+
 // userResolver dispatches users.info lookups for unknown message
 // authors in the background. Deduplicates concurrent requests for
 // the same userID; failures are silent (the row stays rendered as
@@ -272,6 +286,11 @@ type userResolver struct {
 	avatars  *avatar.Cache
 	send     func(tea.Msg)
 	inflight sync.Map // userID -> struct{}
+	// sem bounds concurrent round trips. Buffered, so acquiring it
+	// happens inside the request goroutine and Request itself never
+	// blocks -- it is called from the render path and from WS event
+	// handlers, neither of which may wait on the network.
+	sem chan struct{}
 }
 
 func newUserResolver(
@@ -287,6 +306,7 @@ func newUserResolver(
 		db:      db,
 		avatars: avatars,
 		send:    send,
+		sem:     make(chan struct{}, userResolverConcurrency),
 	}
 }
 
@@ -321,6 +341,10 @@ func (r *userResolver) Request(userID string) {
 	}
 	go func() {
 		defer r.inflight.Delete(userID)
+		if r.sem != nil {
+			r.sem <- struct{}{}
+			defer func() { <-r.sem }()
+		}
 		u, err := r.client.GetUserProfile(userID)
 		if err != nil {
 			debuglog.Cache("userResolver: GetUserProfile team=%s user=%s err=%v",
