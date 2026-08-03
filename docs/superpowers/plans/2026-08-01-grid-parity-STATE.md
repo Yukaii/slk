@@ -48,14 +48,25 @@ interfaces that could reach them so they cannot come back without failing a
 test. A 25-second two-workspace session went from 270 API requests to 44.
 
 **THE NEXT THING TO FIX, BEFORE ANYTHING ELSE:** on a *cold cache* a 35-second
-boot issues **40,523 `users.info` requests**. `membership.Manager` asks the user
-resolver for every member of every channel it fetches
-(`internal/slack/membership/manager.go:165`), the resolver spawns one goroutine
-and one request per cache miss (`cmd/slk/main.go:318`), and the `users.list`
-sweep used to fill that cache before the manager got going. Deleting the sweep
-did not create the fan-out, it removed the thing hiding it. Warm cache: 2
-requests, which is why four tasks went by without noticing. Details and the
-shape of the fix are in the Phase 2b outcomes doc.
+boot **starts 40,523 `users.info` requests — one per distinct channel member**
+(`select count(distinct user_id) from channel_members` returns 40,527 on the
+same workspace). `membership.Manager` asks the user resolver for every member of
+every channel it fetches (`internal/slack/membership/manager.go:165`), and the
+resolver spawns one goroutine and one request per cache miss
+(`cmd/slk/main.go:318`); the `users.list` sweep used to fill that cache before
+the manager got going. Deleting the sweep did not create the fan-out, it removed
+the thing hiding it.
+
+**Say "started", not "issued".** The counter records at `RoundTrip` entry
+(`internal/slackhttp/transport.go:110`), so that figure is requests *initiated*;
+with no worker pool they all enter the transport at once and queue. How many
+reached Slack in 35s is unknown and much smaller. The number establishes the
+fan-out's shape, not a delivered request count.
+
+Warm cache: 2 requests, which is why four tasks went by without noticing. Only
+an empty cache triggers it — i.e. a fresh install, which is exactly what a new
+Grid tester has. Details and the shape of the fix are in the Phase 2b outcomes
+doc.
 
 ## Corrections to the original design, made during the work
 

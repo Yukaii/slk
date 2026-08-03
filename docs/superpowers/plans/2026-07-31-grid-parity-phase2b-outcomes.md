@@ -5,14 +5,36 @@
 **No.** One measurement taken while writing this document says so, and it is
 the most important thing here:
 
-**On a cold cache, a 35-second boot issued 40,523 `users.info` requests.**
+**On a cold cache, a 35-second boot started 40,523 `users.info` requests —
+one per distinct channel member in the workspace.**
 
-That is not a typo and it is worse than the `users.list` sweep this phase
-deleted. The mechanism is understood (below) and it is a direct consequence of
-Task 8: deleting the sweep removed the thing that was keeping an existing
-per-user fan-out dormant. On a warm cache the same boot issues **2**, which is
-why every other measurement in this document looks as good as it does and why
-this went unnoticed for four tasks.
+Read "started" literally: `slackhttp.Counter` records at `RoundTrip` entry, not
+at completion (`internal/slackhttp/transport.go:110`). slk spawns one goroutine
+and one request per unresolved user with no worker pool, so all ~40k enter the
+transport within moments of each other and then queue on the connection pool.
+How many actually reached Slack in those 35 seconds is unknown and is certainly
+far smaller — the absence of error lines in the debug log is evidence that most
+never returned at all. **Do not quote this as "40k requests hit Slack."** What
+it establishes is the fan-out's *shape*: unbounded, and sized by workspace
+membership rather than by anything on screen.
+
+The count matches an independent number almost exactly:
+
+```
+counter:                                        40,523  users.info
+select count(distinct user_id) from channel_members ->  40,527
+```
+
+That is one request per distinct channel member, which is the mechanism below,
+confirmed arithmetically rather than argued.
+
+It is a direct consequence of Task 8: deleting the `users.list` sweep removed
+the thing that was keeping an existing per-user fan-out dormant. On a warm cache
+the same boot issues **2**, which is why every other measurement in this
+document looks as good as it does and why this went unnoticed for four tasks.
+
+**Who hits it:** anyone whose cache is empty — i.e. a fresh install. That is
+exactly the state a new Grid tester would be in.
 
 Nobody should point this at an Enterprise Grid account until that is fixed. Two
 contributors have already been signed out helping diagnose the original problem.
@@ -90,7 +112,8 @@ API requests: 40604 total across 18 endpoints
      42  conversations.members
 ```
 
-The chain:
+42 `conversations.members` responses covering 40,527 distinct members, and one
+`users.info` started for each. The chain:
 
 1. `membership.Manager.backgroundFetch` fetches `conversations.members` for a
    channel and then calls `resolver.Request(id)` for **every member**
@@ -111,7 +134,8 @@ without replacing.
 Two things are wrong and both need fixing:
 
 - **Unbounded.** One goroutine and one request per user, no worker pool, no rate
-  limit. Even the right number of users would arrive as a burst.
+  limit. Even the right number of users would arrive as a burst — and the burst
+  is the fingerprint, independent of how many requests survive the queue.
 - **Eager.** These are the members of every channel the manager touches, not the
   authors of messages on screen. The mention picker shows at most 7 rows.
 
