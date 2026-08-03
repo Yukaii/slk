@@ -1,4 +1,4 @@
-# Grid Parity — Where This Is, 2026-08-01
+# Grid Parity — Where This Is, 2026-08-03
 
 **Read this first if you are picking the work up.** It records *state* and the
 findings that live nowhere else. The design and the plan are the forward-looking
@@ -14,41 +14,58 @@ what changed underneath them.
 | [`plans/2026-07-31-grid-parity-phase2b-bootstrap-rewrite.md`](./2026-07-31-grid-parity-phase2b-bootstrap-rewrite.md) | The 12-task plan. Current, **but its `- [ ]` checkboxes were never ticked** — use the table below instead. Tasks 9/10/11 were re-scoped mid-flight; the file reflects that. |
 | [`plans/2026-07-30-grid-parity-phase1-outcomes.md`](./2026-07-30-grid-parity-phase1-outcomes.md) | Phase 1 retrospective. |
 | [`plans/2026-07-30-grid-parity-phase2a-outcomes.md`](./2026-07-30-grid-parity-phase2a-outcomes.md) | Phase 2a retrospective. Its *Test-integrity findings* section is the most useful thing to read before writing any test here. |
+| [`plans/2026-07-31-grid-parity-phase2b-outcomes.md`](./2026-07-31-grid-parity-phase2b-outcomes.md) | **Phase 2b retrospective, 2026-08-03. Read its first section before anything else** — it opens with a cold-cache regression that blocks Grid testing. |
 
 ## Where we are
 
 Branch `feat/grid-parity`, worktree `.worktrees/grid-parity-phase1` (the
 directory name is a leftover; it holds all three phases). Draft PR
-[gammons/slk#121](https://github.com/gammons/slk/pull/121). HEAD `26adbc0`,
-everything pushed, tree clean.
+[gammons/slk#121](https://github.com/gammons/slk/pull/121). HEAD `c60b92a`,
+tree clean.
 
-Phases 1 and 2a are complete. Phase 2b is **7 of 12 tasks done**.
+Phases 1 and 2a are complete. Phase 2b is **11 of 12 tasks done, one half-done**.
 
 | Task | State | Key commits |
 |---|---|---|
-| 1. Request counter | ✅ | `372cd0f`, `91de452`, `7d53bcb`, `bec5ab3` |
-| 2. Cache partial writers | ✅ | `23dd441`, `9b0d52b` |
-| 3. `edge.User.ImageOriginal` + membership batch presence | ✅ | `2c2c619`, `2350c4c` |
-| 4. `internal/bootstrap` skeleton | ✅ | `cbede9d` |
-| 5. `conversations.view` + fallback | ✅ | `5b210fd`, `26adbc0` |
-| 6. Scoped revalidation | ✅ | `1997284`, `263464c` |
-| 7. Wire `connectWorkspace` | ✅ | `12b5a7d`, `26adbc0` |
-| 8. Delete the `users.list` sweep | ⬜ next | |
-| 9. Delete `triggerBackfill` + thread-subscription sweep, bound reconnect | ⬜ | |
-| 10. Defer boot-time `subscriptions.thread.getView` | ⬜ | |
-| 11. Finder/mentions → edge search, **delete `GetAllPublicChannels`** | ⬜ | |
-| 12. Full verification + outcomes doc | ⬜ | |
+| 1. Request counter | done | `372cd0f`, `91de452`, `7d53bcb`, `bec5ab3` |
+| 2. Cache partial writers | done | `23dd441`, `9b0d52b` |
+| 3. `edge.User.ImageOriginal` + membership batch presence | done | `2c2c619`, `2350c4c` |
+| 4. `internal/bootstrap` skeleton | done | `cbede9d` |
+| 5. `conversations.view` + fallback | done | `5b210fd`, `26adbc0` |
+| 6. Scoped revalidation | done | `1997284`, `263464c` |
+| 7. Wire `connectWorkspace` | done | `12b5a7d`, `26adbc0` |
+| 8. Delete the `users.list` sweep | done | `35a0611` |
+| 9. Delete `triggerBackfill`, bound reconnect | done | `f08011c` |
+| 10. Defer boot-time `subscriptions.thread.getView` | done | `80abaf7` |
+| 11a. Finder → `edge.ChannelsSearch`, delete `conversations.list` | done | `c60b92a` |
+| 11b. Mention picker → `edge.UsersSearch` | **not started** | |
+| 12. Verification + outcomes doc | done (this session) | |
 
-**slk currently boots through `internal/bootstrap` and still runs every old
-enumeration alongside it.** That is deliberate (plan Task 7): no intermediate
-commit may leave slk unable to boot. Call counts are *up* by ~9 per boot right
-now. Tasks 8-11 delete the old paths, each next to its replacement.
+**slk no longer runs the old enumeration paths.** `users.list`,
+`conversations.list`, the per-channel `conversations.history` backfill and the
+boot-time thread-subscription sweep are all gone, three of them removed from the
+interfaces that could reach them so they cannot come back without failing a
+test. A 25-second two-workspace session went from 270 API requests to 44.
+
+**THE NEXT THING TO FIX, BEFORE ANYTHING ELSE:** on a *cold cache* a 35-second
+boot issues **40,523 `users.info` requests**. `membership.Manager` asks the user
+resolver for every member of every channel it fetches
+(`internal/slack/membership/manager.go:165`), the resolver spawns one goroutine
+and one request per cache miss (`cmd/slk/main.go:318`), and the `users.list`
+sweep used to fill that cache before the manager got going. Deleting the sweep
+did not create the fan-out, it removed the thing hiding it. Warm cache: 2
+requests, which is why four tasks went by without noticing. Details and the
+shape of the fix are in the Phase 2b outcomes doc.
 
 ## Corrections to the original design, made during the work
 
 The Layer 2 design predates any measurement. Four of its claims are wrong.
 
-1. **`conversations.list` IS called.** The design said so, I "corrected" it to dead code, and I was wrong — that reversal is documented at the top of the 2b design. The live path is `Client.GetAllPublicChannels` ← `fetchBrowseableChannels` ← the `go` spawn in `run`. **Find these by symbol, not by line** — see *A note on line citations* below. It pages at `Limit: 1000` to populate the finder with unjoined channels. **Deleting it belongs with Task 11**, next to the `edge.ChannelsSearch` move that replaces it — deleting it earlier drops unjoined channels from the finder with nothing in their place.
+1. ~~**`conversations.list` IS called.**~~ *Resolved 2026-08-03: Task 11a
+   deleted `GetAllPublicChannels` and `fetchBrowseableChannels`, and removed
+   `GetConversations` from `SlackAPI`, so it is now structurally impossible.
+   The paragraph below is kept because the way this was got wrong is worth
+   remembering.* The design said so, I "corrected" it to dead code, and I was wrong — that reversal is documented at the top of the 2b design. The live path is `Client.GetAllPublicChannels` ← `fetchBrowseableChannels` ← the `go` spawn in `run`. **Find these by symbol, not by line** — see *A note on line citations* below. It pages at `Limit: 1000` to populate the finder with unjoined channels. **Deleting it belongs with Task 11**, next to the `edge.ChannelsSearch` move that replaces it — deleting it earlier drops unjoined channels from the finder with nothing in their place.
 
 2. **The WebSocket does not replay missed messages.** The design inferred from slk's socket params (`sync_desync=1`, `ms_latest=true`, `flannel=3`, `lazy_channels=1`) that slk probably receives the same replay as the official client. Measured 2026-08-01: after a 90-second outage the socket delivered ~160 `presence_change` events and nothing else. **`client.counts` stays in the reconnect path.**
 
@@ -110,14 +127,21 @@ Cite and search by **symbol**. The symbols that matter, current at `26adbc0`:
 
 | Symbol | File | Line at `26adbc0` |
 |---|---|---|
-| `Client.GetAllPublicChannels` | `internal/slack/client.go` | 532 |
-| `fetchBrowseableChannels` | `cmd/slk/main.go` | 2276 |
-| its `go` spawn | `cmd/slk/main.go` | 1788 |
-| `rtmEventHandler.OnConnect` | `cmd/slk/main.go` | 3776 |
-| `rtmEventHandler.triggerBackfill` | `cmd/slk/main.go` | 3841 |
-| the `users.list` sweep (`client.GetUsers`) | `cmd/slk/main.go` | 2132 |
+| `userResolver.Request` (the cold-cache fan-out) | `cmd/slk/main.go` | 296 |
+| `membership.Manager.backgroundFetch` (its caller) | `internal/slack/membership/manager.go` | 165 |
+| `rtmEventHandler.OnConnect` | `cmd/slk/main.go` | 3782 |
+| `rtmEventHandler.syncOnReconnect` | `cmd/slk/main.go` | 3846 |
+| `reconnectSync.run` | `cmd/slk/reconnect_sync.go` | 89 |
+| `searchChannelsRemote` | `cmd/slk/channel_search.go` | 44 |
+| `ensureThreadSubscriptions` | `cmd/slk/thread_subscriptions.go` | 147 |
 
-Re-derive with `rg -n 'func fetchBrowseableChannels'` before acting on any of
+Deleted in this session, so that citations to them elsewhere are known-dead:
+`Client.GetAllPublicChannels`, `Client.GetUsers`, `fetchBrowseableChannels` and
+its `go` spawn, `rtmEventHandler.triggerBackfill`, the whole `backfiller` type
+(`cmd/slk/reconnect_backfill.go`), `cache.BackfillCandidates`, and the
+`GetConversations` / `GetUsersContext` methods on `SlackAPI`.
+
+Re-derive with `rg -n 'func searchChannelsRemote'` before acting on any of
 them.
 
 ## Operational notes
@@ -136,4 +160,8 @@ them.
 - **The cache column mapping** is the most likely source of silent damage. `edge` results cover different column subsets than `UpsertChannel`/`UpsertUser` write, so revalidation goes through the partial writers in `internal/cache/edge_sync.go`. If avatars, membership or starred state start disappearing, look there first.
 - **`Result.Messages` is fetched and discarded.** `conversations.view` is currently pure cost — the channel still renders through the old cache + `GetHistory` path. Tasks 8-11 wire it. The `[]slack.Message` → `[]json.RawMessage` conversion in `cmd/slk/bootstrap_adapters.go` is lossy and unvalidated against a real render.
 - **Cold-cache convergence takes two boots.** The partial writers are UPDATE-only, so on an empty cache they find no rows; first-sight hydration inserts at version 0 and the next boot re-requests in full. Bytes, not correctness.
+- **The cold-cache `users.info` fan-out** is the standing risk that matters
+  most; see *Where we are*. Any measurement taken against a warm cache — which
+  is every measurement in this document and the Phase 2b outcomes doc except
+  the one that found it — says nothing about it.
 - **Nobody has tested any of this on Enterprise Grid**, and nobody should until all three phases land. Two contributors have already been signed out helping diagnose the original problem. The Phase 2a outcomes doc leads with this and so should any summary.
