@@ -65,8 +65,17 @@ fan-out's shape, not a delivered request count.
 
 Warm cache: 2 requests, which is why four tasks went by without noticing. Only
 an empty cache triggers it — i.e. a fresh install, which is exactly what a new
-Grid tester has. Details and the shape of the fix are in the Phase 2b outcomes
-doc.
+Grid tester has.
+
+**The captures say this work is unnecessary, not merely inefficient.** Counted
+across all 8: `/api/users.info` **0**, `/api/conversations.members` **0**,
+`/api/users.list` **0**. The official client uses `edge:users/list` for one
+channel at a time with `count: 30, present_first: true` (full user records
+inline, no resolution step), `edge:channels/membership` to test a specific set
+of users, and batched `edge:users/info` to revalidate — 291 records in 30
+responses. `internal/slack/edge` already implements all three, tested, and
+`membership.Manager` uses none of them. The fix is wiring. See the Phase 2b
+outcomes doc for the order of work.
 
 ## Corrections to the original design, made during the work
 

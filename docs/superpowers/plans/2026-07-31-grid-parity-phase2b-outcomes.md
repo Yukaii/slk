@@ -139,12 +139,52 @@ Two things are wrong and both need fixing:
 - **Eager.** These are the members of every channel the manager touches, not the
   authors of messages on screen. The mention picker shows at most 7 rows.
 
-The shape of the fix is already in the tree and unused for this purpose:
-`edge.UsersInfo(ctx, updatedIDs)` takes `{id: version}` in batches and is what
-`internal/bootstrap` already uses for revalidation. Routing resolver misses
-through it turns N requests into N/50 — but the real fix is to stop asking for
-users nobody is about to look at, which is a design question, not a batching
-one.
+### What the official client does instead — counted, not guessed
+
+Across all 8 captures:
+
+| endpoint | occurrences |
+|---|---|
+| `/api/users.info` | **0** |
+| `/api/conversations.members` | **0** |
+| `/api/users.list` | **0** |
+| `edge:users/info` | 30 responses carrying **291 user records** |
+| `edge:users/list` | 4 requests, each `channels:[1]`, `count: 20-30`, `present_first: true` |
+| `edge:channels/membership` | 10 requests, `users` arrays of length 1-66 |
+
+slk is wrong in two independent ways, and the second is the bigger one:
+
+1. **Wrong endpoint.** The official client never calls `/api/users.info`. It
+   revalidates in batches through `edge:users/info` — 291 records in 30
+   responses, roughly ten users per request, keyed `{id: version}`.
+2. **Wrong question.** slk asks `conversations.members` for *every* member id of
+   a channel and then resolves each one. The official client asks
+   `edge:users/list` for **one channel, `count: 30`, `present_first: true`** —
+   the first page of members, present users first, with full user records
+   inline and a `next_marker` for the rest. There is no resolution step at all.
+   When it needs to know whether specific users are in a channel it sends
+   `edge:channels/membership` with an explicit `users` array and reads back
+   `members` / `non_members` (10 for 10 observed responses satisfy
+   `members + non_members == users sent`).
+
+So the fan-out is not the same work done less efficiently. It is work the
+official client never does: a 40,000-member workspace costs it thirty user
+records per channel view.
+
+**The fix is wiring, not protocol work.** `internal/slack/edge` already has all
+three methods, built and tested in Phase 2a and currently unused by
+`membership.Manager`:
+
+```go
+func (c *Client) UsersList(ctx, channelID string, count int) (users []User, truncated bool, err error)
+func (c *Client) ChannelsMembership(ctx, channelID string, userIDs []string) (members, nonMembers []string, err error)
+func (c *Client) UsersInfo(ctx, updatedIDs map[string]int64) ([]User, error)
+```
+
+Order of work: point `membership.Manager` at `UsersList` so the per-member
+resolution never starts; bound `userResolver.Request` with a worker pool so
+whatever misses remain cannot burst; route those misses through `UsersInfo`
+batches rather than one request each.
 
 **This is Phase 2c's first task, and it blocks any Grid test.**
 
