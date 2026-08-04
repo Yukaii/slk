@@ -14,6 +14,7 @@ what changed underneath them.
 | [`plans/2026-07-31-grid-parity-phase2b-bootstrap-rewrite.md`](./2026-07-31-grid-parity-phase2b-bootstrap-rewrite.md) | The 12-task plan. Current, **but its `- [ ]` checkboxes were never ticked** — use the table below instead. Tasks 9/10/11 were re-scoped mid-flight; the file reflects that. |
 | [`plans/2026-07-30-grid-parity-phase1-outcomes.md`](./2026-07-30-grid-parity-phase1-outcomes.md) | Phase 1 retrospective. |
 | [`plans/2026-07-30-grid-parity-phase2a-outcomes.md`](./2026-07-30-grid-parity-phase2a-outcomes.md) | Phase 2a retrospective. Its *Test-integrity findings* section is the most useful thing to read before writing any test here. |
+| [`plans/2026-08-03-grid-parity-qa-checklist.md`](./2026-08-03-grid-parity-qa-checklist.md) | **The manual QA gate.** Nothing in Phase 2b was confirmed to still *work* — only that it stopped enumerating. Run this before any Grid test. |
 | [`plans/2026-07-31-grid-parity-phase2b-outcomes.md`](./2026-07-31-grid-parity-phase2b-outcomes.md) | **Phase 2b retrospective, 2026-08-03. Read its first section before anything else** — it opens with a cold-cache regression that blocks Grid testing. |
 
 ## Where we are
