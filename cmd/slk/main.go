@@ -690,6 +690,7 @@ func run() error {
 	// of truth). Falls back to cached tokens when offline / desktop absent.
 	tokens = remintTokens(context.Background(), tokens,
 		slackdesktop.Cookie,
+		slackdesktop.Tokens,
 		slackclient.MintToken,
 		tokenStore.Save,
 	)
