@@ -161,6 +161,16 @@ func endpointName(rawURL string) (string, bool) {
 		if name == "" {
 			return "", false
 		}
+		// Slack Web API method names never contain a slash:
+		// users.info, conversations.history, client.userBoot. Further
+		// path segments under /api/ mean an asset, not a method —
+		// manual QA caught an image tallied as
+		// "v1/images/stellar/prod/card-20260730181521756.png" — and
+		// counting those overstates the numbers the success criteria
+		// are quoted in.
+		if strings.Contains(name, "/") {
+			return "", false
+		}
 		return name, true
 	}
 	return "", false

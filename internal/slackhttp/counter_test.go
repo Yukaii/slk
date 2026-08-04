@@ -42,6 +42,30 @@ func TestCounter_IgnoresNonAPIURLs(t *testing.T) {
 	}
 }
 
+func TestCounter_IgnoresAssetPathsThatContainAPI(t *testing.T) {
+	// Found during manual QA: an image URL whose PATH contains /api/
+	// was tallied as an API call, showing up in a boot report as
+	// "1  v1/images/stellar/prod/card-20260730181521756.png".
+	//
+	// Slack Web API method names never contain a slash -- they are
+	// users.info, conversations.history, client.userBoot. Anything
+	// with a path separator after /api/ is something else, and the
+	// whole point of this counter is that the numbers in the success
+	// criteria can be quoted without qualification.
+	var c Counter
+	c.Record("https://slack.com/api/v1/images/stellar/prod/card-20260730181521756.png")
+	c.Record("https://example.invalid/api/some/nested/thing")
+	if got := c.Snapshot(); len(got) != 0 {
+		t.Errorf("Snapshot() = %v; want empty -- a slash-bearing path after /api/ is not a Slack method", got)
+	}
+
+	// The real ones must still count.
+	c.Record("https://slack.com/api/users.info")
+	if got := c.Snapshot()["users.info"]; got != 1 {
+		t.Errorf("users.info = %d; want 1 -- the exclusion must not swallow real methods", got)
+	}
+}
+
 func TestCounter_SnapshotIsACopy(t *testing.T) {
 	var c Counter
 	c.Record("https://slack.com/api/client.counts")

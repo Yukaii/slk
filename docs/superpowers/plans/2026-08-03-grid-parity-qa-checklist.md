@@ -151,7 +151,19 @@ The Phase 2a partial writers (`internal/cache/edge_sync.go`) update rows from
 edge responses that cannot populate every column. If they ever write a full
 upsert by mistake, these three go blank — silently, and days later.
 
-- [ ] **4.1 Muted channels are still muted** and render dimmed.
+- [ ] **4.1 Muted channels are still muted.** There is no visual treatment for
+      mute in the sidebar, so check the log instead — slk records what it
+      loaded at boot:
+
+      ```bash
+      grep 'mute store bootstrap\|marked IsMuted after build' slk-debug.log
+      ```
+
+      Compare the count against the number of muted channels the official
+      client shows you. A count of 0 when you have muted channels means the
+      mute state was lost; a plausible non-zero count means it survived.
+      → Suspect: `bootMutedChannels` (mute now comes from `userBoot`'s prefs
+      rather than a `users.prefs.get` round trip).
 - [ ] **4.2 Starred channels still appear in the Starred section.**
 - [ ] **4.3 Your channels are still yours** — nothing you are a member of has
       dropped out of the sidebar.
@@ -309,6 +321,25 @@ existing HAR captures: worktree root, gitignored, never committed, never
 pasted into a document.**
 
 ---
+
+## Results so far
+
+| section | date | result |
+|---|---|---|
+| 1. Provenance | 2026-08-04 | pass, on the second attempt — the first ran a stale binary |
+| 2. Cold cache | 2026-08-04 | **pass.** 235 `users.info` (was 37,573 on the old binary), 330 total, responsive throughout, no load spike. No `conversations.view` and two `emoji.list` calls, which is correct for a profile with no visit history: nothing to restore, so no view response, so the emoji fallback covers both workspaces. |
+| 3. Unread state | 2026-08-04 | pass, provisionally — every item checked out by eye against the official client. Real confidence needs users. |
+| 4. Muted / starred / membership | 2026-08-04 | starred present, no channels missing. Mute unverified: 4.1 originally assumed a visual treatment that does not exist; rewritten as a log check, not yet run. |
+
+Two things manual QA found that the automated work did not:
+
+- The counter tallied an asset URL whose path contained `/api/` as though it
+  were an API call. Fixed; Slack method names never contain a slash.
+- `conversations.members` reached 54 in a real session (one per channel
+  visited) against 3 in a 35-second scripted run. It is bounded by user
+  action rather than workspace size, so it is not a scraper signature, but it
+  is the call `edge:users/list` would remove and this workspace has 40,504
+  distinct channel members.
 
 ## What this checklist cannot tell you
 
