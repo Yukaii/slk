@@ -1,5 +1,40 @@
 # Grid Parity Phase 2b — Outcomes
 
+## FIRST GRID EVIDENCE — 2026-08-04
+
+A Grid user tested `v0.13.0-beta.1` (gammons/slk#5). Both halves matter.
+
+**It no longer signs them out.** That is this project's actual success
+criterion, and it now has one data point behind it rather than zero. Every
+number elsewhere in this document is a proxy for that sentence.
+
+**And conditional revalidation does not work on Grid at all.**
+`channels/info could not resolve 217 ids` — every conversation they have.
+The likely cause is a code-level asymmetry nobody could have caught without a
+Grid account:
+
+| | host | scoping |
+|---|---|---|
+| workspace API (`internal/slack/client.go:305`) | `deriveAPIBaseURL(resp.URL)` → `https://<org>.n.slack.com/api/` on Grid | grid-aware |
+| edge API (`internal/slack/edge/client.go:73`) | hardcoded `https://edgeapi.slack.com` | `/cache/<single teamID>/…` |
+
+slk models a workspace; Grid is an org containing many. If a user's
+conversations span several workspaces in the org, asking one team's edge cache
+about all of them fails for all of them — which is exactly the log line.
+
+Also reported: `stars.list` returns `enterprise_is_restricted` (benign, the
+Starred section hides), and **the channel list renders empty** — not yet
+explained, since failed revalidation deliberately leaves channels stale rather
+than removing them. Diagnostics requested on the issue.
+
+**What this says about the method.** The top of this document and the STATE doc
+both said "nobody has tested this on Grid" and treated it as the standing risk.
+That risk materialised on the first contact, in the one subsystem two phases
+were built around. Measurements on non-Grid workspaces could not have found it;
+neither could the test suite, which fakes the edge client. Phase 2c's first task
+is making the edge client grid-aware, and its first verification is a Grid user,
+not a counter.
+
 ## Should a Grid tester try this yet?
 
 **Not yet, but the blocker below is fixed.** See *Status of the cold-cache
