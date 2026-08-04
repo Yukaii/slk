@@ -17,16 +17,40 @@ specific deletion, and knowing which one saves an afternoon.
 
 ## 1. Setup
 
+### 1.0 Build to a distinct name, and run it by absolute path
+
+**There is a stale `slk` binary in the main checkout** (`~/local_code/slk/slk`),
+predating all of this work. A `./slk` typed from the wrong directory silently
+runs it, and the first QA attempt of this checklist did exactly that — the whole
+session measured code from July, and the "bug" it found was the original one.
+
+So: build under a name that cannot collide, and always invoke it by full path.
+
 ```bash
 cd ~/local_code/slk/.worktrees/grid-parity-phase1
-git log --oneline -1          # expect a05f9d4 or later on feat/grid-parity
-go build -o slk ./cmd/slk
+git log --oneline -1                    # expect a05f9d4 or later on feat/grid-parity
+go build -o slk-qa ./cmd/slk
+export SLKQA=$PWD/slk-qa
 ```
+
+### 1.1 Prove you are running the right binary — do this EVERY session
+
+Run `$SLKQA` for a few seconds, quit normally, then:
+
+```bash
+grep -c 'shutdown API request tally' slk-debug.log   # must be 1
+grep -c 'channel-phase\|trigger=reconnect'  slk-debug.log   # must be 0
+```
+
+The tally exists only in the new code; `channel-phase` and `trigger=reconnect`
+exist only in the deleted backfiller. **If those numbers come out the other way
+around, you are running the old binary and nothing you observe is about this
+work.** No other check in this document means anything until this one passes.
 
 Run everything with the counter on:
 
 ```bash
-SLK_DEBUG=1 ./slk
+SLK_DEBUG=1 $SLKQA
 ```
 
 `slk-debug.log` is written to the **current directory** and **truncated on every
@@ -65,13 +89,28 @@ also exactly what a new Grid tester's first run looks like. Do it before
 anything else.
 
 ```bash
+rm -rf /tmp/slkcold                      # always start from nothing
 mkdir -p /tmp/slkcold/data/slk /tmp/slkcold/cache
 cp -r ~/.local/share/slk/tokens /tmp/slkcold/data/slk/tokens
-SLK_DEBUG=1 XDG_DATA_HOME=/tmp/slkcold/data XDG_CACHE_HOME=/tmp/slkcold/cache ./slk
+SLK_DEBUG=1 XDG_DATA_HOME=/tmp/slkcold/data XDG_CACHE_HOME=/tmp/slkcold/cache $SLKQA
 # ... use it for a minute, then quit normally
 grep -A30 'shutdown API request tally' slk-debug.log
-rm -rf /tmp/slkcold          # DELETE THE TOKEN COPY WHEN DONE
+rm -rf /tmp/slkcold                      # DELETE THE TOKEN COPY WHEN DONE
 ```
+
+**If the machine bogs down — load climbing past ~10, UI unresponsive — that is
+the symptom of the pre-fix fan-out.** Before debugging anything, re-run the 1.1
+provenance check on that session's log. The first QA attempt hit exactly this
+and it was a stale binary.
+
+For reference, what the OLD binary does on a cold cache with this workspace, and
+what the fix is measured against:
+
+| | old (July binary) | fixed |
+|---|---|---|
+| `users.info` requests | 37,573 (one per distinct channel member) | ~200 |
+| rate-limit errors | 30,713, ignored, no backoff | — |
+| load average | ~30, UI unresponsive | normal |
 
 - [ ] **2.1 It boots at all.** Sidebar populates, a channel opens.
 - [ ] **2.2 `users.info` is in the low hundreds, not thousands.** Reference after
