@@ -86,6 +86,13 @@ const (
 // finally lands on.
 const openThreadDebounceDelay = 200 * time.Millisecond
 
+// channelSearchDebounceDelay is how long the channel finder waits for
+// typing to stop before asking the server. ~300 ms is the figure the
+// Phase 2b design fixed on from the captures, where a four-second
+// typing session produced two channels/search requests — about one per
+// pause, never one per keystroke.
+const channelSearchDebounceDelay = 300 * time.Millisecond
+
 type App struct {
 	// Sub-models
 	workspaceRail    workspace.Model
@@ -241,6 +248,18 @@ type App struct {
 	// callers (activation, list reload, G jump) do NOT bump this — bumping there
 	// would needlessly invalidate any in-flight debounced fetch about to land.
 	pendingThreadFetchGen uint64
+
+	// pendingChannelSearchGen is bumped by every channel-finder
+	// keystroke that changes the query, including the one that empties
+	// it. channelSearchDebounceMsg runs the search only when its gen
+	// still matches, so a burst of keystrokes issues one request for
+	// the query the user stopped on — and deleting back to empty
+	// cancels the request that was about to go out.
+	pendingChannelSearchGen uint64
+
+	// channelSearchDebounce is the finder's debounce window. A field
+	// rather than the constant so tests can collapse it.
+	channelSearchDebounce time.Duration
 
 	// emojiInvalidatePending guards against scheduling multiple tick
 	// callbacks when many EmojiImageReadyMsg arrive in rapid succession
@@ -443,55 +462,56 @@ func NewApp() *App {
 	// first ChannelSelectedMsg apply records the channel on it.
 	wins, rootWin := wintree.New(wintree.Channel{})
 	app := &App{
-		workspaceRail:        workspace.New(nil, 0),
-		sidebar:              sidebar.New(nil),
-		compose:              compose.New(""),
-		statusbar:            statusbar.New(),
-		channelFinder:        channelfinder.New(),
-		searchResults:        searchresults.New(),
-		newMessagePicker:     newmessagepicker.New(),
-		workspaceFinder:      workspacefinder.New(),
-		themeSwitcher:        themeswitcher.New(),
-		presenceMenu:         presencemenu.New(),
-		help:                 help.New(),
-		threadPanel:          thread.New(),
-		threadCompose:        compose.New("thread"),
-		threadsView:          threadsview.New(nil, ""),
-		linkPicker:           linkpicker.New(),
-		reactionPicker:       reactionpicker.New(),
-		reactionsView:        reactionsview.New(),
-		confirmPrompt:        confirmprompt.New(),
-		mode:                 ModeNormal,
-		focusedPanel:         PanelSidebar,
-		wins:                 wins,
-		focusedWin:           rootWin,
-		sidebarVisible:       true,
-		view:                 ViewChannels,
-		keys:                 DefaultKeyMap(),
-		selfSend:             newSelfSendDedup(),
-		bootstrap:            newWorkspaceBootstrap(),
-		windowTitle:          "slk",
-		threadsDirtyDebounce: 150 * time.Millisecond,
-		fetchingOlder:        map[string]bool{},
-		mouseWheelLines:      3,
-		userNames:            map[string]string{},
-		externalUsers:        map[string]bool{},
-		presence:             newPresenceController(),
-		renderCache:          newPanelRenderCache(),
-		drag:                 newDragState(),
-		preview:              newImagePreviewController(),
-		layout:               newPanelLayout(),
-		reactions:            noopReactionService,
-		threads:              noopThreadService,
-		messageSvc:           noopMessageService,
-		channels:             noopChannelService,
-		searchSvc:            noopSearchService,
-		lastChannelByTeam:    map[string]string{},
-		workspaceDomains:     map[string]string{},
-		browserOpener:        openURLCmd,
-		navHistory:           newNavHistoryStore(),
-		clipboardRead:        defaultClipboardReader,
-		clipboardWrite:       defaultClipboardWriter,
+		workspaceRail:         workspace.New(nil, 0),
+		sidebar:               sidebar.New(nil),
+		compose:               compose.New(""),
+		statusbar:             statusbar.New(),
+		channelFinder:         channelfinder.New(),
+		searchResults:         searchresults.New(),
+		newMessagePicker:      newmessagepicker.New(),
+		workspaceFinder:       workspacefinder.New(),
+		themeSwitcher:         themeswitcher.New(),
+		presenceMenu:          presencemenu.New(),
+		help:                  help.New(),
+		threadPanel:           thread.New(),
+		threadCompose:         compose.New("thread"),
+		threadsView:           threadsview.New(nil, ""),
+		linkPicker:            linkpicker.New(),
+		reactionPicker:        reactionpicker.New(),
+		reactionsView:         reactionsview.New(),
+		confirmPrompt:         confirmprompt.New(),
+		mode:                  ModeNormal,
+		focusedPanel:          PanelSidebar,
+		wins:                  wins,
+		focusedWin:            rootWin,
+		sidebarVisible:        true,
+		view:                  ViewChannels,
+		keys:                  DefaultKeyMap(),
+		selfSend:              newSelfSendDedup(),
+		bootstrap:             newWorkspaceBootstrap(),
+		windowTitle:           "slk",
+		threadsDirtyDebounce:  150 * time.Millisecond,
+		channelSearchDebounce: channelSearchDebounceDelay,
+		fetchingOlder:         map[string]bool{},
+		mouseWheelLines:       3,
+		userNames:             map[string]string{},
+		externalUsers:         map[string]bool{},
+		presence:              newPresenceController(),
+		renderCache:           newPanelRenderCache(),
+		drag:                  newDragState(),
+		preview:               newImagePreviewController(),
+		layout:                newPanelLayout(),
+		reactions:             noopReactionService,
+		threads:               noopThreadService,
+		messageSvc:            noopMessageService,
+		channels:              noopChannelService,
+		searchSvc:             noopSearchService,
+		lastChannelByTeam:     map[string]string{},
+		workspaceDomains:      map[string]string{},
+		browserOpener:         openURLCmd,
+		navHistory:            newNavHistoryStore(),
+		clipboardRead:         defaultClipboardReader,
+		clipboardWrite:        defaultClipboardWriter,
 	}
 	// Root model deliberately bypasses newWindowModel: the config
 	// retention fields (avatarFn, userNames, emojiCtx, ...) are still
@@ -3174,4 +3194,29 @@ func (a *App) uploadToastCmd(text string, dur time.Duration) tea.Cmd {
 			return statusbar.CopiedClearMsg{}
 		}),
 	)
+}
+
+// scheduleChannelSearch defers a channels/search for the finder's
+// current query.
+//
+// The generation is bumped on every call, including the ones that
+// return nil: emptying the query must cancel the request that the last
+// keystroke had already scheduled, and only a bump can do that. An
+// empty query issues nothing — edge.ChannelsSearch would return early
+// anyway, but queueing the request and dropping it at the far end
+// still leaves a timer running against a finder that is on its way
+// closed.
+func (a *App) scheduleChannelSearch(query string) tea.Cmd {
+	a.pendingChannelSearchGen++
+	if query == "" {
+		return nil
+	}
+	gen := a.pendingChannelSearchGen
+	delay := a.channelSearchDebounce
+	if delay <= 0 {
+		delay = channelSearchDebounceDelay
+	}
+	return tea.Tick(delay, func(time.Time) tea.Msg {
+		return channelSearchDebounceMsg{query: query, gen: gen}
+	})
 }

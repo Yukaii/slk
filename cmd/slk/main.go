@@ -9,6 +9,7 @@ import (
 	"image"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,6 +21,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/gammons/slk/internal/avatar"
+	"github.com/gammons/slk/internal/bootstrap"
 	"github.com/gammons/slk/internal/cache"
 	"github.com/gammons/slk/internal/config"
 	"github.com/gammons/slk/internal/debuglog"
@@ -29,6 +31,7 @@ import (
 	"github.com/gammons/slk/internal/notify"
 	"github.com/gammons/slk/internal/service"
 	slackclient "github.com/gammons/slk/internal/slack"
+	"github.com/gammons/slk/internal/slack/edge"
 	"github.com/gammons/slk/internal/slack/membership"
 	"github.com/gammons/slk/internal/slackdesktop"
 	"github.com/gammons/slk/internal/slackhttp"
@@ -100,19 +103,23 @@ func (a sectionsProviderAdapter) OrderedSlackSections() []sidebar.SectionMeta {
 
 // WorkspaceContext holds all state for a single connected workspace.
 type WorkspaceContext struct {
-	Client     *slackclient.Client
+	Client *slackclient.Client
+	// Edge is the edgeapi client for this workspace: the
+	// conditional-revalidation and server-side-search endpoints. Nil
+	// only if construction failed, and every caller nil-checks.
+	Edge       *edge.Client
 	ConnMgr    *slackclient.ConnectionManager
 	RTMHandler *rtmEventHandler
 	UserNames  map[string]string
 	// AvatarURLs maps userID -> avatar image URL. Populated from the
 	// local users cache at connect time (synchronous, before any
-	// goroutines spin up) and refreshed from the background
-	// client.GetUsers fetch and on-demand resolveUser calls. Read by
+	// goroutines spin up), from conversations.view's users array via
+	// applyBootUsers, and from on-demand resolveUser calls. Read by
 	// the AvatarFunc closure on the UI goroutine to trigger a lazy
 	// avatar Preload when an avatar slot first renders empty.
 	//
 	// sync.Map (not a plain map) because writes happen from background
-	// goroutines (GetUsers fetch, resolveUser) while reads happen on
+	// goroutines (resolveUser, the unresolved-DM sweep) while reads happen on
 	// the bubbletea Update goroutine. The lookup-or-trigger pattern
 	// (LoadOrStore-style) doesn't apply here — we only call Load — but
 	// we still need a concurrent map to avoid Go's "concurrent map
@@ -123,10 +130,10 @@ type WorkspaceContext struct {
 	// handles in mpdm channel names like `mpdm-grant--myles--ray-1`.
 	UserNamesByHandle map[string]string
 	// BotUserIDs is the set of user IDs known to be Slack apps or bots.
-	// Populated from the local cache on startup and refreshed by the
-	// background users.list fetch and any on-demand resolveUser calls.
-	// Used during channel construction to bucket app DMs into a separate
-	// "Apps" sidebar section.
+	// Populated from the local cache on startup, from
+	// conversations.view's users array via applyBootUsers, and by any
+	// on-demand resolveUser calls. Used during channel construction to
+	// bucket app DMs into a separate "Apps" sidebar section.
 	BotUserIDs map[string]bool
 	// SectionStore holds the user's Slack-native sidebar sections for
 	// this workspace. Nil when use_slack_sections is disabled, the
@@ -148,18 +155,23 @@ type WorkspaceContext struct {
 	// us the workspace has zero unread threads, we trust that and
 	// suppress the heuristic-derived flags entirely.
 	ThreadsHasUnreads bool
+	// ThreadSubsOnce gates the workspace's one
+	// subscriptions.thread.getView fetch, fired on the first open of
+	// the Threads view. See ensureThreadSubscriptions.
+	ThreadSubsOnce sync.Once
 	// SubscriptionsAvailable indicates whether the most recent
-	// runSubscriptionPhase attempt succeeded in fetching Slack's
+	// threadSubscriptionSync attempt succeeded in fetching Slack's
 	// authoritative thread-subscription list. true on bootstrap
-	// (optimistic — no banner during the brief pre-bootstrap
-	// window) and after every successful subscription phase; false
-	// after a failed one. The UI uses it to decide whether to draw
-	// the "Threads list unavailable" banner.
+	// (optimistic — no banner before the first Threads-view open, by
+	// which point nothing has been attempted) and after every
+	// successful sync; false after a failed one. The UI uses it to
+	// decide whether to draw the "Threads list unavailable" banner.
 	SubscriptionsAvailable bool
 	Channels               []sidebar.ChannelItem
-	// FinderItems is the merged list shown in the Ctrl+T finder. Initially
-	// contains only joined channels; the BrowseableChannelsLoadedMsg pipeline
-	// extends it with non-joined public channels in the background.
+	// FinderItems is the list shown in the Ctrl+T finder: the channels
+	// the user has joined. Channels they have not joined are not held
+	// here at all — they arrive per query from the finder's debounced
+	// channels/search and live only in the finder component.
 	FinderItems   []channelfinder.Item
 	TeamID        string
 	TeamName      string
@@ -248,6 +260,20 @@ func (r *workspaceRouter) ByID(teamID string) *WorkspaceContext {
 	return r.all[teamID]
 }
 
+// userResolverConcurrency caps how many users.info round trips the
+// resolver has open at once.
+//
+// The number is a rate bound, not a throughput target. Before it,
+// Request spawned one goroutine per unresolved user with nothing
+// between it and the transport, and a cold cache turned that into a
+// 40,000-request burst -- one per distinct channel member -- all
+// entering RoundTrip within moments of each other. The membership
+// fan-out that produced that particular burst is gone, but Request is
+// still reachable from the render path, the unresolved-DM sweep and
+// inbound messages, so the bound stays. Eight is well under what a
+// browser opens to one host and far more than a person generates.
+const userResolverConcurrency = 8
+
 // userResolver dispatches users.info lookups for unknown message
 // authors in the background. Deduplicates concurrent requests for
 // the same userID; failures are silent (the row stays rendered as
@@ -260,6 +286,11 @@ type userResolver struct {
 	avatars  *avatar.Cache
 	send     func(tea.Msg)
 	inflight sync.Map // userID -> struct{}
+	// sem bounds concurrent round trips. Buffered, so acquiring it
+	// happens inside the request goroutine and Request itself never
+	// blocks -- it is called from the render path and from WS event
+	// handlers, neither of which may wait on the network.
+	sem chan struct{}
 }
 
 func newUserResolver(
@@ -275,6 +306,7 @@ func newUserResolver(
 		db:      db,
 		avatars: avatars,
 		send:    send,
+		sem:     make(chan struct{}, userResolverConcurrency),
 	}
 }
 
@@ -309,6 +341,10 @@ func (r *userResolver) Request(userID string) {
 	}
 	go func() {
 		defer r.inflight.Delete(userID)
+		if r.sem != nil {
+			r.sem <- struct{}{}
+			defer func() { <-r.sem }()
+		}
 		u, err := r.client.GetUserProfile(userID)
 		if err != nil {
 			debuglog.Cache("userResolver: GetUserProfile team=%s user=%s err=%v",
@@ -557,6 +593,18 @@ Docs:    https://github.com/gammons/slk
 `, version)
 }
 
+// newImageHTTPClient builds the HTTP client the avatar/thumbnail
+// fetcher uses.
+//
+// Split out of run() so a test can pin the wiring: the difference
+// between this and the XHR client is invisible at the call site but
+// changes every asset request on the wire.
+func newImageHTTPClient() *http.Client {
+	c := slackhttp.NewImageHTTPClient(nil)
+	c.Timeout = 10 * time.Second
+	return c
+}
+
 func run() error {
 	// Resolve XDG paths
 	configDir := xdgConfig()
@@ -705,9 +753,7 @@ func run() error {
 		})
 		log.Printf("image fetcher: registered team %q (%s) for file auth", t.TeamName, t.TeamID)
 	}
-	imageHTTPClient := slackhttp.NewBrowserHTTPClient(nil)
-	imageHTTPClient.Timeout = 10 * time.Second
-	imageFetcher := imgpkg.NewFetcher(imageCache, imageHTTPClient)
+	imageFetcher := imgpkg.NewFetcher(imageCache, newImageHTTPClient())
 	imageFetcher.SetAuths(auths)
 
 	// Migrate old avatar cache (one-time, idempotent).
@@ -872,7 +918,7 @@ func run() error {
 	// goroutine for every message authored row. The fast path is a
 	// straight map lookup; on miss, we trigger a background Preload
 	// keyed by the workspace's AvatarURLs (populated at connect time
-	// from the local user cache and refreshed by the GetUsers fetch).
+	// from the local user cache and from the boot response).
 	// The avatar.Cache's inflight dedup ensures only one Preload runs
 	// per userID regardless of how many redraws hit the miss path
 	// before completion. On completion, Cache.SetOnReady (wired below
@@ -889,8 +935,8 @@ func run() error {
 			return rendered
 		}
 		// Cache miss: trigger a lazy Preload using the URL the
-		// workspace recorded at connect time (or that GetUsers
-		// refreshed). No router-active = pre-workspace-ready render;
+		// workspace recorded at connect time (or that resolveUser
+		// filled in). No router-active = pre-workspace-ready render;
 		// AvatarReadyMsg will invalidate once the avatar lands.
 		wctx := router.Active()
 		if wctx == nil || wctx.AvatarURLs == nil {
@@ -1093,6 +1139,18 @@ func run() error {
 			},
 			SyncedAt: func(channelID ids.ChannelID) int64 {
 				return db.GetChannelSyncedAt(string(channelID))
+			},
+			// The finder's non-joined results. Debounced by the App
+			// (see scheduleChannelSearch) and only ever called for a
+			// non-empty query, so this runs once per typing pause
+			// rather than once per boot per workspace, which is what
+			// the conversations.list walk it replaced did.
+			SearchRemote: func(query string) []channelfinder.Item {
+				wctx := router.Active()
+				if wctx == nil {
+					return nil
+				}
+				return searchChannelsRemote(ctx, wctx.Edge, wctx.LastVisitedByChannel, query)
 			},
 			MembershipFetch: func(channelID ids.ChannelID) {
 				wctx := router.Active()
@@ -1472,6 +1530,25 @@ func run() error {
 					SubscriptionsAvailable: wctx.SubscriptionsAvailable,
 				}
 			},
+			// First open of the Threads view for this workspace is what
+			// pays for subscriptions.thread.getView, instead of every
+			// boot and (before that) every reconnect. Returns
+			// immediately; the list renders from cache and refreshes
+			// via ThreadsListDirtyMsg when the fetch lands.
+			EnsureSubscriptions: func(teamID ids.TeamID) {
+				wctx := router.Active()
+				if wctx == nil || string(teamID) != wctx.TeamID {
+					return
+				}
+				ensureThreadSubscriptions(ctx, &wctx.ThreadSubsOnce,
+					&threadSubscriptionSync{
+						client:      wctx.Client,
+						db:          db,
+						workspaceID: wctx.TeamID,
+						availableCb: func(available bool) { wctx.SubscriptionsAvailable = available },
+					},
+					func() { p.Send(ui.ThreadsListDirtyMsg{TeamID: wctx.TeamID}) })
+			},
 			ChannelLastRead: func(channelID ids.ChannelID) string {
 				wctx := router.Active()
 				if wctx == nil {
@@ -1641,7 +1718,7 @@ func run() error {
 	// Results are sent to the TUI via p.Send()
 	for _, ot := range orderedTokens {
 		go func(tok slackclient.Token) {
-			wctx, err := connectWorkspace(ctx, tok, db, cfg, avatarCache, p)
+			wctx, err := connectWorkspace(ctx, tok, db, cfg, avatarCache, p, configPath)
 			if err != nil {
 				p.Send(ui.WorkspaceFailedMsg{TeamName: tok.TeamName})
 				return
@@ -1698,6 +1775,22 @@ func run() error {
 				cfg:             cfg,
 				wsCtx:           wctx,
 				backfillGate:    dedupeGate{window: 30 * time.Second},
+				// The reconnect refresh, deliberately NOT the
+				// ChannelService.Fetch closure: that one also marks the
+				// channel read, which is right when the user just
+				// clicked into it and wrong here, where slk is catching
+				// up on messages that arrived while it was offline and
+				// the user may not have looked at the terminal for
+				// hours.
+				refreshChannel: func(ctx context.Context, channelID string) {
+					msgItems := fetchChannelMessages(wctx.Client, channelID, db, wctx.UserNames, tsFormat, avatarCache, router)
+					state, _ := db.GetChannelReadState(channelID)
+					p.Send(ui.MessagesLoadedMsg{
+						ChannelID:  channelID,
+						Messages:   msgItems,
+						LastReadTS: state.LastReadTS,
+					})
+				},
 			}
 			wctx.RTMHandler = handler
 			wctx.ConnMgr = slackclient.NewConnectionManager(wctx.Client, handler)
@@ -1729,7 +1822,7 @@ func run() error {
 				UserNames:        wctx.UserNames,
 				ExternalUsers:    external,
 				UserID:           wctx.UserID,
-				CustomEmoji:      wctx.CustomEmoji,  // empty at this point; filled by the goroutine below
+				CustomEmoji:      wctx.CustomEmoji,  // from conversations.view, or filled by the goroutine below
 				UserGroups:       wctx.UserGroups(), // empty at this point; filled by the goroutine below
 				SectionsProvider: sectionsProviderAdapter{store: wctx.SectionStore},
 				InitialActive:    isInitial,
@@ -1741,6 +1834,11 @@ func run() error {
 			// emoji picker entries. Best-effort: failure leaves the picker
 			// using built-ins only.
 			go func(teamID string) {
+				// Nothing to fetch when conversations.view already
+				// returned them, which is the normal path.
+				if len(wctx.CustomEmoji) > 0 {
+					return
+				}
 				emojis, err := wctx.Client.ListCustomEmoji(ctx)
 				if err != nil {
 					return
@@ -1769,11 +1867,6 @@ func run() error {
 					UserGroups: byID,
 				})
 			}(wctx.TeamID)
-
-			// Background fetch of all public channels so the finder can show
-			// channels the user is not yet a member of. Slow on big workspaces;
-			// must not block initial workspace readiness.
-			go fetchBrowseableChannels(ctx, wctx, p)
 
 			// Resolve unknown DM user names in background
 			if len(wctx.UnresolvedDMs) > 0 {
@@ -1809,11 +1902,27 @@ func run() error {
 			if wctx == nil || wctx.RTMHandler == nil {
 				continue
 			}
-			wctx.RTMHandler.triggerBackfill("wake")
+			wctx.RTMHandler.syncOnReconnect("wake")
 		}
 	}).Run(wakeCtx)
 
 	_, err = p.Run()
+
+	// Dump the API request tally before anything else at shutdown.
+	//
+	// Phase 2b's success criteria are call counts -- "a boot issues
+	// <= 10 API calls, with zero users.list and zero per-channel
+	// conversations.history fan-out" -- and nothing in slk could
+	// report them. Reconstructing the numbers from a debug log only
+	// worked at all because triggerBackfill happens to log per
+	// channel; there was no way to see users.list or a total.
+	//
+	// Nobody is testing slk against a real Enterprise Grid account
+	// until the whole grid-parity series lands, so this is the only
+	// feedback loop the work has.
+	if debuglog.Enabled() {
+		debuglog.General("shutdown API request tally:\n%s", slackhttp.DefaultCounter.Report())
+	}
 
 	// Clean up connection managers
 	for _, wctx := range workspaces {
@@ -1867,14 +1976,60 @@ func slugifyHandle(name string) string {
 	return b.String()
 }
 
-func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB, cfg config.Config, avatarCache *avatar.Cache, p *tea.Program) (*WorkspaceContext, error) {
+// shouldReloadTimeout bounds the background _x_version_ts refresh.
+// Matches slackclient.MintToken's 15s — the only other bounded Slack
+// HTTP call in slk — rather than inventing a second number for the
+// same job. Nothing waits on this refresh, so a generous bound costs
+// nothing, while a tight one would turn a merely slow proxy into a
+// lost refresh and a stale build timestamp.
+const shouldReloadTimeout = 15 * time.Second
+
+func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB, cfg config.Config, avatarCache *avatar.Cache, p *tea.Program, configPath string) (*WorkspaceContext, error) {
 	client := slackclient.NewClient(token.AccessToken, token.Cookie)
+
+	// Seed the build timestamp from the last run so the very first
+	// request of this session already carries a current _x_version_ts
+	// instead of the compiled-in fallback.
+	seedVersionTS(client.Envelope(), cfg, token.TeamID)
+
 	if err := client.Connect(ctx); err != nil {
 		return nil, fmt.Errorf("connecting %s: %w", token.TeamName, err)
 	}
 
+	// Refresh the build timestamp in the background. Failure is
+	// non-fatal: the seeded or compiled-in value stays in use.
+	go func() {
+		// The API client sets no http.Client.Timeout, and
+		// http.DefaultTransport bounds only the dial and the TLS
+		// handshake — not the response headers or body. A server that
+		// accepts the connection and then never answers (captive
+		// portal, wedged corporate proxy — see #111) would otherwise
+		// pin this goroutine and its connection for the whole life of
+		// the process, because ctx here is the app root context.
+		rctx, cancel := context.WithTimeout(ctx, shouldReloadTimeout)
+		defer cancel()
+		ts, err := client.ShouldReload(rctx)
+		if err != nil {
+			debuglog.General("shouldReload: %v", err)
+			return
+		}
+		if env := client.Envelope(); env != nil {
+			env.SetVersionTS(ts)
+		}
+		tomlKey := workspaceTOMLKey(cfg, client.TeamID())
+		if err := saveWorkspaceVersionTS(configPath, tomlKey, client.TeamID(), token.TeamName, ts); err != nil {
+			debuglog.General("saving version_ts: %v", err)
+		}
+	}()
+
 	wctx := &WorkspaceContext{
-		Client:               client,
+		Client: client,
+		// Same construction as newBootstrapDeps makes for
+		// revalidation, and for the same reason it must be
+		// client.HTTPClient(): edge.New needs the
+		// BrowserTransport-carrying client, and a plain one differs
+		// only in what goes on the wire.
+		Edge:                 edge.New(token.AccessToken, client.TeamID(), client.HTTPClient()),
 		TeamID:               client.TeamID(),
 		TeamName:             token.TeamName,
 		UserID:               client.UserID(),
@@ -1968,6 +2123,45 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		wctx.LastVisitedByChannel = visits
 	}
 
+	// The boot sequence: client.userBoot, client.counts,
+	// conversations.view for the restored channel (falling back to
+	// conversations.history), and conditional revalidation of the
+	// cache against edgeapi. See internal/bootstrap.
+	//
+	// This runs AFTER the channel-visits load because
+	// mostRecentlyVisitedChannel reads wctx.LastVisitedByChannel,
+	// which that load fills. It is the same expression the UI is
+	// handed as WorkspaceReadyMsg.LastChannelID, so the channel
+	// bootstrap opens is the channel the sidebar restores rather than
+	// a second, differently-chosen one. Empty is legal and means "open
+	// nothing" — a fresh profile with no recorded visits.
+	//
+	// The old enumeration paths below (GetChannels, GetUnreadCounts,
+	// and the reconnect backfill) still run. That is
+	// deliberate for this commit: they are deleted one at a time in
+	// the tasks that follow, each next to the call that replaces it,
+	// so no intermediate commit leaves slk unable to boot. Until then
+	// slk does both, and the request tally goes UP.
+	res, err := bootstrap.Run(ctx, newBootstrapDeps(client, db, token.AccessToken,
+		mostRecentlyVisitedChannel(wctx.LastVisitedByChannel)))
+	if err != nil {
+		return nil, fmt.Errorf("bootstrapping %s: %w", token.TeamName, err)
+	}
+	// Order matters between these two: applyBootUsers fills
+	// wctx.BotUserIDs, which buildChannelItem reads to bucket app DMs,
+	// and hydrateFirstSight writes the cache rows the sidebar's
+	// channel list is later reconciled against.
+	applyBootUsers(wctx, res)
+	// conversations.view returns the workspace's custom emoji next to
+	// the history it was asked for, which is what emoji.list would
+	// have gone and fetched separately. Empty on the
+	// conversations.history fallback and when no channel was opened —
+	// the background fetch below still covers those.
+	if len(res.Emojis) > 0 {
+		wctx.CustomEmoji = res.Emojis
+	}
+	hydrateFirstSight(db, client.TeamID(), res)
+
 	// Initialize Slack-native section store if enabled. Bootstrap is
 	// best-effort: failure is logged, the field stays nil, and the
 	// resolver falls through to config-glob behavior. Doing this
@@ -2008,9 +2202,16 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 	// unmuted (the conservative default). pref_change WS events for
 	// muted_channels can still rebuild the store mid-session via
 	// MuteStore.ApplyPrefChange even if this initial fetch failed.
+	//
+	// The source is client.userBoot's prefs, not a users.prefs.get
+	// round trip: userBoot already returned all_notifications_prefs
+	// (and muted_channels on the workspaces that still ship it), so
+	// the second call asked the same server the same question. See
+	// bootMutedChannels, which merges the two exactly as
+	// slackclient.GetMutedChannels does.
 	{
 		store := service.NewMuteStore()
-		if err := store.Bootstrap(ctx, client); err != nil {
+		if err := store.Bootstrap(ctx, bootMutedChannels{res}); err != nil {
 			log.Printf("mute store bootstrap for %s failed: %v (channels will render as unmuted until first pref_change)", token.TeamName, err)
 		} else {
 			ids := store.MutedChannels()
@@ -2021,53 +2222,36 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		wctx.MuteStore = store
 	}
 
-	// Background user fetch
-	go func() {
-		users, err := client.GetUsers(ctx)
-		if err != nil {
-			return
-		}
-		for _, u := range users {
-			name := u.Profile.DisplayName
-			if name == "" {
-				name = u.RealName
-			}
-			if name == "" {
-				name = u.Name
-			}
-			wctx.UserNames[u.ID] = name
-			if u.Name != "" {
-				wctx.UserNamesByHandle[u.Name] = name
-			}
-			isBot := u.IsBot || u.IsAppUser
-			if isBot {
-				wctx.BotUserIDs[u.ID] = true
-			}
-			// Slack Connect / shared-channel guests have a TeamID
-			// that differs from this workspace's home TeamID. Empty
-			// TeamID is treated as internal (under-detect rather than
-			// falsely flag). Mirrors userResolver.Request semantics.
-			isExternal := u.TeamID != "" && u.TeamID != client.TeamID()
-			db.UpsertUser(cache.User{
-				ID:          u.ID,
-				WorkspaceID: client.TeamID(),
-				Name:        u.Name,
-				DisplayName: name,
-				AvatarURL:   u.Profile.Image32,
-				Presence:    "away",
-				IsBot:       isBot,
-				IsExternal:  isExternal,
-			})
-			// Record the avatar URL for lazy fetch (mirrors the cached-
-			// user seed above). The eager Preload was the second wave
-			// of the startup avatar burst — equally large on big
-			// workspaces — and is replaced by on-demand fetches driven
-			// by AvatarFunc.
-			if u.Profile.Image32 != "" {
-				wctx.AvatarURLs.Store(u.ID, u.Profile.Image32)
-			}
-		}
-	}()
+	// Thread subscriptions are deliberately NOT fetched here. They are
+	// pulled on the first open of the Threads view, by
+	// ensureThreadSubscriptions via the threads list fetcher. See that
+	// function for why: the call paginates to a 1000-item hard cap,
+	// ~62 requests per workspace on a real account, and the Threads
+	// view is not on screen at boot.
+
+	// There is deliberately no workspace-wide user fetch here.
+	//
+	// A users.list sweep used to run in the background at this point,
+	// paginating the entire directory — ~50 pages on a 10k-user
+	// workspace — to fill UserNames, UserNamesByHandle, BotUserIDs and
+	// the users cache. The official web client issues users.list zero
+	// times across all 8 captures, and it is the clearest single
+	// "scraping" signal slk emitted. Four sources cover the same
+	// ground without it:
+	//
+	//   - the cache seed above (db.ListUsers), which holds everyone
+	//     slk has ever resolved on this workspace;
+	//   - applyBootUsers, from conversations.view's users array — the
+	//     authors of the messages about to be rendered;
+	//   - edge.UsersInfo revalidation inside bootstrap.Run, which
+	//     refreshes those records by version;
+	//   - resolveUser, which fetches a single users.info on a miss and
+	//     writes it to the cache, so each unknown user costs one call
+	//     once rather than the whole directory every boot.
+	//
+	// The visible difference is that a name slk has never seen renders
+	// as its user ID for the moment before resolveUser answers, rather
+	// than for the (much longer) moment before the sweep finished.
 
 	// Fetch channels
 	channels, err := client.GetChannels(ctx)
@@ -2096,12 +2280,19 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		wctx.FinderItems = append(wctx.FinderItems, finderItem)
 	}
 
-	// Fetch unread counts
-	unreadCounts, threadsAgg, ucErr := client.GetUnreadCounts()
-	if ucErr != nil {
-		debuglog.Cache("workspace_unread_bootstrap: team=%s GetUnreadCounts failed: %v", token.TeamName, ucErr)
+	// Unread counts come from the boot response rather than a second
+	// client.counts call. bootstrap.Run has already made exactly this
+	// request; asking again asked the same server the same question,
+	// and it did so once per workspace.
+	//
+	// res.CountsOK carries what the error return used to: a FAILED
+	// call and a workspace with nothing unread both produce an empty
+	// slice, and only the second may be applied as a snapshot.
+	unreadCounts, ucOK := res.Counts.Unreads, res.CountsOK
+	if !ucOK {
+		debuglog.Cache("workspace_unread_bootstrap: team=%s client.counts failed during bootstrap; leaving read state as cached", token.TeamName)
 	}
-	wctx.ThreadsHasUnreads = threadsAgg.HasUnreads
+	wctx.ThreadsHasUnreads = res.Counts.Threads.HasUnreads
 	// Boot applies an authoritative FULL snapshot: reset every channel
 	// in the workspace to read, then set the ones client.counts reports
 	// unread. This runs BEFORE the WebSocket goes live (ConnMgr.Run is
@@ -2112,7 +2303,7 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 	// unreads legitimately means "everything is read" and must clear
 	// stale dots carried over from a prior session. A FAILED call must
 	// NOT reset — that would wipe every dot with no data to restore.
-	if ucErr == nil {
+	if ucOK {
 		updates := make([]cache.ChannelReadStateUpdate, 0, len(unreadCounts))
 		for _, u := range unreadCounts {
 			updates = append(updates, cache.ChannelReadStateUpdate{
@@ -2149,61 +2340,17 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 			}
 		}
 		debuglog.Cache("workspace_unread_bootstrap: team=%s total=%d muted=%d threads_has_unreads=%v threads_unread=%d",
-			token.TeamName, len(wctx.Channels), mutedChans, threadsAgg.HasUnreads, threadsAgg.UnreadCount)
+			token.TeamName, len(wctx.Channels), mutedChans, res.Counts.Threads.HasUnreads, res.Counts.Threads.UnreadCount)
 	}
 
 	// Finder items are built alongside the sidebar items in the loop above
 	// (see buildChannelItem). The user is a member of every channel returned
 	// by GetChannels (it's backed by users.conversations), so those entries
-	// have Joined=true. A separate background fetch surfaces non-joined
-	// public channels for browsing -- see startBrowseableChannelsFetch.
+	// have Joined=true. Channels the user has NOT joined are found on
+	// demand by the finder's debounced channels/search -- see
+	// searchChannelsRemote -- rather than enumerated up front.
 
 	return wctx, nil
-}
-
-// fetchBrowseableChannels fetches every public channel in the workspace and
-// sends a BrowseableChannelsLoadedMsg to the TUI with the entries the user
-// has NOT joined. Joined entries are skipped to avoid duplicates with the
-// existing finder list. Runs in a background goroutine; failures are logged
-// but otherwise ignored (the finder simply continues to show only joined
-// channels).
-func fetchBrowseableChannels(ctx context.Context, wctx *WorkspaceContext, p *tea.Program) {
-	channels, err := wctx.Client.GetAllPublicChannels(ctx)
-	if err != nil {
-		log.Printf("warning: fetching browseable channels for %s: %v", wctx.TeamName, err)
-		return
-	}
-
-	// Build set of joined IDs so we can skip them.
-	joined := make(map[string]struct{}, len(wctx.Channels))
-	for _, ch := range wctx.Channels {
-		joined[ch.ID] = struct{}{}
-	}
-
-	browseable := make([]channelfinder.Item, 0, len(channels))
-	for _, ch := range channels {
-		if _, ok := joined[ch.ID]; ok {
-			continue
-		}
-		browseable = append(browseable, channelfinder.Item{
-			ID:          ch.ID,
-			Name:        ch.Name,
-			Type:        "channel",
-			Joined:      false,
-			LastVisited: wctx.LastVisitedByChannel[ch.ID],
-		})
-	}
-
-	// Persist on the workspace context so future workspace switches preserve
-	// the merged list.
-	wctx.FinderItems = append(wctx.FinderItems, browseable...)
-
-	if p != nil {
-		p.Send(ui.BrowseableChannelsLoadedMsg{
-			TeamID: wctx.TeamID,
-			Items:  browseable,
-		})
-	}
 }
 
 // extractAttachments converts slack-go File entries into the UI's
@@ -3381,9 +3528,18 @@ type rtmEventHandler struct {
 	wsCtx *WorkspaceContext
 
 	// backfillGate enforces a 30 s minimum between reconnect-driven
-	// backfill passes. Per-handler so each workspace has its own gate.
+	// catch-up passes. Per-handler so each workspace has its own gate.
 	// Initialized at construction with window = 30 * time.Second.
 	backfillGate dedupeGate
+
+	// refreshChannel reloads one channel from the server through the
+	// same path a channel switch uses, and pushes the result into the
+	// UI. The reconnect handler calls it for the channel on screen and
+	// for nothing else — that is the whole of slk's post-reconnect
+	// network work, alongside one client.counts.
+	//
+	// nil in tests that construct a handler for unrelated events.
+	refreshChannel func(ctx context.Context, channelID string)
 }
 
 func (h *rtmEventHandler) OnMessage(channelID, userID, ts, text, threadTS, subtype string, edited bool, files []slack.File, blocks slack.Blocks, attachments []slack.Attachment, botID, username string) {
@@ -3668,6 +3824,11 @@ func (h *rtmEventHandler) OnUserTyping(channelID, userID string) {
 }
 
 func (h *rtmEventHandler) OnConnect() {
+	// connected doubles as "has this handler ever connected". It is
+	// never cleared on disconnect, deliberately: what the catch-up
+	// below needs to know is whether bootstrap.Run has already covered
+	// this session, not whether the socket is up right now.
+	firstConnect := !h.connected
 	h.connected = true
 	h.program.Send(ui.ConnectionStateMsg{State: int(statusbar.StateConnected)})
 	if h.wsCtx != nil {
@@ -3692,17 +3853,23 @@ func (h *rtmEventHandler) OnConnect() {
 		}
 	}
 
-	// Reconnect backfill: catch up on messages missed while the WS
-	// was dead. The 30 s dedupe in backfillGate prevents disconnect
-	// flaps from spawning overlapping passes. Runs in its own
-	// goroutine so the WS read loop isn't blocked on HTTP work.
+	// Bounded reconnect catch-up: client.counts, the channel on
+	// screen, and a staleness mark on everything else. The 30 s dedupe
+	// in backfillGate prevents disconnect flaps from spawning
+	// overlapping passes. Runs in its own goroutine so the WS read
+	// loop isn't blocked on HTTP work.
 	//
-	// Note on first-connect: the initial WS connect also fires
-	// OnConnect, so backfill runs at startup too. This is harmless —
-	// synced_at for freshly-bootstrapped channels is current, so most
-	// GetHistorySince calls return zero messages quickly. The 4-wide
-	// concurrency cap bounds the cost.
-	h.triggerBackfill("reconnect")
+	// Skipped on the first connect, which fires moments after
+	// connectWorkspace returns. bootstrap.Run has just done the same
+	// work — client.counts, and the restored channel's history — so
+	// running it again asked the same server the same questions, once
+	// per workspace, and marked every other channel stale seconds
+	// after boot had populated them.
+	if firstConnect {
+		debuglog.Backfill("team=%s first connect: skipping catch-up, bootstrap.Run already covered it", h.workspaceID)
+	} else {
+		h.syncOnReconnect("reconnect")
+	}
 
 	// Force-stale the active channel's membership cache and re-fetch.
 	// The WS may have missed member_joined/left deltas during the
@@ -3718,7 +3885,7 @@ func (h *rtmEventHandler) OnConnect() {
 	}
 }
 
-// triggerBackfill kicks off a reconnect-style backfill pass for this
+// syncOnReconnect kicks off the bounded catch-up pass for this
 // workspace, subject to the per-handler 30 s dedupe gate. Called by
 // OnConnect on every WS reconnect AND by the wake detector when the
 // system wakes from sleep (where the WS may not have torn down — a
@@ -3727,12 +3894,11 @@ func (h *rtmEventHandler) OnConnect() {
 // explicit trigger).
 //
 // The dedupe gate is shared with OnConnect, so a wake event that
-// happens to coincide with a real WS reconnect runs the backfill
-// exactly once.
+// coincides with a real WS reconnect runs the pass exactly once.
 //
-// Returns true if the backfill was started, false if the gate
-// suppressed it.
-func (h *rtmEventHandler) triggerBackfill(trigger string) bool {
+// Returns true if the pass was started, false if the gate suppressed
+// it.
+func (h *rtmEventHandler) syncOnReconnect(trigger string) bool {
 	if h.wsCtx == nil || h.db == nil || h.wsCtx.Client == nil {
 		return false
 	}
@@ -3740,16 +3906,18 @@ func (h *rtmEventHandler) triggerBackfill(trigger string) bool {
 		debuglog.Backfill("team=%s trigger=%s skipped reason=dedupe", h.workspaceID, trigger)
 		return false
 	}
-	wctx := h.wsCtx
-	workspaceID := h.workspaceID
-	program := h.program
-	db := h.db
+	sync := &reconnectSync{
+		client:         h.wsCtx.Client,
+		db:             h.db,
+		workspaceID:    h.workspaceID,
+		program:        h.program,
+		activeChannel:  h.activeChannelID,
+		refreshChannel: h.refreshChannel,
+	}
 	go func() {
-		bf := newBackfiller(
-			wctx.Client, db, workspaceID, wctx.Client.UserID(), program, 4, 500,
-			func(available bool) { wctx.SubscriptionsAvailable = available },
-		)
-		_ = bf.run(context.Background())
+		if err := sync.run(context.Background()); err != nil {
+			debuglog.Backfill("team=%s trigger=%s reconnect-sync err=%v", sync.workspaceID, trigger, err)
+		}
 	}()
 	return true
 }

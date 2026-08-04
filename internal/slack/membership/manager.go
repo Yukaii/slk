@@ -160,11 +160,29 @@ func (m *Manager) backgroundFetch(ctx context.Context, channelID string) {
 	if err != nil {
 		return
 	}
-	if m.resolver != nil {
-		for _, id := range ids {
-			m.resolver.Request(id)
-		}
-	}
+	// Deliberately no resolution pass over ids.
+	//
+	// This used to call m.resolver.Request for every member, which is
+	// one users.info request per member on any id the cache has not
+	// seen. Measured on a cold cache: a 35-second boot started 40,523
+	// of them, one per distinct row in channel_members. The resolver
+	// short-circuits on a cache hit, so the users.list sweep used to
+	// hide it by filling the cache first; deleting that sweep exposed
+	// it.
+	//
+	// It is also a question the official client never asks — zero
+	// /api/users.info and zero /api/conversations.members across all 8
+	// captures. It fetches one channel's first page of members through
+	// edgeapi's users/list (count 30, present first), which returns
+	// full user records with no resolution step at all. Moving to that
+	// is the next step; removing the fan-out does not have to wait for
+	// it.
+	//
+	// The ids themselves are still fetched and cached below: that is
+	// one bounded call per channel, and it is what the mention
+	// picker's in-channel ordering reads. Names for members slk has
+	// not met come from the cache, the boot response, and on-demand
+	// resolution when a row is actually rendered.
 	now := time.Now().Unix()
 	if err := m.db.ReplaceChannelMembers(m.workspaceID, channelID, ids, now); err != nil {
 		return
