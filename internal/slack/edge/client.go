@@ -38,6 +38,11 @@ type Client struct {
 // New returns a Client. httpClient must be one built with
 // slackhttp.BrowserTransport so requests carry the browser headers and
 // edgeapi envelope; pass the same client slack.Client uses.
+//
+// teamID is the workspace-scope default: most endpoints are keyed
+// under it, and their callers pass it through to call. It is not the
+// team on every request path — ChannelsInfo takes the owning team
+// per call, because on Grid one user's conversations span teams.
 func New(token, teamID string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
