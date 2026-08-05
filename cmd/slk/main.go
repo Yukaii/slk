@@ -274,6 +274,20 @@ func (r *workspaceRouter) ByID(teamID string) *WorkspaceContext {
 // browser opens to one host and far more than a person generates.
 const userResolverConcurrency = 8
 
+// userResolverBatchWindow is how long Request waits for more misses
+// to coalesce before flushing them as one edge users/info call. The
+// render path resolves a channel's unknown authors in a single
+// burst, so a short window turns a channel open from N requests into
+// one; 200 ms is below what a person perceives as resolution lag.
+const userResolverBatchWindow = 200 * time.Millisecond
+
+// userBatcher is the edge.UsersInfo subset the resolver batches
+// misses through. *edge.Client satisfies it structurally; nil means
+// no batching and every miss takes the per-user users.info path.
+type userBatcher interface {
+	UsersInfo(ctx context.Context, updatedIDs map[string]int64) ([]edge.User, error)
+}
+
 // userResolver dispatches users.info lookups for unknown message
 // authors in the background. Deduplicates concurrent requests for
 // the same userID; failures are silent (the row stays rendered as
@@ -291,6 +305,13 @@ type userResolver struct {
 	// blocks -- it is called from the render path and from WS event
 	// handlers, neither of which may wait on the network.
 	sem chan struct{}
+
+	batcher  userBatcher
+	degraded func() bool // nil: never degraded
+
+	pendingMu  sync.Mutex
+	pending    map[string]struct{}
+	flushTimer *time.Timer
 }
 
 func newUserResolver(
@@ -299,14 +320,19 @@ func newUserResolver(
 	db *cache.DB,
 	avatars *avatar.Cache,
 	send func(tea.Msg),
+	batcher userBatcher,
+	degraded func() bool,
 ) *userResolver {
 	return &userResolver{
-		teamID:  teamID,
-		client:  client,
-		db:      db,
-		avatars: avatars,
-		send:    send,
-		sem:     make(chan struct{}, userResolverConcurrency),
+		teamID:   teamID,
+		client:   client,
+		db:       db,
+		avatars:  avatars,
+		send:     send,
+		sem:      make(chan struct{}, userResolverConcurrency),
+		batcher:  batcher,
+		degraded: degraded,
+		pending:  map[string]struct{}{},
 	}
 }
 
@@ -339,68 +365,170 @@ func (r *userResolver) Request(userID string) {
 		r.inflight.Delete(userID)
 		return
 	}
-	go func() {
-		defer r.inflight.Delete(userID)
-		if r.sem != nil {
-			r.sem <- struct{}{}
-			defer func() { <-r.sem }()
-		}
-		u, err := r.client.GetUserProfile(userID)
-		if err != nil {
-			debuglog.Cache("userResolver: GetUserProfile team=%s user=%s err=%v",
-				r.teamID, userID, err)
-			return
-		}
-		name := u.Profile.DisplayName
-		if name == "" {
-			name = u.RealName
-		}
-		if name == "" {
-			name = u.Name
-		}
-		isBot := u.IsBot || u.IsAppUser
-		// r.teamID is the workspace's home TeamID; u.TeamID is the
-		// user's home TeamID. If they differ (and u.TeamID is set),
-		// the user is a Slack Connect / shared-channel guest. Treat
-		// an empty u.TeamID as internal — better to under-detect than
-		// to falsely flag.
-		isExternal := u.TeamID != "" && u.TeamID != r.teamID
-		// Persist to the cache DB (its own goroutine-safe SQLite
-		// connection) and the avatar cache (internal RWMutex), but
-		// do NOT write r.userNames[userID] from this goroutine —
-		// userNames is a plain map shared with the UI goroutine and
-		// other code paths, and a direct write here trips Go's
-		// "concurrent map writes" detector under load (two parallel
-		// Request goroutines for different userIDs is enough). The
-		// UserResolvedMsg below is delivered to the bubbletea Update
-		// loop, which calls Model.PatchUserName on the UI goroutine
-		// — that is the single safe writer for in-history rows.
-		// Subsequent resolveUserCached misses fall back to the DB
-		// row we just upserted, so we don't re-fetch on every miss
-		// in the small window before UserResolvedMsg lands.
-		r.avatars.Preload(userID, u.Profile.Image32)
-		_ = r.db.UpsertUser(cache.User{
-			ID:          userID,
-			WorkspaceID: r.teamID,
-			Name:        u.Name,
+	if r.batcher == nil || (r.degraded != nil && r.degraded()) {
+		go r.resolveOne(userID)
+		return
+	}
+	r.pendingMu.Lock()
+	r.pending[userID] = struct{}{}
+	if r.flushTimer == nil {
+		r.flushTimer = time.AfterFunc(userResolverBatchWindow, r.flush)
+	}
+	r.pendingMu.Unlock()
+}
+
+// resolveOne resolves a single user through the Web API users.info
+// path: the pre-batch behaviour, now the fallback for ids edge did
+// not return, for a failed edge call, and for workspaces whose edge
+// is degraded. Callers run it on its own goroutine.
+func (r *userResolver) resolveOne(userID string) {
+	defer r.inflight.Delete(userID)
+	if r.sem != nil {
+		r.sem <- struct{}{}
+		defer func() { <-r.sem }()
+	}
+	u, err := r.client.GetUserProfile(userID)
+	if err != nil {
+		debuglog.Cache("userResolver: GetUserProfile team=%s user=%s err=%v",
+			r.teamID, userID, err)
+		return
+	}
+	name := u.Profile.DisplayName
+	if name == "" {
+		name = u.RealName
+	}
+	if name == "" {
+		name = u.Name
+	}
+	isBot := u.IsBot || u.IsAppUser
+	// r.teamID is the workspace's home TeamID; u.TeamID is the
+	// user's home TeamID. If they differ (and u.TeamID is set),
+	// the user is a Slack Connect / shared-channel guest. Treat
+	// an empty u.TeamID as internal — better to under-detect than
+	// to falsely flag.
+	isExternal := u.TeamID != "" && u.TeamID != r.teamID
+	// Persist to the cache DB (its own goroutine-safe SQLite
+	// connection) and the avatar cache (internal RWMutex), but
+	// do NOT write r.userNames[userID] from this goroutine —
+	// userNames is a plain map shared with the UI goroutine and
+	// other code paths, and a direct write here trips Go's
+	// "concurrent map writes" detector under load (two parallel
+	// Request goroutines for different userIDs is enough). The
+	// UserResolvedMsg below is delivered to the bubbletea Update
+	// loop, which calls Model.PatchUserName on the UI goroutine
+	// — that is the single safe writer for in-history rows.
+	// Subsequent resolveUserCached misses fall back to the DB
+	// row we just upserted, so we don't re-fetch on every miss
+	// in the small window before UserResolvedMsg lands.
+	r.avatars.Preload(userID, u.Profile.Image32)
+	_ = r.db.UpsertUser(cache.User{
+		ID:          userID,
+		WorkspaceID: r.teamID,
+		Name:        u.Name,
+		DisplayName: name,
+		AvatarURL:   u.Profile.Image32,
+		Presence:    "away",
+		IsBot:       isBot,
+		IsExternal:  isExternal,
+	})
+	if r.send != nil {
+		r.send(ui.UserResolvedMsg{
+			TeamID:      r.teamID,
+			UserID:      userID,
 			DisplayName: name,
-			AvatarURL:   u.Profile.Image32,
-			Presence:    "away",
 			IsBot:       isBot,
-			IsExternal:  isExternal,
 		})
-		if r.send != nil {
-			r.send(ui.UserResolvedMsg{
-				TeamID:      r.teamID,
-				UserID:      userID,
-				DisplayName: name,
-				IsBot:       isBot,
-			})
+	}
+	if isExternal && r.send != nil {
+		r.send(ui.UserExternalMsg{UserID: userID, IsExternal: true})
+	}
+}
+
+// flush resolves everything queued since the window opened, as one
+// edge users/info batch. Anything the batch does not return falls
+// back to the per-user path: absence from the batch means "could not
+// resolve", and an errored batch resolves nothing at all.
+func (r *userResolver) flush() {
+	r.pendingMu.Lock()
+	ids := make([]string, 0, len(r.pending))
+	for id := range r.pending {
+		ids = append(ids, id)
+	}
+	clear(r.pending)
+	r.flushTimer = nil
+	r.pendingMu.Unlock()
+	if len(ids) == 0 {
+		return
+	}
+	// Re-check at flush time: boot may have marked the workspace
+	// degraded while the window was open.
+	if r.degraded != nil && r.degraded() {
+		for _, id := range ids {
+			go r.resolveOne(id)
 		}
-		if isExternal && r.send != nil {
-			r.send(ui.UserExternalMsg{UserID: userID, IsExternal: true})
+		return
+	}
+	updated := make(map[string]int64, len(ids))
+	for _, id := range ids {
+		// 0 is the conditional protocol's "never seen, send the full
+		// record" — the resolver only ever queues cache misses.
+		updated[id] = 0
+	}
+	users, err := r.batcher.UsersInfo(context.Background(), updated)
+	if err != nil {
+		debuglog.Cache("userResolver: edge users/info for %d users team=%s: %v (falling back to per-user users.info)", len(ids), r.teamID, err)
+		for _, id := range ids {
+			go r.resolveOne(id)
 		}
-	}()
+		return
+	}
+	returned := make(map[string]struct{}, len(users))
+	for _, u := range users {
+		returned[u.ID] = struct{}{}
+		r.applyEdgeUser(u)
+	}
+	for _, id := range ids {
+		if _, ok := returned[id]; !ok {
+			go r.resolveOne(id)
+		}
+	}
+}
+
+// applyEdgeUser records one user the edge batch returned: cache row
+// (created — these are misses), avatar preload, and the same
+// UserResolvedMsg/UserExternalMsg pair the per-user path emits, so
+// the UI cannot tell the two paths apart.
+func (r *userResolver) applyEdgeUser(u edge.User) {
+	defer r.inflight.Delete(u.ID)
+	name := u.Profile.DisplayName
+	if name == "" {
+		name = u.Profile.RealName
+	}
+	if name == "" {
+		name = u.Name
+	}
+	isExternal := u.TeamID != "" && u.TeamID != r.teamID
+	r.avatars.Preload(u.ID, u.Profile.ImageOriginal)
+	_ = r.db.UpsertUserFromEdge(r.teamID, cache.EdgeUserUpdate{
+		ID:          u.ID,
+		Name:        u.Name,
+		DisplayName: name,
+		AvatarURL:   u.Profile.ImageOriginal,
+		IsBot:       u.IsBot,
+		IsExternal:  isExternal,
+		Version:     u.Version,
+	})
+	if r.send != nil {
+		r.send(ui.UserResolvedMsg{
+			TeamID:      r.teamID,
+			UserID:      u.ID,
+			DisplayName: name,
+			IsBot:       u.IsBot,
+		})
+	}
+	if isExternal && r.send != nil {
+		r.send(ui.UserExternalMsg{UserID: u.ID, IsExternal: true})
+	}
 }
 
 // RequestBot enqueues a bots.info fetch for a bot author (bot_message has
@@ -2108,6 +2236,7 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 				p.Send(msg)
 			}
 		},
+		nil, nil, // batcher and degraded wired in Task 4
 	)
 
 	// Per-workspace channel-membership manager. *slackclient.Client
