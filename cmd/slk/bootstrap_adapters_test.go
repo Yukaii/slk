@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"github.com/slack-go/slack"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -746,5 +747,93 @@ func TestBootMutedChannels_MergesBothPrefs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBootConversations_MapsWhatTheSidebarBuilderReads(t *testing.T) {
+	// buildChannelItem reads ID, Name, Topic, IsIM, IsMpIM, IsPrivate,
+	// IsMember and User. Every one of those has to survive the trip
+	// from client.userBoot, or the sidebar renders wrong rather than
+	// empty -- which is harder to notice.
+	res := &bootstrap.Result{
+		Channels: []boot.Channel{
+			{ID: "C1", Name: "general", IsChannel: true, IsGeneral: true,
+				Topic: boot.TextBlock{Value: "company wide"}},
+			{ID: "C2", Name: "secret", IsChannel: true, IsPrivate: true},
+			{ID: "C3", Name: "mpdm-a--b--c", IsMPIM: true},
+		},
+		IMs:    []boot.IM{{ID: "D1", UserID: "U9", IsIM: true, IsOpen: true}},
+		IsOpen: []string{"D1"},
+	}
+
+	got := bootConversations(res)
+	if len(got) != 4 {
+		t.Fatalf("got %d conversations; want 4 (3 channels + 1 IM)", len(got))
+	}
+	by := map[string]slack.Channel{}
+	for _, c := range got {
+		by[c.ID] = c
+	}
+
+	if c := by["C1"]; c.Name != "general" || c.Topic.Value != "company wide" {
+		t.Errorf("C1 = %+v; want name and topic carried through", c)
+	}
+	// userBoot's channels[] is the user's OWN channel list, so every
+	// entry is one they are in. Losing this bucketed every channel as
+	// unjoined.
+	for _, id := range []string{"C1", "C2", "C3"} {
+		if !by[id].IsMember {
+			t.Errorf("%s IsMember = false; userBoot only returns channels the user is in", id)
+		}
+	}
+	if !by["C2"].IsPrivate {
+		t.Error("C2 lost IsPrivate; it would render as a public channel")
+	}
+	if !by["C3"].IsMpIM {
+		t.Error("C3 lost IsMpIM; group DMs would render as channels")
+	}
+	if d := by["D1"]; !d.IsIM || d.User != "U9" {
+		t.Errorf("D1 = %+v; want IsIM with User U9 — the counterparty id is what names a DM", d)
+	}
+}
+
+func TestBootConversations_SkipsArchivedAndClosed(t *testing.T) {
+	// users.conversations was called with ExcludeArchived: true, so
+	// keeping archived channels here would be a visible regression
+	// dressed up as a fix. A closed DM is not in the sidebar either.
+	res := &bootstrap.Result{
+		Channels: []boot.Channel{
+			{ID: "C1", Name: "live", IsChannel: true},
+			{ID: "C2", Name: "dead", IsChannel: true, IsArchived: true},
+		},
+		IMs: []boot.IM{
+			{ID: "D1", UserID: "U1", IsIM: true, IsOpen: true},
+			{ID: "D2", UserID: "U2", IsIM: true},
+			{ID: "D3", UserID: "U3", IsIM: true, IsArchived: true},
+		},
+		IsOpen: []string{"D1"},
+	}
+	got := bootConversations(res)
+	ids := map[string]bool{}
+	for _, c := range got {
+		ids[c.ID] = true
+	}
+	if ids["C2"] {
+		t.Error("archived channel kept")
+	}
+	if ids["D3"] {
+		t.Error("archived DM kept")
+	}
+	if ids["D2"] {
+		t.Error("closed DM kept; it is not in IsOpen and IsOpen is false on it")
+	}
+	if !ids["C1"] || !ids["D1"] {
+		t.Errorf("dropped something live: %v", ids)
+	}
+}
+
+func TestBootConversations_NilSafe(t *testing.T) {
+	if got := bootConversations(nil); got != nil {
+		t.Errorf("got %v; want nil", got)
 	}
 }

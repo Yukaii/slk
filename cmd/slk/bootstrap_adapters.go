@@ -375,6 +375,85 @@ func applyBootUsers(wctx *WorkspaceContext, res *bootstrap.Result) {
 	}
 }
 
+// bootConversations converts what client.userBoot returned into the
+// slack.Channel values the sidebar builder consumes.
+//
+// It exists because users.conversations is not reliably available. On
+// the Enterprise Grid org in gammons/slk#5 that call is rejected, and
+// because connectWorkspace treated the failure as fatal the whole
+// workspace was dropped: no channels, no threads, and no active
+// workspace at all. userBoot had already returned all 217 of that
+// user's conversations moments earlier, so slk was discarding a
+// session over data it already held.
+//
+// The mapping only has to satisfy buildChannelItem, which reads ID,
+// Name, Topic, IsIM, IsMpIM, IsPrivate, IsMember and User. Everything
+// else on slack.Channel is left zero deliberately: a field invented
+// here would read as measured downstream.
+//
+// IsMember is true for every channels[] entry because userBoot returns
+// the user's OWN conversation list -- there is no is_member on the
+// entries and none is needed. IMs are filtered to the open ones, since
+// a closed DM does not belong in the sidebar; both the per-IM is_open
+// flag and userBoot's top-level is_open list are consulted, because
+// either alone would silently empty the DM list if that response shape
+// varies.
+func bootConversations(res *bootstrap.Result) []slack.Channel {
+	if res == nil {
+		return nil
+	}
+	out := make([]slack.Channel, 0, len(res.Channels)+len(res.IMs))
+	for _, ch := range res.Channels {
+		if ch.IsArchived {
+			continue
+		}
+		out = append(out, slack.Channel{
+			GroupConversation: slack.GroupConversation{
+				Conversation: slack.Conversation{
+					ID:          ch.ID,
+					IsGroup:     ch.IsGroup,
+					IsPrivate:   ch.IsPrivate,
+					IsMpIM:      ch.IsMPIM,
+					IsShared:    ch.IsShared,
+					IsOrgShared: ch.IsOrgShared,
+					IsExtShared: ch.IsExtShared,
+				},
+				Name:    ch.Name,
+				Creator: ch.Creator,
+				Topic:   slack.Topic{Value: ch.Topic.Value},
+				Purpose: slack.Purpose{Value: ch.Purpose.Value},
+			},
+			IsChannel: ch.IsChannel,
+			IsGeneral: ch.IsGeneral,
+			IsMember:  true,
+		})
+	}
+	open := make(map[string]bool, len(res.IsOpen))
+	for _, id := range res.IsOpen {
+		open[id] = true
+	}
+	for _, im := range res.IMs {
+		if im.IsArchived {
+			continue
+		}
+		if !im.IsOpen && !open[im.ID] {
+			continue
+		}
+		out = append(out, slack.Channel{
+			GroupConversation: slack.GroupConversation{
+				Conversation: slack.Conversation{
+					ID:          im.ID,
+					IsIM:        true,
+					User:        im.UserID,
+					IsOrgShared: im.IsOrgShared,
+				},
+			},
+			IsMember: true,
+		})
+	}
+	return out
+}
+
 // hydrateFirstSight inserts cache rows for the conversations and users
 // this boot learned about that the cache has never seen.
 //
