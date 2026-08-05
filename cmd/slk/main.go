@@ -108,6 +108,11 @@ type WorkspaceContext struct {
 	// conditional-revalidation and server-side-search endpoints. Nil
 	// only if construction failed, and every caller nil-checks.
 	Edge       *edge.Client
+	// EdgeHealth records whether edge resolution is working for this
+	// workspace this session. bootstrap marks it degraded on a
+	// wholesale failure; the user resolver reads it to skip batch
+	// attempts that would resolve nothing.
+	EdgeHealth *edge.Health
 	ConnMgr    *slackclient.ConnectionManager
 	RTMHandler *rtmEventHandler
 	UserNames  map[string]string
@@ -2178,6 +2183,7 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		// BrowserTransport-carrying client, and a plain one differs
 		// only in what goes on the wire.
 		Edge:                 edge.New(token.AccessToken, client.TeamID(), client.HTTPClient()),
+		EdgeHealth:           edge.NewHealth(),
 		TeamID:               client.TeamID(),
 		TeamName:             token.TeamName,
 		UserID:               client.UserID(),
@@ -2242,7 +2248,7 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 				p.Send(msg)
 			}
 		},
-		nil, nil, // batcher and degraded wired in Task 4
+		wctx.Edge, wctx.EdgeHealth.Degraded,
 	)
 
 	// Per-workspace channel-membership manager. *slackclient.Client
@@ -2292,7 +2298,7 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 	// so no intermediate commit leaves slk unable to boot. Until then
 	// slk does both, and the request tally goes UP.
 	res, err := bootstrap.Run(ctx, newBootstrapDeps(client, db, token.AccessToken,
-		mostRecentlyVisitedChannel(wctx.LastVisitedByChannel)))
+		mostRecentlyVisitedChannel(wctx.LastVisitedByChannel), wctx.EdgeHealth))
 	if err != nil {
 		return nil, fmt.Errorf("bootstrapping %s: %w", token.TeamName, err)
 	}

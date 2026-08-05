@@ -47,7 +47,7 @@ import (
 // accessToken is the xoxc credential; it is passed separately because
 // edge.New takes the token directly rather than going through
 // *slackclient.Client, which does not expose it.
-func newBootstrapDeps(c *slackclient.Client, db *cache.DB, accessToken, openChannelID string) bootstrap.Deps {
+func newBootstrapDeps(c *slackclient.Client, db *cache.DB, accessToken, openChannelID string, health *edge.Health) bootstrap.Deps {
 	return bootstrap.Deps{
 		WorkspaceID: c.TeamID(),
 		Boot:        bootAdapter{c},
@@ -59,6 +59,7 @@ func newBootstrapDeps(c *slackclient.Client, db *cache.DB, accessToken, openChan
 		// one differs only in what goes on the wire. See
 		// (*slackclient.Client).HTTPClient.
 		Revalidate:    edge.New(accessToken, c.TeamID(), c.HTTPClient()),
+		Health:        health,
 		Store:         storeAdapter{db},
 		OpenChannelID: openChannelID,
 		Log:           debuglog.General,
