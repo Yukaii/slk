@@ -75,8 +75,9 @@ func revalidate(ctx context.Context, deps Deps, out *Result, logf func(string, .
 // edge cache keys records under the owning team: a single call scoped
 // to the auth.test team resolved zero of one Grid user's 217
 // conversations (gammons/slk#5). On a non-Grid workspace every
-// context team IS the workspace team, so the partition is a single
-// group and the request shape is identical to before. An empty
+// context team is expected to be the workspace team, so the partition
+// is a single group and the request shape is identical to before. An
+// empty
 // context team groups under the workspace team, preserving the old
 // behaviour for anything the field is missing on.
 //

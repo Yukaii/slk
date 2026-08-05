@@ -801,6 +801,11 @@ func TestRevalidate_AppliesMembershipToTheQueriedIDsNotTheReturnedOnes(t *testin
 	if len(f.membershipCalls) != 2 {
 		t.Fatalf("ApplyMembership called %d times; want 2, one per context team (%#v)", len(f.membershipCalls), f.membershipCalls)
 	}
+	// Index alignment is the invariant: one membership call per
+	// channels/info call, in the same order. It holds only because
+	// every team's filtered MembershipQueried is non-empty — a team
+	// whose batch reported nothing produces no membership call and
+	// would shift the alignment.
 	byTeam := map[string]membershipCall{}
 	for i, c := range f.channelsInfoCalls {
 		byTeam[c.team] = f.membershipCalls[i]
@@ -1184,8 +1189,9 @@ func TestRevalidate_TeamFailureDoesNotSkipOtherTeams(t *testing.T) {
 
 func TestRevalidate_StaysInsideTheBootCallBudget(t *testing.T) {
 	// Success criterion 1, on the full sequence: userBoot, counts,
-	// conversations.view, channels/info, users/info — five, against a
-	// budget of ten, replacing roughly four hundred.
+	// conversations.view, channels/info per context team (two here),
+	// users/info — six, against a budget of ten, replacing roughly
+	// four hundred.
 	f := openedFake()
 
 	if _, err := Run(context.Background(), f.Deps()); err != nil {
