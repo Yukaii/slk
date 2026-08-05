@@ -2144,6 +2144,88 @@ func TestStartWebSocket_SendsChromeUpgradeHeaders(t *testing.T) {
 	}
 }
 
+// TestStartWebSocket_StartArgsMatchTheCapture pins the start_args
+// query param against the official client's, from the 2026-08-02
+// coldboot capture:
+//
+//	start_args = ?agent=client&org_wide_aware=true&agent_version=1785403654
+//	             &eac_cache_ts=true&cache_ts=0&name_tagging=true
+//	             &only_self_subteams=true&connect_only=true&ms_latest=true
+//
+// slk sent only agent/connect_only/ms_latest, and at some point
+// user_typing frames stopped arriving — the visible symptom was typing
+// indicators silently disappearing while everything else on the socket
+// kept working. Which of the missing keys gates typing delivery is not
+// documented anywhere; the fix is the project's standing rule — match
+// the capture, don't invent — applied in full.
+func TestStartWebSocket_StartArgsMatchTheCapture(t *testing.T) {
+	gotCh := make(chan url.Values, 1)
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			select {
+			case gotCh <- r.URL.Query():
+			default:
+			}
+			return true
+		},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Logf("upgrade failed: %v", err)
+			return
+		}
+		conn.Close()
+	}))
+	defer srv.Close()
+
+	env := slackhttp.NewEnvelope()
+	env.SetVersionTS("1785403654")
+	c := &Client{
+		token:     "xoxc-test",
+		cookie:    "d-cookie",
+		teamID:    "T12345",
+		wsBaseURL: "ws://" + srv.Listener.Addr().String(),
+		envelope:  env,
+	}
+	if err := c.StartWebSocket(&mockEventHandler{}); err != nil {
+		t.Fatalf("StartWebSocket: %v", err)
+	}
+	defer func() { <-c.WsDone() }()
+
+	var q url.Values
+	select {
+	case q = <-gotCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never received an upgrade request")
+	}
+
+	raw := q.Get("start_args")
+	if raw == "" {
+		t.Fatalf("no start_args in dialed URL: %v", q)
+	}
+	args, err := url.ParseQuery(strings.TrimPrefix(raw, "?"))
+	if err != nil {
+		t.Fatalf("start_args is not a query string: %q (%v)", raw, err)
+	}
+	want := map[string]string{
+		"agent":              "client",
+		"org_wide_aware":     "true",
+		"agent_version":      "1785403654", // the envelope's version_ts
+		"eac_cache_ts":       "true",
+		"cache_ts":           "0",
+		"name_tagging":       "true",
+		"only_self_subteams": "true",
+		"connect_only":       "true",
+		"ms_latest":          "true",
+	}
+	for k, v := range want {
+		if got := args.Get(k); got != v {
+			t.Errorf("start_args[%s] = %q; want %q (from the capture)", k, got, v)
+		}
+	}
+}
+
 func TestGetUsersInConversationPaginates(t *testing.T) {
 	type page struct {
 		users []string
