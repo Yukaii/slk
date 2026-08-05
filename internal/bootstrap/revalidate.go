@@ -148,6 +148,11 @@ func revalidateChannels(ctx context.Context, deps Deps, out *Result, logf func(s
 		}
 		groups[team][id] = version
 	}
+	// The majority base is NON-IM ids, on both sides. IMs always fail
+	// (above), so wholesaleFailure excludes them — and counting them
+	// here would let a group that is mostly IMs claim the majority
+	// and get edge marked degraded over a single channel's failure.
+	nonIMTotal := nonIMCount(updated, noteIM)
 	// Largest group first, alphabetical on ties. On a Grid org the
 	// enterprise-id group holds the overwhelming majority of a user's
 	// conversations (measured: 218 of 277), and judging it first means
@@ -165,8 +170,12 @@ func revalidateChannels(ctx context.Context, deps Deps, out *Result, logf func(s
 		outcome := revalidateChannelTeam(ctx, deps, team, groups[team], logf)
 		// Only the first (largest) group can trip the wholesale
 		// check: later groups are smaller, so if the largest holds
-		// under half the ids no group reaches the majority threshold.
-		if i == 0 && deps.Health != nil && len(groups[team])*2 >= len(updated) && wholesaleFailure(outcome, groups[team], noteIM) {
+		// under half the non-IM ids no group reaches the majority
+		// threshold. On an exact 50/50 tie the second group is never
+		// evaluated — half is not a majority — and the alpha-first
+		// tiebreak makes which half goes first arbitrary but
+		// deterministic.
+		if i == 0 && deps.Health != nil && nonIMTotal > 0 && nonIMCount(groups[team], noteIM)*2 >= nonIMTotal && wholesaleFailure(outcome, groups[team], noteIM) {
 			deps.Health.MarkDegraded()
 			logf("bootstrap: channels/info for team %s failed wholesale (%d of %d ids); marking edge degraded for this session and skipping the remaining %d team group(s)",
 				team, len(groups[team]), len(updated), len(teams)-1)
@@ -190,7 +199,8 @@ type teamOutcome struct {
 // counting them would trip the check on healthy workspaces. A group
 // whose response is empty because everything was already current is
 // NOT a wholesale failure: nothing in failed_ids means nothing
-// failed. A group with no non-IM ids can never fail wholesale.
+// failed. A group with no non-IM ids can only fail wholesale via
+// callErr.
 func wholesaleFailure(oc teamOutcome, group map[string]int64, noteIM map[string]bool) bool {
 	if oc.callErr {
 		return true
@@ -206,6 +216,20 @@ func wholesaleFailure(oc teamOutcome, group map[string]int64, noteIM map[string]
 		}
 	}
 	return nonIM > 0
+}
+
+// nonIMCount is the number of ids in group that are not IMs — the
+// base the majority check and wholesaleFailure both reason over,
+// since IMs always land in failed_ids and would otherwise inflate
+// both.
+func nonIMCount(group map[string]int64, noteIM map[string]bool) int {
+	n := 0
+	for id := range group {
+		if !noteIM[id] {
+			n++
+		}
+	}
+	return n
 }
 
 // revalidateChannelTeam runs the channels/info call and its
