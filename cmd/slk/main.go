@@ -1721,6 +1721,19 @@ func run() error {
 		go func(tok slackclient.Token) {
 			wctx, err := connectWorkspace(ctx, tok, db, cfg, avatarCache, p, configPath)
 			if err != nil {
+				// Log it. WorkspaceFailedMsg carries only the team
+				// name, so without this the reason never reaches the
+				// user OR the debug log, and a workspace that fails to
+				// connect is indistinguishable from one that connected
+				// and found nothing: empty sidebar, no threads, and
+				// "no active workspace" from every service closure.
+				//
+				// That cost a full round trip with a Grid user in #5,
+				// whose users.conversations call was being rejected
+				// with enterprise_is_restricted while slk reported
+				// nothing at all.
+				log.Printf("workspace %s failed to connect: %v", tok.TeamName, err)
+				debuglog.General("workspace %s failed to connect: %v", tok.TeamName, err)
 				p.Send(ui.WorkspaceFailedMsg{TeamName: tok.TeamName})
 				return
 			}
