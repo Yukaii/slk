@@ -505,6 +505,46 @@ func (r *userResolver) flush() {
 	}
 }
 
+// ResolveNow resolves ids immediately through one edge users/info
+// batch and returns the records edge resolved. Unlike Request it
+// blocks the caller, so it is for background goroutines that need the
+// results — the unresolved-DM sweep maps them to channel ids and
+// cannot use the fire-and-forget queue. Ids edge does not resolve are
+// simply absent from the result; the caller falls back per-user.
+// Nil means "resolve everything per-user": no edge client, a degraded
+// workspace, a failed call, or nothing worth sending.
+//
+// Note applyEdgeUser's inflight.Delete is a no-op for these ids —
+// they were never queued. A Request racing a ResolveNow for the same
+// id can produce one duplicate users.info; the upserts are idempotent
+// and the window is a cache miss wide, so no guard is taken.
+func (r *userResolver) ResolveNow(ids []string) []edge.User {
+	if r == nil || r.batcher == nil || len(ids) == 0 {
+		return nil
+	}
+	if r.degraded != nil && r.degraded() {
+		return nil
+	}
+	updated := make(map[string]int64, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			updated[id] = 0
+		}
+	}
+	if len(updated) == 0 {
+		return nil
+	}
+	users, err := r.batcher.UsersInfo(context.Background(), updated)
+	if err != nil {
+		debuglog.Cache("userResolver: ResolveNow edge users/info for %d users team=%s: %v (caller falls back per-user)", len(updated), r.teamID, err)
+		return nil
+	}
+	for _, u := range users {
+		r.applyEdgeUser(u)
+	}
+	return users
+}
+
 // applyEdgeUser records one user the edge batch returned: cache row
 // (created — these are misses), avatar preload, and the same
 // UserResolvedMsg/UserExternalMsg pair the per-user path emits, so
@@ -2023,21 +2063,11 @@ func run() error {
 
 			// Resolve unknown DM user names in background
 			if len(wctx.UnresolvedDMs) > 0 {
-				go func() {
-					for _, dm := range wctx.UnresolvedDMs {
-						resolved, isBot := resolveUser(wctx.Client, dm.UserID, wctx.UserNames, db, avatarCache)
-						if isBot {
-							wctx.BotUserIDs[dm.UserID] = true
-						}
-						if resolved != dm.UserID {
-							p.Send(ui.DMNameResolvedMsg{
-								ChannelID:   dm.ChannelID,
-								DisplayName: resolved,
-								IsBot:       isBot,
-							})
-						}
+				go resolveDMNames(wctx, db, avatarCache, func(msg tea.Msg) {
+					if p != nil {
+						p.Send(msg)
 					}
-				}()
+				})
 			}
 		}(ot.Token)
 	}
@@ -2719,6 +2749,65 @@ func resolveUser(client *slackclient.Client, userID string, userNames map[string
 		return name, isBot
 	}
 	return userID, false
+}
+
+// resolveDMNames resolves the display names of unresolved DM
+// counterparties, one edge users/info batch for the whole sweep, with
+// the per-user resolveUser loop as the fallback for ids edge did not
+// return. Batched because the sweep is the dominant cold-boot
+// users.info source: one synchronous GetUserProfile per unresolved DM,
+// measured at ~100 calls on a two-workspace cold boot and 282 in a
+// full Grid session. The mapping to channel ids is why this cannot go
+// through UserResolver.Request: DMNameResolvedMsg renames the sidebar
+// row and re-buckets app DMs, while UserResolvedMsg only patches
+// in-history names.
+func resolveDMNames(wctx *WorkspaceContext, db *cache.DB, avatarCache *avatar.Cache, send func(tea.Msg)) {
+	dmIDs := make([]string, 0, len(wctx.UnresolvedDMs))
+	for _, dm := range wctx.UnresolvedDMs {
+		dmIDs = append(dmIDs, dm.UserID)
+	}
+	byEdge := make(map[string]edge.User)
+	for _, u := range wctx.UserResolver.ResolveNow(dmIDs) {
+		byEdge[u.ID] = u
+	}
+	for _, dm := range wctx.UnresolvedDMs {
+		if u, ok := byEdge[dm.UserID]; ok {
+			name := u.Profile.DisplayName
+			if name == "" {
+				name = u.Profile.RealName
+			}
+			if name == "" {
+				name = u.Name
+			}
+			// edge users/info carries no is_app_user: a Slack app's DM
+			// resolved here may bucket as "dm" rather than "app" until
+			// something else classifies it. No capture shows that
+			// field on this endpoint, so none is invented; the
+			// per-user fallback below classifies the ids edge missed.
+			if u.IsBot {
+				wctx.BotUserIDs[dm.UserID] = true
+			}
+			if name != "" && send != nil {
+				send(ui.DMNameResolvedMsg{
+					ChannelID:   dm.ChannelID,
+					DisplayName: name,
+					IsBot:       u.IsBot,
+				})
+			}
+			continue
+		}
+		resolved, isBot := resolveUser(wctx.Client, dm.UserID, wctx.UserNames, db, avatarCache)
+		if isBot {
+			wctx.BotUserIDs[dm.UserID] = true
+		}
+		if resolved != dm.UserID && send != nil {
+			send(ui.DMNameResolvedMsg{
+				ChannelID:   dm.ChannelID,
+				DisplayName: resolved,
+				IsBot:       isBot,
+			})
+		}
+	}
 }
 
 // messageAuthor resolves the display identity for a fetched message.

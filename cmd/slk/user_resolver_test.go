@@ -299,3 +299,137 @@ func TestUserResolver_DegradedWorkspaceSkipsEdge(t *testing.T) {
 		t.Error("U001 was not resolved per-user on the degraded path")
 	}
 }
+
+func TestUserResolver_ResolveNowBatchesAndApplies(t *testing.T) {
+	db := newTestDB(t)
+	batcher := &fakeBatcher{res: []edge.User{
+		edgeUserRecord("U001", "alice", "Alice", "", "T1", 1783337599010, false),
+		edgeUserRecord("U002", "bob", "", "Bob Real", "T1", 1783337599011, false),
+	}}
+	r := newUserResolver("T1", nil, db, nil, nil, batcher, nil)
+
+	got := r.ResolveNow([]string{"U001", "U002"})
+
+	if len(got) != 2 {
+		t.Fatalf("ResolveNow returned %d records; want 2", len(got))
+	}
+	calls := batcher.calls()
+	if len(calls) != 1 {
+		t.Fatalf("edge batches = %d; want 1", len(calls))
+	}
+	if want := map[string]int64{"U001": 0, "U002": 0}; !reflect.DeepEqual(calls[0], want) {
+		t.Errorf("batch = %v; want %v", calls[0], want)
+	}
+	// Applied: cache rows exist and carry versions, so the sweep's
+	// callers and conditional revalidation both read them.
+	for _, id := range []string{"U001", "U002"} {
+		if _, err := db.GetUser(id); err != nil {
+			t.Errorf("%s was not cached by ResolveNow: %v", id, err)
+		}
+	}
+	versions, err := db.UserVersions("T1")
+	if err != nil {
+		t.Fatalf("UserVersions: %v", err)
+	}
+	if versions["U001"] != 1783337599010 {
+		t.Errorf("U001 version = %d; want 1783337599010", versions["U001"])
+	}
+}
+
+func TestUserResolver_ResolveNowReturnsNilWhenDegraded(t *testing.T) {
+	db := newTestDB(t)
+	batcher := &fakeBatcher{}
+	r := newUserResolver("T1", nil, db, nil, nil, batcher, func() bool { return true })
+
+	if got := r.ResolveNow([]string{"U001"}); got != nil {
+		t.Errorf("a degraded workspace resolved %v through edge; want nil so the caller falls back per-user", got)
+	}
+	if n := len(batcher.calls()); n != 0 {
+		t.Errorf("a degraded workspace made %d edge calls; want 0", n)
+	}
+}
+
+func TestUserResolver_ResolveNowReturnsNilOnError(t *testing.T) {
+	db := newTestDB(t)
+	batcher := &fakeBatcher{err: errors.New("ratelimited")}
+	r := newUserResolver("T1", nil, db, nil, nil, batcher, nil)
+
+	if got := r.ResolveNow([]string{"U001"}); got != nil {
+		t.Errorf("a failed edge call returned %v; want nil", got)
+	}
+	if _, err := db.GetUser("U001"); err == nil {
+		t.Error("U001 was cached from a response the resolver rejected")
+	}
+}
+
+func TestUserResolver_ResolveNowSkipsEmptyInput(t *testing.T) {
+	db := newTestDB(t)
+	batcher := &fakeBatcher{}
+	r := newUserResolver("T1", nil, db, nil, nil, batcher, nil)
+
+	if got := r.ResolveNow(nil); got != nil {
+		t.Errorf("ResolveNow(nil) = %v; want nil", got)
+	}
+	if got := r.ResolveNow([]string{""}); got != nil {
+		t.Errorf("ResolveNow([\"\"]) = %v; want nil — an updated_ids map containing \"\" is a request shape nothing observed produces", got)
+	}
+	if n := len(batcher.calls()); n != 0 {
+		t.Errorf("empty input produced %d edge calls; want 0", n)
+	}
+}
+
+func TestResolveDMNames(t *testing.T) {
+	// The sweep maps resolutions to CHANNEL ids: DMNameResolvedMsg
+	// renames the sidebar row and re-buckets app DMs, which
+	// UserResolvedMsg (history patching) cannot do.
+	db := newTestDB(t)
+	batcher := &fakeBatcher{res: []edge.User{
+		edgeUserRecord("U_ALICE", "alice", "Alice A", "", "T1", 1, false),
+		edgeUserRecord("U_APP", "someapp", "Some App", "", "T1", 1, true),
+	}}
+	wctx := &WorkspaceContext{
+		TeamID:       "T1",
+		UserNames:    map[string]string{},
+		BotUserIDs:   map[string]bool{},
+		UserResolver: newUserResolver("T1", nil, db, nil, nil, batcher, nil),
+		UnresolvedDMs: []UnresolvedDM{
+			{ChannelID: "D_ALICE", UserID: "U_ALICE"},
+			{ChannelID: "D_APP", UserID: "U_APP"},
+		},
+	}
+	var mu sync.Mutex
+	var sent []tea.Msg
+	resolveDMNames(wctx, db, nil, func(m tea.Msg) {
+		mu.Lock()
+		sent = append(sent, m)
+		mu.Unlock()
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	var alice, app *ui.DMNameResolvedMsg
+	for _, m := range sent {
+		if dm, ok := m.(ui.DMNameResolvedMsg); ok {
+			switch dm.ChannelID {
+			case "D_ALICE":
+				d := dm
+				alice = &d
+			case "D_APP":
+				d := dm
+				app = &d
+			}
+		}
+	}
+	if alice == nil || alice.DisplayName != "Alice A" {
+		t.Errorf("D_ALICE got %+v; want a DMNameResolvedMsg naming Alice A", alice)
+	}
+	if app == nil || app.DisplayName != "Some App" || !app.IsBot {
+		t.Errorf("D_APP got %+v; want a DMNameResolvedMsg naming Some App with IsBot true — that flag re-buckets the row into the Apps section", app)
+	}
+	if !wctx.BotUserIDs["U_APP"] {
+		t.Error("U_APP was not recorded in BotUserIDs")
+	}
+	if n := len(batcher.calls()); n != 1 {
+		t.Errorf("the sweep made %d edge calls; want 1 for any number of DMs", n)
+	}
+}
