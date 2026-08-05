@@ -13,6 +13,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/gammons/slk/internal/cache"
 	slackclient "github.com/gammons/slk/internal/slack"
+	"github.com/gammons/slk/internal/slack/membership"
 	"github.com/gammons/slk/internal/ui"
 )
 
@@ -281,6 +282,82 @@ func TestReconnect_CountsFailureStillRefreshesTheActiveChannel(t *testing.T) {
 	}
 	if len(refreshed) != 1 {
 		t.Errorf("refreshed %v; want the active channel refreshed despite the counts failure", refreshed)
+	}
+}
+
+// fakeMemberAPI implements membership.ConversationMemberAPI and
+// records how many full fetches it was asked to perform.
+type fakeMemberAPI struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *fakeMemberAPI) GetUsersInConversation(_ context.Context, _ string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return []string{"U1"}, nil
+}
+
+func (f *fakeMemberAPI) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func newMembershipHandler(t *testing.T, active bool) (*rtmEventHandler, *fakeMemberAPI, *cache.DB) {
+	t.Helper()
+	db := newTestDB(t)
+	if err := db.ReplaceChannelMembers("T1", "C1", []string{"U1"}, time.Now().Unix()); err != nil {
+		t.Fatalf("ReplaceChannelMembers: %v", err)
+	}
+	api := &fakeMemberAPI{}
+	mgr := membership.New("T1", api, db, nil, nil)
+	h := &rtmEventHandler{
+		wsCtx:           &WorkspaceContext{Membership: mgr},
+		isActive:        func() bool { return active },
+		activeChannelID: func() string { return "C1" },
+	}
+	return h, api, db
+}
+
+// TestOnConnectMembershipRefreshSkipsInactiveWorkspace pins the
+// cross-workspace bug behind the 42-conversations.members session.
+// Every workspace's handler reads the GLOBAL UI active channel via
+// app.ActiveChannelID(); without an isActive gate, OnConnect ran
+// ForceStale+EnsureFresh for that channel on EVERY workspace's
+// connect. The workspaces that don't own the channel fail with
+// channel_not_found, and a failing fetch leaves the cache stale, so
+// each reconnect re-fired the call — an unbounded amplifier with zero
+// user interaction. Measured live: both workspaces' OnConnect fetched
+// the same DM id 0.6 s apart; the non-owner's failed.
+func TestOnConnectMembershipRefreshSkipsInactiveWorkspace(t *testing.T) {
+	h, api, db := newMembershipHandler(t, false)
+	before, _, _ := db.GetChannelMembershipMeta("T1", "C1")
+
+	h.refreshActiveMembership()
+	time.Sleep(100 * time.Millisecond)
+
+	if c := api.callCount(); c != 0 {
+		t.Errorf("background workspace fetched membership %d times for a channel it does not own; want 0", c)
+	}
+	after, _, _ := db.GetChannelMembershipMeta("T1", "C1")
+	if after != before {
+		t.Errorf("ForceStale zeroed a background workspace's membership meta (%d -> %d); staleness must only be forced by the workspace on screen", before, after)
+	}
+}
+
+func TestOnConnectMembershipRefreshRunsForActiveWorkspace(t *testing.T) {
+	h, api, _ := newMembershipHandler(t, true)
+
+	h.refreshActiveMembership()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && api.callCount() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if c := api.callCount(); c != 1 {
+		t.Errorf("active workspace's membership refresh fetched %d times; want 1", c)
 	}
 }
 
