@@ -177,7 +177,7 @@ func TestChannelsInfo_SendsUpdatedIDsAndDecodesResults(t *testing.T) {
 	})
 	c := rec.client()
 
-	got, err := c.ChannelsInfo(context.Background(), map[string]int64{
+	got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", map[string]int64{
 		"C2QPK1V44":   1783337533019,
 		"C092E63RUUC": 0,
 	})
@@ -268,6 +268,28 @@ func TestChannelsInfo_SendsUpdatedIDsAndDecodesResults(t *testing.T) {
 	}
 }
 
+func TestChannelsInfo_ScopesThePathToTheGivenTeam(t *testing.T) {
+	// On Enterprise Grid a user's conversations are owned by many
+	// teams within the org, and the edge cache keys them under the
+	// owning team. The team in the request path is therefore a
+	// per-call decision, not a client property: scoping every request
+	// to the auth.test team is what resolved zero of raff's 217
+	// conversations (gammons/slk#5).
+	rec := newRecorder(t, alwaysEmpty)
+	c := rec.client() // constructed with team T04T4TH8W
+
+	if _, err := c.ChannelsInfo(context.Background(), "T_OTHER_TEAM", map[string]int64{"C1": 0}); err != nil {
+		t.Fatalf("ChannelsInfo: %v", err)
+	}
+	reqs := rec.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("requests = %d; want 1", len(reqs))
+	}
+	if want := "/cache/T_OTHER_TEAM/channels/info"; reqs[0].path != want {
+		t.Errorf("path = %q; want %q — the call's team, not the client's construction team", reqs[0].path, want)
+	}
+}
+
 // channelBooleanFlags is every boolean modelled on Channel, paired
 // with the wire key it must decode from.
 var channelBooleanFlags = []struct {
@@ -318,7 +340,7 @@ func TestChannel_DecodesEachBooleanFlagIndependently(t *testing.T) {
 					strings.Join(fields, ","))
 			})
 
-			got, err := rec.client().ChannelsInfo(context.Background(), map[string]int64{"C2QPK1V44": 1})
+			got, err := rec.client().ChannelsInfo(context.Background(), "T04T4TH8W", map[string]int64{"C2QPK1V44": 1})
 			if err != nil {
 				t.Fatalf("ChannelsInfo: %v", err)
 			}
@@ -429,7 +451,7 @@ func TestChannelsInfo_MembershipArrivesWithNoResults(t *testing.T) {
 	})
 	c := rec.client()
 
-	got, err := c.ChannelsInfo(context.Background(), map[string]int64{
+	got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", map[string]int64{
 		"C2QPK1V44":   1,
 		"CL0AET1L0":   2,
 		"C092E63RUUC": 3,
@@ -470,7 +492,7 @@ func TestChannelsInfo_SurfacesFailedIDs(t *testing.T) {
 	})
 	c := rec.client()
 
-	got, err := c.ChannelsInfo(context.Background(), map[string]int64{
+	got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", map[string]int64{
 		"C2QPK1V44":    1,
 		"C092E63RUUCX": 2,
 		"C0B0QD6BH1N":  3,
@@ -504,7 +526,7 @@ func TestChannelsInfo_AbsentMembershipAndFailuresDecodeEmpty(t *testing.T) {
 	rec := newRecorder(t, alwaysEmpty) // {"results":[],"ok":true}
 	c := rec.client()
 
-	got, err := c.ChannelsInfo(context.Background(), map[string]int64{"C2QPK1V44": 1})
+	got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", map[string]int64{"C2QPK1V44": 1})
 	if err != nil {
 		t.Fatalf("ChannelsInfo on a response with neither key: %v", err)
 	}
@@ -530,7 +552,7 @@ func TestChannelsInfo_AccumulatesMembershipAcrossBatches(t *testing.T) {
 	})
 	c := rec.client()
 
-	got, err := c.ChannelsInfo(context.Background(), ids("C", channelsInfoBatchSize*2+10))
+	got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", ids("C", channelsInfoBatchSize*2+10))
 	if err != nil {
 		t.Fatalf("ChannelsInfo: %v", err)
 	}
@@ -590,7 +612,7 @@ func TestChannelsInfo_MembershipQueriedCoversOnlyBatchesThatReported(t *testing.
 	})
 	c := rec.client()
 
-	got, err := c.ChannelsInfo(context.Background(), ids("C", channelsInfoBatchSize*2+10))
+	got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", ids("C", channelsInfoBatchSize*2+10))
 	if err != nil {
 		t.Fatalf("ChannelsInfo: %v", err)
 	}
@@ -643,7 +665,7 @@ func TestChannelsInfo_SurfacesFailedIDsWithoutMemberChannels(t *testing.T) {
 	})
 	c := rec.client()
 
-	got, err := c.ChannelsInfo(context.Background(), map[string]int64{
+	got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", map[string]int64{
 		"C092E63RUUCX": 44,
 		"C0B0QD6BH1N":  55,
 	})
@@ -671,7 +693,7 @@ func TestChannelsInfo_AbsentMemberChannelsCoversNoIDs(t *testing.T) {
 	rec := newRecorder(t, alwaysEmpty) // {"results":[],"ok":true}
 	c := rec.client()
 
-	got, err := c.ChannelsInfo(context.Background(), map[string]int64{
+	got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", map[string]int64{
 		"C2QPK1V44":   11,
 		"CL0AET1L0":   22,
 		"C092E63RUUC": 33,
@@ -706,7 +728,7 @@ func TestChannelsInfo_ExplicitlyEmptyMemberChannelsCoversTheWholeBatch(t *testin
 		"CL0AET1L0":   22,
 		"C092E63RUUC": 33,
 	}
-	got, err := c.ChannelsInfo(context.Background(), queried)
+	got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", queried)
 	if err != nil {
 		t.Fatalf("ChannelsInfo: %v", err)
 	}
@@ -740,7 +762,7 @@ func TestChannelsInfo_MembershipQueriedHoldsIDsSentNotIDsReturned(t *testing.T) 
 	})
 	c := rec.client()
 
-	got, err := c.ChannelsInfo(context.Background(), map[string]int64{
+	got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", map[string]int64{
 		"C2QPK1V44":   11, // reported on, named nowhere: a non-member
 		"CL0AET1L0":   22, // a member
 		"C092E63RUUC": 33, // a failure
@@ -782,7 +804,7 @@ func TestChannelsInfo_AllAccumulatorsPreserveRequestOrder(t *testing.T) {
 	})
 	c := rec.client()
 
-	got, err := c.ChannelsInfo(context.Background(), ids("C", channelsInfoBatchSize*2+10))
+	got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", ids("C", channelsInfoBatchSize*2+10))
 	if err != nil {
 		t.Fatalf("ChannelsInfo: %v", err)
 	}
@@ -829,7 +851,7 @@ func TestChannelsInfo_EmptyResultsMeansNothingChanged(t *testing.T) {
 	rec := newRecorder(t, alwaysEmpty)
 	c := rec.client()
 
-	got, err := c.ChannelsInfo(context.Background(), map[string]int64{"CL0AET1L0": 1783337533019})
+	got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", map[string]int64{"CL0AET1L0": 1783337533019})
 	if err != nil {
 		t.Fatalf("ChannelsInfo: %v", err)
 	}
@@ -847,7 +869,7 @@ func TestChannelsInfo_NoIDsMakesNoRequest(t *testing.T) {
 	c := rec.client()
 
 	for _, in := range []map[string]int64{nil, {}} {
-		got, err := c.ChannelsInfo(context.Background(), in)
+		got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", in)
 		if err != nil {
 			t.Fatalf("ChannelsInfo(%v): %v", in, err)
 		}
@@ -867,7 +889,7 @@ func TestChannelsInfo_SplitsLargeIDSets(t *testing.T) {
 
 	const total = channelsInfoBatchSize*2 + 10
 	want := ids("C", total)
-	if _, err := c.ChannelsInfo(context.Background(), want); err != nil {
+	if _, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", want); err != nil {
 		t.Fatalf("ChannelsInfo: %v", err)
 	}
 
@@ -916,7 +938,7 @@ func TestChannelsInfo_ExactMultipleOfBatchSizeSendsNoEmptyBatch(t *testing.T) {
 	rec := newRecorder(t, alwaysEmpty)
 	c := rec.client()
 
-	if _, err := c.ChannelsInfo(context.Background(), ids("C", channelsInfoBatchSize)); err != nil {
+	if _, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", ids("C", channelsInfoBatchSize)); err != nil {
 		t.Fatalf("ChannelsInfo: %v", err)
 	}
 	if n := len(rec.requests()); n != 1 {
@@ -934,7 +956,7 @@ func TestChannelsInfo_ReturnsResultsFromEveryBatch(t *testing.T) {
 	})
 	c := rec.client()
 
-	got, err := c.ChannelsInfo(context.Background(), ids("C", channelsInfoBatchSize*2+10))
+	got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", ids("C", channelsInfoBatchSize*2+10))
 	if err != nil {
 		t.Fatalf("ChannelsInfo: %v", err)
 	}
@@ -979,7 +1001,7 @@ func TestChannelsInfo_IgnoresUnknownResponseFields(t *testing.T) {
 	})
 	c := rec.client()
 
-	got, err := c.ChannelsInfo(context.Background(), map[string]int64{"C2QPK1V44": 1})
+	got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", map[string]int64{"C2QPK1V44": 1})
 	if err != nil {
 		t.Fatalf("ChannelsInfo on a full real-shaped response: %v", err)
 	}
@@ -998,7 +1020,7 @@ func TestChannelsInfo_PropagatesAPIError(t *testing.T) {
 	})
 	c := rec.client()
 
-	got, err := c.ChannelsInfo(context.Background(), map[string]int64{"C1": 1})
+	got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", map[string]int64{"C1": 1})
 	if err == nil {
 		t.Fatal("ChannelsInfo returned nil error on ok:false")
 	}
@@ -1027,7 +1049,7 @@ func TestChannelsInfo_MidBatchErrorAbortsAndDiscardsPartialResults(t *testing.T)
 	})
 	c := rec.client()
 
-	got, err := c.ChannelsInfo(context.Background(), ids("C", channelsInfoBatchSize*2+10))
+	got, err := c.ChannelsInfo(context.Background(), "T04T4TH8W", ids("C", channelsInfoBatchSize*2+10))
 	if err == nil {
 		t.Fatal("ChannelsInfo returned nil error when the second batch failed")
 	}
@@ -1435,7 +1457,7 @@ func TestFetchInfo_DoesNotMergeAnErroredBatch(t *testing.T) {
 	c := rec.client()
 
 	var merged []channelsInfoResponse
-	err := fetchInfo(context.Background(), c, "channels/info",
+	err := fetchInfo(context.Background(), c, "T04T4TH8W", "channels/info",
 		map[string]any{"check_membership": true},
 		ids("C", channelsInfoBatchSize*2+10), channelsInfoBatchSize,
 		func(batch channelsInfoResponse, _ []string) { merged = append(merged, batch) })
@@ -1484,7 +1506,7 @@ func TestFetchInfo_HandsMergeTheIDsThatBatchSent(t *testing.T) {
 	c := rec.client()
 
 	var seen [][]string
-	err := fetchInfo(context.Background(), c, "channels/info",
+	err := fetchInfo(context.Background(), c, "T04T4TH8W", "channels/info",
 		map[string]any{"check_membership": true},
 		ids("C", channelsInfoBatchSize*2+10), channelsInfoBatchSize,
 		func(_ channelsInfoResponse, queried []string) {

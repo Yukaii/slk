@@ -88,7 +88,7 @@ func (c *Client) ChannelsSearch(ctx context.Context, query string, topChannels [
 		Results        []Channel `json:"results"`
 		MemberChannels []string  `json:"member_channels"`
 	}
-	if err := c.call(ctx, "channels/search", payload, &resp); err != nil {
+	if err := c.call(ctx, c.teamID, "channels/search", payload, &resp); err != nil {
 		return nil, nil, err
 	}
 	return resp.Results, resp.MemberChannels, nil
@@ -161,7 +161,7 @@ func (c *Client) UsersSearch(ctx context.Context, query, currentChannel string, 
 	var resp struct {
 		Results []User `json:"results"`
 	}
-	if err := c.call(ctx, "users/search", payload, &resp); err != nil {
+	if err := c.call(ctx, c.teamID, "users/search", payload, &resp); err != nil {
 		return nil, err
 	}
 	return resp.Results, nil

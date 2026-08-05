@@ -31,7 +31,7 @@ func TestClient_PostsJSONAsTextPlain(t *testing.T) {
 	var out struct {
 		OK bool `json:"ok"`
 	}
-	err := c.call(context.Background(), "users/info",
+	err := c.call(context.Background(), "T04T4TH8W", "users/info",
 		map[string]any{"check_interaction": true}, &out)
 	if err != nil {
 		t.Fatalf("call: %v", err)
@@ -79,7 +79,7 @@ func TestClient_PropagatesHTTPError(t *testing.T) {
 	c := New("xoxc-test", "T1", srv.Client())
 	c.baseURL = srv.URL
 	var out struct{}
-	err := c.call(context.Background(), "users/info", map[string]any{}, &out)
+	err := c.call(context.Background(), "T1", "users/info", map[string]any{}, &out)
 	if err == nil {
 		t.Fatal("call returned nil error on HTTP 500")
 	}
@@ -102,7 +102,7 @@ func TestClient_PropagatesAPIError(t *testing.T) {
 	c := New("xoxc-test", "T1", srv.Client())
 	c.baseURL = srv.URL
 	var out struct{}
-	err := c.call(context.Background(), "users/info", map[string]any{}, &out)
+	err := c.call(context.Background(), "T1", "users/info", map[string]any{}, &out)
 	if err == nil {
 		t.Fatal("call returned nil error on ok:false")
 	}
@@ -129,7 +129,7 @@ func TestClient_RespectsContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var out struct{}
-	err := c.call(ctx, "users/info", map[string]any{}, &out)
+	err := c.call(ctx, "T1", "users/info", map[string]any{}, &out)
 	if err == nil {
 		t.Fatal("call ignored a cancelled context")
 	}
@@ -175,7 +175,7 @@ func TestClient_SendsThroughTheCallerSuppliedHTTPClient(t *testing.T) {
 	c := New("xoxc-test", "T1", &http.Client{Transport: marker})
 	c.baseURL = srv.URL
 
-	if err := c.call(context.Background(), "users/info", map[string]any{}, nil); err != nil {
+	if err := c.call(context.Background(), "T1", "users/info", map[string]any{}, nil); err != nil {
 		t.Fatalf("call: %v", err)
 	}
 	if !marker.used.Load() {
@@ -196,7 +196,7 @@ func TestClient_AcceptsNilOutToDiscardTheBody(t *testing.T) {
 
 	c := New("xoxc-test", "T1", srv.Client())
 	c.baseURL = srv.URL
-	if err := c.call(context.Background(), "users/info", map[string]any{}, nil); err != nil {
+	if err := c.call(context.Background(), "T1", "users/info", map[string]any{}, nil); err != nil {
 		t.Fatalf("call with out=nil: %v", err)
 	}
 }
@@ -212,7 +212,7 @@ func TestClient_ReportsAPIErrorWithNoErrorField(t *testing.T) {
 
 	c := New("xoxc-test", "T1", srv.Client())
 	c.baseURL = srv.URL
-	err := c.call(context.Background(), "users/info", map[string]any{}, nil)
+	err := c.call(context.Background(), "T1", "users/info", map[string]any{}, nil)
 	if err == nil {
 		t.Fatal("call returned nil error on ok:false")
 	}

@@ -10,7 +10,9 @@ import (
 //
 // These are not documented limits. They are caps chosen at or just
 // under the largest batch the official web client has been observed
-// sending, measured across 8 HAR captures of a live Grid workspace:
+// sending, measured across 8 HAR captures of a live NON-Grid
+// workspace (Rands, T04T4TH8W). No Grid capture of edgeapi exists;
+// behaviour there is inferred from a user's log, not observed:
 //
 //	channels/info   18 requests, 1–63 ids per request
 //	users/info      30 requests, 1–80 ids per request
@@ -232,7 +234,17 @@ type channelsInfoResponse struct {
 	FailedIDs      []string  `json:"failed_ids"`
 }
 
-// ChannelsInfo revalidates channels against the edge cache.
+// ChannelsInfo revalidates channels against the edge cache, scoped to
+// teamID: the request path is /cache/<teamID>/channels/info.
+//
+// teamID is mandatory and per-call because of Enterprise Grid. A Grid
+// user's conversations are owned by different teams within the org,
+// and the edge cache keys records under the owning team; a request
+// scoped to the auth.test team resolves only the conversations that
+// team owns and fails the rest (gammons/slk#5: 217 of 217 failed).
+// The caller partitions by userBoot's context_team_id; non-Grid
+// callers pass the workspace's own team id, which is every
+// conversation's context team there.
 //
 // updatedIDs maps channel id to the version last seen (0 for a channel
 // we have never seen). Only the entries whose version moved, plus the
@@ -244,9 +256,9 @@ type channelsInfoResponse struct {
 // the top-level member_channels array, returned for every id in the
 // batch whether or not that channel changed — see
 // ChannelsInfoResult.MemberChannels.
-func (c *Client) ChannelsInfo(ctx context.Context, updatedIDs map[string]int64) (ChannelsInfoResult, error) {
+func (c *Client) ChannelsInfo(ctx context.Context, teamID string, updatedIDs map[string]int64) (ChannelsInfoResult, error) {
 	var out ChannelsInfoResult
-	err := fetchInfo(ctx, c, "channels/info", map[string]any{
+	err := fetchInfo(ctx, c, teamID, "channels/info", map[string]any{
 		"check_membership": true,
 	}, updatedIDs, channelsInfoBatchSize, func(batch channelsInfoResponse, queried []string) {
 		out.Channels = append(out.Channels, batch.Results...)
@@ -293,7 +305,7 @@ type usersInfoResponse struct {
 // caller wants. Adding it later is a two-line change plus a merge.
 func (c *Client) UsersInfo(ctx context.Context, updatedIDs map[string]int64) ([]User, error) {
 	var out []User
-	err := fetchInfo(ctx, c, "users/info", map[string]any{
+	err := fetchInfo(ctx, c, c.teamID, "users/info", map[string]any{
 		"check_interaction":          true,
 		"include_profile_only_users": true,
 	}, updatedIDs, usersInfoBatchSize, func(batch usersInfoResponse, _ []string) {
@@ -368,6 +380,7 @@ func (c *Client) UsersInfo(ctx context.Context, updatedIDs map[string]int64) ([]
 func fetchInfo[Resp any](
 	ctx context.Context,
 	c *Client,
+	teamID string,
 	endpoint string,
 	flags map[string]any,
 	updatedIDs map[string]int64,
@@ -396,7 +409,7 @@ func fetchInfo[Resp any](
 		queried := slices.Collect(maps.Keys(batch))
 
 		var resp Resp
-		if err := c.call(ctx, endpoint, payload, &resp); err != nil {
+		if err := c.call(ctx, teamID, endpoint, payload, &resp); err != nil {
 			return err
 		}
 		merge(resp, queried)
