@@ -288,11 +288,13 @@ type userBatcher interface {
 	UsersInfo(ctx context.Context, updatedIDs map[string]int64) ([]edge.User, error)
 }
 
-// userResolver dispatches users.info lookups for unknown message
-// authors in the background. Deduplicates concurrent requests for
-// the same userID; failures are silent (the row stays rendered as
-// its user ID). Bound to a single workspace because user IDs are
-// workspace-scoped.
+// userResolver resolves unknown message authors in the background.
+// Misses coalesce into batched edge users/info calls (see flush); ids
+// edge cannot resolve, a failed batch, and degraded workspaces fall
+// back to the per-user Web API users.info path (see resolveOne).
+// Deduplicates concurrent requests for the same userID; failures are
+// silent (the row stays rendered as its user ID). Bound to a single
+// workspace because user IDs are workspace-scoped.
 type userResolver struct {
 	teamID   string
 	client   *slackclient.Client
@@ -300,10 +302,14 @@ type userResolver struct {
 	avatars  *avatar.Cache
 	send     func(tea.Msg)
 	inflight sync.Map // userID -> struct{}
-	// sem bounds concurrent round trips. Buffered, so acquiring it
-	// happens inside the request goroutine and Request itself never
-	// blocks -- it is called from the render path and from WS event
-	// handlers, neither of which may wait on the network.
+	// sem bounds concurrent round trips on the per-user users.info
+	// path (resolveOne). Buffered, so acquiring it happens inside the
+	// request goroutine and Request itself never blocks -- it is
+	// called from the render path and from WS event handlers, neither
+	// of which may wait on the network. The batch path needs no
+	// semaphore: it is bounded by the window itself, at one edge
+	// users/info call per userResolverBatchWindow (plus that call's
+	// internal 80-id splitting, sequential within the call).
 	sem chan struct{}
 
 	batcher  userBatcher
