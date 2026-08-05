@@ -321,6 +321,13 @@ type Deps struct {
 	Revalidate Revalidator
 	Store      Store
 
+	// Health, when non-nil, is marked degraded when the largest
+	// context-team group fails wholesale (every non-IM id unresolved)
+	// and holds at least half of all revalidated ids; the remaining
+	// groups are then aborted. Nil disables the check. See
+	// revalidateChannels for the reasoning.
+	Health *edge.Health
+
 	// OpenChannelID is the conversation to open — the restored last
 	// channel, or the configured default. Empty means "whatever Slack
 	// considers last-viewed", which is what the capture did.

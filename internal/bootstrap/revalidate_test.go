@@ -1185,6 +1185,141 @@ func TestRevalidate_TeamFailureDoesNotSkipOtherTeams(t *testing.T) {
 	}
 }
 
+// --- edge health ------------------------------------------------------
+
+// bigTeamFixture builds a boot whose conversations partition into one
+// 6-id T_BIG group and one 2-id T_SMALL group, all channels (no IMs
+// unless added by the test). 6 of 8 ids is over the majority
+// threshold; T_BIG sorts first by size.
+func bigTeamFixture(f *fakeDeps) {
+	f.bootRes.Channels = []boot.Channel{
+		{ID: "C_BIG1", Name: "big1", ContextTeamID: "T_BIG"},
+		{ID: "C_BIG2", Name: "big2", ContextTeamID: "T_BIG"},
+		{ID: "C_BIG3", Name: "big3", ContextTeamID: "T_BIG"},
+		{ID: "C_BIG4", Name: "big4", ContextTeamID: "T_BIG"},
+		{ID: "C_BIG5", Name: "big5", ContextTeamID: "T_BIG"},
+		{ID: "C_BIG6", Name: "big6", ContextTeamID: "T_BIG"},
+		{ID: "C_SMALL1", Name: "small1", ContextTeamID: "T_SMALL"},
+		{ID: "C_SMALL2", Name: "small2", ContextTeamID: "T_SMALL"},
+	}
+	f.bootRes.IMs = nil
+}
+
+func TestRevalidate_WholesaleFailureMarksDegradedAndAborts(t *testing.T) {
+	// Measured on the first working Grid session (2026-08-05): one
+	// enterprise-id group holding 79% of the user's conversations
+	// resolved none of them, and the 16 foreign-team groups behind it
+	// were all Unauthenticated — 23 wasted edge calls per boot. The
+	// largest group failing wholesale IS the diagnosis; the rest of
+	// the partition is not worth spending requests on.
+	f := openedFake()
+	bigTeamFixture(f)
+	f.deps.Health = edge.NewHealth()
+	f.channelsInfoRes.FailedIDs = []string{"C_BIG1", "C_BIG2", "C_BIG3", "C_BIG4", "C_BIG5", "C_BIG6"}
+	// The canned response's Channels/queried sets name fixture ids
+	// this boot does not have, so filterChannelsInfo reduces them to
+	// nothing for these ids — only the failed ids apply.
+
+	if _, err := Run(context.Background(), f.Deps()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !f.deps.Health.Degraded() {
+		t.Error("the majority group failed wholesale and edge was not marked degraded; the resolver will keep spending edge calls on a workspace where they resolve nothing")
+	}
+	if len(f.channelsInfoCalls) != 1 {
+		t.Errorf("channels/info calls = %d; want 1 — after a wholesale failure of the majority group the remaining teams are aborted (calls: %+v)", len(f.channelsInfoCalls), f.channelsInfoCalls)
+	}
+	if f.channelsInfoCalls[0].team != "T_BIG" {
+		t.Errorf("first call went to %q; want T_BIG — groups are processed largest-first so the diagnosis comes before the spend", f.channelsInfoCalls[0].team)
+	}
+	if !f.loggedMatching("degraded") {
+		t.Errorf("a wholesale edge failure must say what it decided (logged: %v)", f.logged())
+	}
+}
+
+func TestRevalidate_CallErrorOfTheMajorityGroupAlsoMarksDegraded(t *testing.T) {
+	// The other wholesale shape: not failed_ids but an error —
+	// ratelimited, or Grid's Unauthenticated.
+	f := openedFake()
+	bigTeamFixture(f)
+	f.deps.Health = edge.NewHealth()
+	f.channelsInfoErrFor = map[string]error{"T_BIG": errors.New("Unauthenticated")}
+
+	if _, err := Run(context.Background(), f.Deps()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !f.deps.Health.Degraded() {
+		t.Error("an errored majority group did not mark edge degraded")
+	}
+	if len(f.channelsInfoCalls) != 1 {
+		t.Errorf("channels/info calls = %d; want 1", len(f.channelsInfoCalls))
+	}
+}
+
+func TestRevalidate_IMOnlyFailureDoesNotMarkDegraded(t *testing.T) {
+	// IMs ALWAYS land in failed_ids — 22 of 22 across the captures,
+	// on healthy workspaces. A group whose only failures are IMs is
+	// the normal case, and marking it degraded would disable edge
+	// batching everywhere.
+	f := openedFake()
+	f.bootRes.Channels = nil
+	f.bootRes.IMs = []boot.IM{
+		{ID: "D_A", UserID: "U_ALICE", IsIM: true, IsOpen: true, ContextTeamID: "T_HOME"},
+		{ID: "D_B", UserID: "U_BOB", IsIM: true, IsOpen: true, ContextTeamID: "T_HOME"},
+	}
+	f.deps.Health = edge.NewHealth()
+	f.channelsInfoRes.FailedIDs = []string{"D_A", "D_B"}
+
+	if _, err := Run(context.Background(), f.Deps()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if f.deps.Health.Degraded() {
+		t.Error("IM-only failures marked edge degraded; IMs land in failed_ids on every healthy workspace")
+	}
+}
+
+func TestRevalidate_HealthyRunDoesNotMarkDegraded(t *testing.T) {
+	f := openedFake()
+	f.deps.Health = edge.NewHealth()
+
+	if _, err := Run(context.Background(), f.Deps()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if f.deps.Health.Degraded() {
+		t.Error("a healthy revalidation marked edge degraded")
+	}
+}
+
+func TestRevalidate_MinorityWholesaleFailureDoesNotAbort(t *testing.T) {
+	// The threshold is the majority: a failing group that holds less
+	// than half the ids is one team's problem, not a broken edge.
+	// Here T_BIG holds 3 of 7 — wholesale-failed, but a minority —
+	// so all three teams are still called and nothing is marked.
+	f := openedFake()
+	f.bootRes.Channels = []boot.Channel{
+		{ID: "C_BIG1", Name: "big1", ContextTeamID: "T_BIG"},
+		{ID: "C_BIG2", Name: "big2", ContextTeamID: "T_BIG"},
+		{ID: "C_BIG3", Name: "big3", ContextTeamID: "T_BIG"},
+		{ID: "C_MID1", Name: "mid1", ContextTeamID: "T_MID"},
+		{ID: "C_MID2", Name: "mid2", ContextTeamID: "T_MID"},
+		{ID: "C_SMALL1", Name: "small1", ContextTeamID: "T_SMALL"},
+		{ID: "C_SMALL2", Name: "small2", ContextTeamID: "T_SMALL"},
+	}
+	f.bootRes.IMs = nil
+	f.deps.Health = edge.NewHealth()
+	f.channelsInfoErrFor = map[string]error{"T_BIG": errors.New("ratelimited")}
+
+	if _, err := Run(context.Background(), f.Deps()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if f.deps.Health.Degraded() {
+		t.Error("a minority group's failure marked edge degraded; the threshold is the majority of ids")
+	}
+	if len(f.channelsInfoCalls) != 3 {
+		t.Errorf("channels/info calls = %d; want 3 — a minority failure aborts nothing", len(f.channelsInfoCalls))
+	}
+}
+
 // --- budget -----------------------------------------------------------
 
 func TestRevalidate_StaysInsideTheBootCallBudget(t *testing.T) {
