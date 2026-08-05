@@ -530,7 +530,7 @@ func TestBootstrapDeps_RevalidatorUsesTheBrowserShapedHTTPClient(t *testing.T) {
 			"telemetry envelope and DefaultCounter; any other sends bare Go requests to edgeapi.")
 	}
 
-	if _, err := deps.Revalidate.ChannelsInfo(context.Background(), map[string]int64{"C1": 0}); err != nil {
+	if _, err := deps.Revalidate.ChannelsInfo(context.Background(), "T1", map[string]int64{"C1": 0}); err != nil {
 		t.Fatalf("ChannelsInfo: %v", err)
 	}
 
