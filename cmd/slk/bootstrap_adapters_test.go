@@ -20,6 +20,7 @@ import (
 	"github.com/gammons/slk/internal/cache"
 	slackclient "github.com/gammons/slk/internal/slack"
 	"github.com/gammons/slk/internal/slack/boot"
+	"github.com/gammons/slk/internal/slack/edge"
 	"github.com/gammons/slk/internal/slackhttp"
 )
 
@@ -462,7 +463,7 @@ func TestBootstrapDeps_PopulatesEveryDependency(t *testing.T) {
 	}
 	defer db.Close()
 
-	deps := newBootstrapDeps(slackclient.NewClient("xoxc-test", "d-cookie"), db, "xoxc-test", "C1")
+	deps := newBootstrapDeps(slackclient.NewClient("xoxc-test", "d-cookie"), db, "xoxc-test", "C1", edge.NewHealth())
 
 	v := reflect.ValueOf(deps)
 	for i := 0; i < v.NumField(); i++ {
@@ -474,6 +475,9 @@ func TestBootstrapDeps_PopulatesEveryDependency(t *testing.T) {
 				t.Errorf("Deps.%s is nil; bootstrap.Run cannot use a dependency that was never wired", name)
 			}
 		}
+	}
+	if deps.Health == nil {
+		t.Errorf("Deps.Health is nil; bootstrap cannot mark wholesale edge failures degraded without it")
 	}
 	if deps.OpenChannelID != "C1" {
 		t.Errorf("OpenChannelID = %q; want the channel it was given", deps.OpenChannelID)
@@ -505,7 +509,7 @@ func TestBootstrapDeps_RevalidatorUsesTheBrowserShapedHTTPClient(t *testing.T) {
 	}
 	defer db.Close()
 
-	deps := newBootstrapDeps(c, db, "xoxc-test", "")
+	deps := newBootstrapDeps(c, db, "xoxc-test", "", edge.NewHealth())
 
 	// Structural check FIRST, and it is deliberately not redundant
 	// with the wire assertions below. edge.Client's base URL is

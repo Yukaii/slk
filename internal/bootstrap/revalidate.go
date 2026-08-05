@@ -4,6 +4,7 @@ import (
 	"context"
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/gammons/slk/internal/cache"
 	"github.com/gammons/slk/internal/slack/edge"
@@ -127,6 +128,15 @@ func revalidateChannels(ctx context.Context, deps Deps, out *Result, logf func(s
 		return
 	}
 
+	// noteIM tracks which ids are IMs: they ALWAYS land in failed_ids
+	// (22 of 22 across the captures, healthy workspaces included), so
+	// the wholesale-failure check below must not count them, or every
+	// healthy workspace would trip it.
+	noteIM := make(map[string]bool, len(out.IMs))
+	for _, im := range out.IMs {
+		noteIM[im.ID] = true
+	}
+
 	groups := make(map[string]map[string]int64)
 	for id, version := range updated {
 		team := teamOf[id]
@@ -138,14 +148,88 @@ func revalidateChannels(ctx context.Context, deps Deps, out *Result, logf func(s
 		}
 		groups[team][id] = version
 	}
-	// Sorted for determinism: request order must not depend on map
-	// iteration, both for the debug log's readability and so a test
-	// can rely on call order.
+	// The majority base is NON-IM ids, on both sides. IMs always fail
+	// (above), so wholesaleFailure excludes them — and counting them
+	// here would let a group that is mostly IMs claim the majority
+	// and get edge marked degraded over a single channel's failure.
+	nonIMTotal := nonIMCount(updated, noteIM)
+	// Largest group first, alphabetical on ties. On a Grid org the
+	// enterprise-id group holds the overwhelming majority of a user's
+	// conversations (measured: 218 of 277), and judging it first means
+	// a wholesale edge failure is diagnosed before the remaining
+	// groups spend their requests. Deterministic order also keeps the
+	// debug log readable and tests able to rely on call order.
 	teams := slices.Collect(maps.Keys(groups))
-	slices.Sort(teams)
-	for _, team := range teams {
-		revalidateChannelTeam(ctx, deps, team, groups[team], logf)
+	slices.SortFunc(teams, func(a, b string) int {
+		if d := len(groups[b]) - len(groups[a]); d != 0 {
+			return d
+		}
+		return strings.Compare(a, b)
+	})
+	for i, team := range teams {
+		outcome := revalidateChannelTeam(ctx, deps, team, groups[team], logf)
+		// Only the first (largest) group can trip the wholesale
+		// check: later groups are smaller, so if the largest holds
+		// under half the non-IM ids no group reaches the majority
+		// threshold. On an exact 50/50 tie the second group is never
+		// evaluated — half is not a majority — and the alpha-first
+		// tiebreak makes which half goes first arbitrary but
+		// deterministic.
+		if i == 0 && deps.Health != nil && nonIMTotal > 0 && nonIMCount(groups[team], noteIM)*2 >= nonIMTotal && wholesaleFailure(outcome, groups[team], noteIM) {
+			deps.Health.MarkDegraded()
+			logf("bootstrap: channels/info for team %s failed wholesale (%d of %d ids); marking edge degraded for this session and skipping the remaining %d team group(s)",
+				team, len(groups[team]), len(updated), len(teams)-1)
+			return
+		}
 	}
+}
+
+// teamOutcome is what one team's revalidation learned, for the
+// wholesale-failure check in revalidateChannels. callErr covers both
+// transport and ok:false failures (the body's ids are all
+// unresolved either way); failed is the failed_ids set.
+type teamOutcome struct {
+	callErr bool
+	failed  map[string]struct{}
+}
+
+// wholesaleFailure reports whether a team's call resolved NOTHING it
+// was asked about: an errored call, or every non-IM id in failed_ids.
+// IMs are excluded — they always fail (see revalidateChannels), so
+// counting them would trip the check on healthy workspaces. A group
+// whose response is empty because everything was already current is
+// NOT a wholesale failure: nothing in failed_ids means nothing
+// failed. A group with no non-IM ids can only fail wholesale via
+// callErr.
+func wholesaleFailure(oc teamOutcome, group map[string]int64, noteIM map[string]bool) bool {
+	if oc.callErr {
+		return true
+	}
+	nonIM := 0
+	for id := range group {
+		if noteIM[id] {
+			continue
+		}
+		nonIM++
+		if _, failed := oc.failed[id]; !failed {
+			return false
+		}
+	}
+	return nonIM > 0
+}
+
+// nonIMCount is the number of ids in group that are not IMs — the
+// base the majority check and wholesaleFailure both reason over,
+// since IMs always land in failed_ids and would otherwise inflate
+// both.
+func nonIMCount(group map[string]int64, noteIM map[string]bool) int {
+	n := 0
+	for id := range group {
+		if !noteIM[id] {
+			n++
+		}
+	}
+	return n
 }
 
 // revalidateChannelTeam runs the channels/info call and its
@@ -153,14 +237,14 @@ func revalidateChannels(ctx context.Context, deps Deps, out *Result, logf func(s
 // one team's error is logged and its ids are left stale, and the
 // remaining teams still run — the same independence the channels and
 // users passes have from each other, one level down.
-func revalidateChannelTeam(ctx context.Context, deps Deps, team string, updated map[string]int64, logf func(string, ...any)) {
+func revalidateChannelTeam(ctx context.Context, deps Deps, team string, updated map[string]int64, logf func(string, ...any)) teamOutcome {
 	res, err := deps.Revalidate.ChannelsInfo(ctx, team, updated)
 	if err != nil {
 		// Everything below is discarded along with it. Slack answers
 		// ok:false with a populated body, so "err != nil and the
 		// value looks fine" is the normal shape of a failure here.
 		logf("bootstrap: channels/info for team %s: %d conversations: %v (leaving them stale)", team, len(updated), err)
-		return
+		return teamOutcome{callErr: true}
 	}
 
 	for _, ch := range res.Channels {
@@ -219,6 +303,12 @@ func revalidateChannelTeam(ctx context.Context, deps Deps, team string, updated 
 	if len(res.FailedIDs) > 0 {
 		logf("bootstrap: channels/info for team %s could not resolve %d ids (%v); leaving them stale to be retried", team, len(res.FailedIDs), res.FailedIDs)
 	}
+
+	failed := make(map[string]struct{}, len(res.FailedIDs))
+	for _, id := range res.FailedIDs {
+		failed[id] = struct{}{}
+	}
+	return teamOutcome{failed: failed}
 }
 
 // revalidateUsers conditionally refreshes the people the opened
