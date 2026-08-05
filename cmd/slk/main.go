@@ -514,10 +514,16 @@ func (r *userResolver) flush() {
 // Nil means "resolve everything per-user": no edge client, a degraded
 // workspace, a failed call, or nothing worth sending.
 //
-// Note applyEdgeUser's inflight.Delete is a no-op for these ids —
-// they were never queued. A Request racing a ResolveNow for the same
-// id can produce one duplicate users.info; the upserts are idempotent
-// and the window is a cache miss wide, so no guard is taken.
+// Note applyEdgeUser's deferred inflight.Delete is NOT always a
+// no-op here: a Request(id) racing a ResolveNow for the same id can
+// claim the inflight slot after ResolveNow's batch returned but
+// before its applyEdgeUser runs, and the deferred Delete then drops
+// that claim. The duplicate work this enables is bounded: the Delete
+// runs after the cache upsert, so any Request arriving later bails
+// on the cache check; the realistic duplicate is a Request that
+// already queued a pending entry before the upsert landed, which
+// flush then re-fetches once. The upserts are idempotent, so no
+// guard is taken.
 func (r *userResolver) ResolveNow(ids []string) []edge.User {
 	if r == nil || r.batcher == nil || len(ids) == 0 {
 		return nil
@@ -2779,22 +2785,29 @@ func resolveDMNames(wctx *WorkspaceContext, db *cache.DB, avatarCache *avatar.Ca
 			if name == "" {
 				name = u.Name
 			}
-			// edge users/info carries no is_app_user: a Slack app's DM
-			// resolved here may bucket as "dm" rather than "app" until
-			// something else classifies it. No capture shows that
-			// field on this endpoint, so none is invented; the
-			// per-user fallback below classifies the ids edge missed.
-			if u.IsBot {
-				wctx.BotUserIDs[dm.UserID] = true
+			if name != "" {
+				// edge users/info carries no is_app_user: a Slack app's DM
+				// resolved here may bucket as "dm" rather than "app" until
+				// something else classifies it. No capture shows that
+				// field on this endpoint, so none is invented; the
+				// per-user fallback below classifies the ids edge missed.
+				if u.IsBot {
+					wctx.BotUserIDs[dm.UserID] = true
+				}
+				if send != nil {
+					send(ui.DMNameResolvedMsg{
+						ChannelID:   dm.ChannelID,
+						DisplayName: name,
+						IsBot:       u.IsBot,
+					})
+				}
+				continue
 			}
-			if name != "" && send != nil {
-				send(ui.DMNameResolvedMsg{
-					ChannelID:   dm.ChannelID,
-					DisplayName: name,
-					IsBot:       u.IsBot,
-				})
-			}
-			continue
+			// An edge record with all three name fields empty is no
+			// resolution at all — and applyEdgeUser has already
+			// upserted its empty-DisplayName row, which satisfies
+			// Request's cache-skip gate. Fall through to the per-user
+			// path, which re-fetches and repairs the row.
 		}
 		resolved, isBot := resolveUser(wctx.Client, dm.UserID, wctx.UserNames, db, avatarCache)
 		if isBot {
