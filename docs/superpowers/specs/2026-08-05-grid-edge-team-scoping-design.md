@@ -75,12 +75,13 @@ evidence-gathering step for all of them.
    (`channels/info for team T… could not resolve N ids`), so the next
    Grid log says which scoping failed, not just that one did.
 
-5. Result merging across teams: each team's `ChannelsInfoResult` is
-   merged field-by-field into one aggregate before the store updates
-   run. `MemberChannels`/`MembershipQueried` stay paired per batch by
-   the existing pointer-guard machinery; concatenating the per-team
-   slices preserves that invariant because the pairing is positional
-   within each call already.
+5. Result handling across teams: each team is processed fully inside
+   its own iteration — call, write-through, membership, failed-ids —
+   rather than merging per-team results into one aggregate first.
+   (Amended during implementation: the aggregate design below was
+   superseded. Per-team processing gives failure independence for
+   free, and the MemberChannels/MembershipQueried pairing invariant
+   holds trivially because a queried set never crosses the partition.)
 
 ## Why this is safe to ship unverifiable-on-Grid
 

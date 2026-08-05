@@ -77,9 +77,8 @@ func revalidate(ctx context.Context, deps Deps, out *Result, logf func(string, .
 // conversations (gammons/slk#5). On a non-Grid workspace every
 // context team is expected to be the workspace team, so the partition
 // is a single group and the request shape is identical to before. An
-// empty
-// context team groups under the workspace team, preserving the old
-// behaviour for anything the field is missing on.
+// empty context team groups under the workspace team, preserving the
+// old behaviour for anything the field is missing on.
 //
 // The ims are included on purpose even though channels/info cannot
 // resolve them. Measured across the captures: of 193 ids the official
