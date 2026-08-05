@@ -2,6 +2,8 @@ package bootstrap
 
 import (
 	"context"
+	"maps"
+	"slices"
 
 	"github.com/gammons/slk/internal/cache"
 	"github.com/gammons/slk/internal/slack/edge"
@@ -67,6 +69,17 @@ func revalidate(ctx context.Context, deps Deps, out *Result, logf func(string, .
 // sidebar will render: userBoot's channels plus its ims, and nothing
 // else in the cache.
 //
+// The id set is partitioned by each conversation's context_team_id,
+// and each team gets its own channels/info call. On Enterprise Grid a
+// user's conversations are owned by many teams within the org and the
+// edge cache keys records under the owning team: a single call scoped
+// to the auth.test team resolved zero of one Grid user's 217
+// conversations (gammons/slk#5). On a non-Grid workspace every
+// context team is expected to be the workspace team, so the partition
+// is a single group and the request shape is identical to before. An
+// empty context team groups under the workspace team, preserving the
+// old behaviour for anything the field is missing on.
+//
 // The ims are included on purpose even though channels/info cannot
 // resolve them. Measured across the captures: of 193 ids the official
 // client sent to this endpoint, 22 were IM ids, and **all 22 came back
@@ -85,12 +98,15 @@ func revalidate(ctx context.Context, deps Deps, out *Result, logf func(string, .
 //     is_member across a boot. Removing the failed-id exclusion would
 //     mark every DM a non-membership on the next revalidation.
 func revalidateChannels(ctx context.Context, deps Deps, out *Result, logf func(string, ...any)) {
+	teamOf := make(map[string]string, len(out.Channels)+len(out.IMs))
 	ids := make([]string, 0, len(out.Channels)+len(out.IMs))
 	for _, ch := range out.Channels {
 		ids = append(ids, ch.ID)
+		teamOf[ch.ID] = ch.ContextTeamID
 	}
 	for _, im := range out.IMs {
 		ids = append(ids, im.ID)
+		teamOf[im.ID] = im.ContextTeamID
 	}
 
 	cached, err := deps.Store.ChannelVersions(deps.WorkspaceID)
@@ -111,12 +127,39 @@ func revalidateChannels(ctx context.Context, deps Deps, out *Result, logf func(s
 		return
 	}
 
-	res, err := deps.Revalidate.ChannelsInfo(ctx, updated)
+	groups := make(map[string]map[string]int64)
+	for id, version := range updated {
+		team := teamOf[id]
+		if team == "" {
+			team = deps.WorkspaceID
+		}
+		if groups[team] == nil {
+			groups[team] = make(map[string]int64)
+		}
+		groups[team][id] = version
+	}
+	// Sorted for determinism: request order must not depend on map
+	// iteration, both for the debug log's readability and so a test
+	// can rely on call order.
+	teams := slices.Collect(maps.Keys(groups))
+	slices.Sort(teams)
+	for _, team := range teams {
+		revalidateChannelTeam(ctx, deps, team, groups[team], logf)
+	}
+}
+
+// revalidateChannelTeam runs the channels/info call and its
+// write-through for one owning team. Team failures are independent:
+// one team's error is logged and its ids are left stale, and the
+// remaining teams still run — the same independence the channels and
+// users passes have from each other, one level down.
+func revalidateChannelTeam(ctx context.Context, deps Deps, team string, updated map[string]int64, logf func(string, ...any)) {
+	res, err := deps.Revalidate.ChannelsInfo(ctx, team, updated)
 	if err != nil {
 		// Everything below is discarded along with it. Slack answers
 		// ok:false with a populated body, so "err != nil and the
 		// value looks fine" is the normal shape of a failure here.
-		logf("bootstrap: channels/info for %d conversations: %v (leaving them stale)", len(updated), err)
+		logf("bootstrap: channels/info for team %s: %d conversations: %v (leaving them stale)", team, len(updated), err)
 		return
 	}
 
@@ -148,12 +191,15 @@ func revalidateChannels(ctx context.Context, deps Deps, out *Result, logf func(s
 	// of the batch.
 	//
 	// Empty means no batch reported, which is the COMMON case —
-	// member_channels is absent from 13 of 18 observed responses, all
+	// member_channels is absent from 13 of the 18 observed responses, all
 	// of which requested it — and it means "no information", so
 	// nothing is written and no call is made. Note res.FailedIDs
 	// accumulates across all batches while MembershipQueried covers
 	// only the reporting ones; that is harmless, since ApplyMembership
 	// touches nothing outside the queried set.
+	//
+	// Applying per team is safe because the queried set is exactly
+	// this team's ids: membership answers never cross the partition.
 	if len(res.MembershipQueried) > 0 {
 		if err := deps.Store.ApplyMembership(deps.WorkspaceID, res.MembershipQueried,
 			cache.MembershipReported(res.MemberChannels, res.FailedIDs)); err != nil {
@@ -168,8 +214,10 @@ func revalidateChannels(ctx context.Context, deps Deps, out *Result, logf func(s
 	// stamping a failed id as current would keep its stale record
 	// forever — its version never advances, so it never comes back.
 	// Leaving the version where it is means the next boot asks again.
+	//
+	// The team is named: on Grid this line is the whole diagnosis.
 	if len(res.FailedIDs) > 0 {
-		logf("bootstrap: channels/info could not resolve %d ids (%v); leaving them stale to be retried", len(res.FailedIDs), res.FailedIDs)
+		logf("bootstrap: channels/info for team %s could not resolve %d ids (%v); leaving them stale to be retried", team, len(res.FailedIDs), res.FailedIDs)
 	}
 }
 

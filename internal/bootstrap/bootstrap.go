@@ -77,7 +77,10 @@ type Historian interface {
 // Revalidator is the edgeapi conditional-revalidation pair. This is
 // what replaces enumeration.
 type Revalidator interface {
-	ChannelsInfo(ctx context.Context, updatedIDs map[string]int64) (edge.ChannelsInfoResult, error)
+	// ChannelsInfo revalidates conversations against the edge cache,
+	// scoped to teamID — on Enterprise Grid the owning team, which is
+	// not necessarily the workspace's own. See edge.ChannelsInfo.
+	ChannelsInfo(ctx context.Context, teamID string, updatedIDs map[string]int64) (edge.ChannelsInfoResult, error)
 	UsersInfo(ctx context.Context, updatedIDs map[string]int64) ([]edge.User, error)
 }
 

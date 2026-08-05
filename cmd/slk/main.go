@@ -2261,10 +2261,31 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 	// as its user ID for the moment before resolveUser answers, rather
 	// than for the (much longer) moment before the sweep finished.
 
-	// Fetch channels
+	// The sidebar comes from users.conversations, with client.userBoot
+	// as a fallback -- in that order, and the order was measured.
+	//
+	// userBoot cannot be the primary source. On a real 218-channel
+	// workspace its channels[] carried 67 of them; on another, 60 of
+	// 71. It is evidently not the complete joined-conversation list,
+	// and preferring it silently drops channels from the sidebar,
+	// which is a worse failure than the one this fixes because nobody
+	// notices a channel that is merely absent.
+	//
+	// But users.conversations must not be FATAL either. On the
+	// Enterprise Grid org in gammons/slk#5 it is rejected outright, and
+	// treating that as fatal dropped the entire workspace: no
+	// channels, no threads, no active workspace, and -- until the
+	// commit before this one -- no logged reason. userBoot had already
+	// returned all 217 of that user's conversations, so falling back to
+	// a partial list beats losing the session.
 	channels, err := client.GetChannels(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("fetching channels for %s: %w", token.TeamName, err)
+		log.Printf("workspace %s: users.conversations failed (%v); falling back to the conversations client.userBoot returned, which may be a subset", token.TeamName, err)
+		debuglog.General("workspace %s: users.conversations failed: %v", token.TeamName, err)
+		channels = bootConversations(res)
+	}
+	if len(channels) == 0 {
+		log.Printf("workspace %s: no conversations from either users.conversations or client.userBoot; the sidebar will be empty", token.TeamName)
 	}
 
 	for _, ch := range channels {

@@ -225,6 +225,12 @@ type membershipCall struct {
 	snap        cache.MembershipSnapshot
 }
 
+// channelsInfoCall is one team-scoped channels/info request.
+type channelsInfoCall struct {
+	team string
+	sent map[string]int64
+}
+
 // The revalidation half of fakeDeps. Declared here rather than in
 // bootstrap_test.go so the recording sits next to the assertions.
 type revalidateFake struct {
@@ -238,9 +244,11 @@ type revalidateFake struct {
 	userVersionsFor   []string
 	userVersionsCalls int
 
-	channelsInfoRes  edge.ChannelsInfoResult
-	channelsInfoErr  error
-	channelsInfoSent map[string]int64
+	channelsInfoRes    edge.ChannelsInfoResult
+	channelsInfoErr    error
+	channelsInfoSent   map[string]int64
+	channelsInfoCalls  []channelsInfoCall
+	channelsInfoErrFor map[string]error // per-team error injection
 
 	usersInfoRes  []edge.User
 	usersInfoErr  error
@@ -284,20 +292,56 @@ func (f *fakeDeps) UserVersions(workspaceID string) (map[string]int64, error) {
 	return f.userVersions, nil
 }
 
-func (f *fakeDeps) ChannelsInfo(_ context.Context, updatedIDs map[string]int64) (edge.ChannelsInfoResult, error) {
+func (f *fakeDeps) ChannelsInfo(_ context.Context, teamID string, updatedIDs map[string]int64) (edge.ChannelsInfoResult, error) {
 	f.record(callChannelsInfo)
 	f.mu.Lock()
-	// Copied: the caller may reuse or clear its map, and an assertion
-	// that reads it later would then be reading the future.
-	f.channelsInfoSent = make(map[string]int64, len(updatedIDs))
+	sent := make(map[string]int64, len(updatedIDs))
 	for k, v := range updatedIDs {
+		sent[k] = v
+	}
+	f.channelsInfoCalls = append(f.channelsInfoCalls, channelsInfoCall{team: teamID, sent: sent})
+	if f.channelsInfoSent == nil {
+		f.channelsInfoSent = map[string]int64{}
+	}
+	for k, v := range sent {
 		f.channelsInfoSent[k] = v
 	}
-	f.mu.Unlock()
-	if f.channelsInfoErr != nil {
-		return poisonedChannelsInfo(), f.channelsInfoErr
+	err := f.channelsInfoErr
+	if e, ok := f.channelsInfoErrFor[teamID]; ok {
+		err = e
 	}
-	return f.channelsInfoRes, nil
+	f.mu.Unlock()
+	if err != nil {
+		return poisonedChannelsInfo(), err
+	}
+	return filterChannelsInfo(f.channelsInfoRes, sent), nil
+}
+
+// filterChannelsInfo intersects a canned result with the ids one
+// request actually asked about, the way the server scopes its answer
+// to the request. A canned membership report that names no asked id
+// decays to "this batch said nothing" (empty MembershipQueried), which
+// is what the real absent-member_channels case already models.
+func filterChannelsInfo(res edge.ChannelsInfoResult, sent map[string]int64) edge.ChannelsInfoResult {
+	var out edge.ChannelsInfoResult
+	for _, ch := range res.Channels {
+		if _, ok := sent[ch.ID]; ok {
+			out.Channels = append(out.Channels, ch)
+		}
+	}
+	keep := func(ids []string) []string {
+		var kept []string
+		for _, id := range ids {
+			if _, ok := sent[id]; ok {
+				kept = append(kept, id)
+			}
+		}
+		return kept
+	}
+	out.MemberChannels = keep(res.MemberChannels)
+	out.MembershipQueried = keep(res.MembershipQueried)
+	out.FailedIDs = keep(res.FailedIDs)
+	return out
 }
 
 func (f *fakeDeps) UsersInfo(_ context.Context, updatedIDs map[string]int64) ([]edge.User, error) {
@@ -566,11 +610,13 @@ func TestRevalidate_UsesTheWorkspaceIDForEveryCacheCall(t *testing.T) {
 	if want := []string{"T_HOME"}; !reflect.DeepEqual(f.userVersionsFor, want) {
 		t.Errorf("UserVersions called for %v; want %v", f.userVersionsFor, want)
 	}
-	if len(f.membershipCalls) != 1 {
-		t.Fatalf("ApplyMembership called %d times; want 1", len(f.membershipCalls))
+	if len(f.membershipCalls) != 2 {
+		t.Fatalf("ApplyMembership called %d times; want 2, one per context team (%#v)", len(f.membershipCalls), f.membershipCalls)
 	}
-	if f.membershipCalls[0].workspaceID != "T_HOME" {
-		t.Errorf("ApplyMembership workspace = %q; want T_HOME", f.membershipCalls[0].workspaceID)
+	for _, c := range f.membershipCalls {
+		if c.workspaceID != "T_HOME" {
+			t.Errorf("ApplyMembership workspace = %q; want T_HOME", c.workspaceID)
+		}
 	}
 }
 
@@ -752,19 +798,34 @@ func TestRevalidate_AppliesMembershipToTheQueriedIDsNotTheReturnedOnes(t *testin
 	if _, err := Run(context.Background(), f.Deps()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if len(f.membershipCalls) != 1 {
-		t.Fatalf("ApplyMembership called %d times; want 1 (%#v)", len(f.membershipCalls), f.membershipCalls)
+	if len(f.membershipCalls) != 2 {
+		t.Fatalf("ApplyMembership called %d times; want 2, one per context team (%#v)", len(f.membershipCalls), f.membershipCalls)
 	}
-	got := f.membershipCalls[0]
-	wantQueried := cannedChannelsInfo().MembershipQueried
-	if !reflect.DeepEqual(got.queriedIDs, wantQueried) {
-		t.Errorf("ApplyMembership queried set = %v; want %v (MembershipQueried — the ids whose batch actually answered). MemberChannels is %v and must never be used here",
-			got.queriedIDs, wantQueried, cannedChannelsInfo().MemberChannels)
+	// Index alignment is the invariant: one membership call per
+	// channels/info call, in the same order. It holds only because
+	// every team's filtered MembershipQueried is non-empty — a team
+	// whose batch reported nothing produces no membership call and
+	// would shift the alignment.
+	byTeam := map[string]membershipCall{}
+	for i, c := range f.channelsInfoCalls {
+		byTeam[c.team] = f.membershipCalls[i]
 	}
-	wantSnap := cache.MembershipReported(cannedChannelsInfo().MemberChannels, failedChannelIDs)
-	if !reflect.DeepEqual(got.snap, wantSnap) {
-		t.Errorf("ApplyMembership snapshot = %#v; want %#v — failed ids are part of it, and omitting them clears is_member for ids the server explicitly could not answer about",
-			got.snap, wantSnap)
+	home := byTeam["T_HOME"]
+	if want := []string{"C_GENERAL", "D_ALICE"}; !reflect.DeepEqual(home.queriedIDs, want) {
+		t.Errorf("T_HOME queried set = %v; want %v (MembershipQueried, never MemberChannels %v)", home.queriedIDs, want, cannedChannelsInfo().MemberChannels)
+	}
+	if want := cache.MembershipReported([]string{"C_GENERAL"}, nil); !reflect.DeepEqual(home.snap, want) {
+		t.Errorf("T_HOME snapshot = %#v; want %#v", home.snap, want)
+	}
+	other := byTeam["T_OTHER"]
+	if want := []string{"C_PRIVATE"}; !reflect.DeepEqual(other.queriedIDs, want) {
+		t.Errorf("T_OTHER queried set = %v; want %v", other.queriedIDs, want)
+	}
+	// The failed id rides in its own team's snapshot: omitting it
+	// would clear is_member for an id the server explicitly could not
+	// answer about.
+	if want := cache.MembershipReported(nil, failedChannelIDs); !reflect.DeepEqual(other.snap, want) {
+		t.Errorf("T_OTHER snapshot = %#v; want %#v", other.snap, want)
 	}
 }
 
@@ -1049,12 +1110,88 @@ func TestRevalidate_MissingDependenciesAreLoggedNotFatal(t *testing.T) {
 	}
 }
 
+// --- team partitioning ------------------------------------------------
+
+// TestRevalidate_PartitionsChannelsInfoByContextTeam is the Grid fix.
+// The fixture spans two context teams (C_GENERAL/D_ALICE on T_HOME,
+// C_PRIVATE/D_BOB on T_OTHER), so a correct run issues one
+// channels/info per team, each carrying exactly that team's ids.
+func TestRevalidate_PartitionsChannelsInfoByContextTeam(t *testing.T) {
+	f := openedFake()
+
+	if _, err := Run(context.Background(), f.Deps()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(f.channelsInfoCalls) != 2 {
+		t.Fatalf("channels/info calls = %d; want 2, one per context team (calls: %+v)", len(f.channelsInfoCalls), f.channelsInfoCalls)
+	}
+	byTeam := map[string]map[string]int64{}
+	for _, c := range f.channelsInfoCalls {
+		byTeam[c.team] = c.sent
+	}
+	if want := map[string]int64{"C_GENERAL": 1783337533019, "D_ALICE": 0}; !reflect.DeepEqual(byTeam["T_HOME"], want) {
+		t.Errorf("T_HOME was sent %v; want %v", byTeam["T_HOME"], want)
+	}
+	if want := map[string]int64{"C_PRIVATE": 0, "D_BOB": 1783337533022}; !reflect.DeepEqual(byTeam["T_OTHER"], want) {
+		t.Errorf("T_OTHER was sent %v; want %v", byTeam["T_OTHER"], want)
+	}
+}
+
+// TestRevalidate_EmptyContextTeamUsesTheWorkspaceTeam: a conversation
+// userBoot gave no context_team_id for must behave exactly as
+// pre-Grid code behaved — scoped to the workspace's own team.
+//
+// NOTE: this is a characterization test. It passes both before and
+// after the partition lands, because the pre-partition code scopes
+// everything to the workspace team anyway. Its job is to pin the
+// fallback rule so a future refactor can't drop it.
+func TestRevalidate_EmptyContextTeamUsesTheWorkspaceTeam(t *testing.T) {
+	f := openedFake()
+	f.bootRes.Channels = append(f.bootRes.Channels, boot.Channel{ID: "C_NO_TEAM", Name: "no-team"})
+
+	if _, err := Run(context.Background(), f.Deps()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, c := range f.channelsInfoCalls {
+		if _, ok := c.sent["C_NO_TEAM"]; ok {
+			if c.team != "T_HOME" {
+				t.Errorf("C_NO_TEAM was scoped to %q; want the workspace team T_HOME", c.team)
+			}
+			return
+		}
+	}
+	t.Errorf("C_NO_TEAM was never sent (calls: %+v)", f.channelsInfoCalls)
+}
+
+// TestRevalidate_TeamFailureDoesNotSkipOtherTeams mirrors the existing
+// channels/users independence guarantee one level down: one team's
+// failure must not strand the other team's revalidation.
+func TestRevalidate_TeamFailureDoesNotSkipOtherTeams(t *testing.T) {
+	f := openedFake()
+	f.channelsInfoErrFor = map[string]error{"T_OTHER": errors.New("ratelimited")}
+
+	if _, err := Run(context.Background(), f.Deps()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(f.channelsInfoCalls) != 2 {
+		t.Fatalf("channels/info calls = %d; want 2 — a failed team must not suppress the other team's call", len(f.channelsInfoCalls))
+	}
+	// T_HOME's results still land.
+	if !reflect.DeepEqual(f.channelUpdates, wantChannelUpdates()) {
+		t.Errorf("channel updates = %#v; want %#v from the healthy team", f.channelUpdates, wantChannelUpdates())
+	}
+	if !f.loggedMatching("team T_OTHER") {
+		t.Errorf("the failed team was not named in the log; on Grid this line is the only diagnostic (logged: %v)", f.logged())
+	}
+}
+
 // --- budget -----------------------------------------------------------
 
 func TestRevalidate_StaysInsideTheBootCallBudget(t *testing.T) {
 	// Success criterion 1, on the full sequence: userBoot, counts,
-	// conversations.view, channels/info, users/info — five, against a
-	// budget of ten, replacing roughly four hundred.
+	// conversations.view, channels/info per context team (two here),
+	// users/info — six, against a budget of ten, replacing roughly
+	// four hundred.
 	f := openedFake()
 
 	if _, err := Run(context.Background(), f.Deps()); err != nil {
@@ -1063,8 +1200,8 @@ func TestRevalidate_StaysInsideTheBootCallBudget(t *testing.T) {
 	if len(f.calls) > 10 {
 		t.Errorf("boot issued %d calls; budget is 10 (sequence: %v)", len(f.calls), f.calls)
 	}
-	if n := f.countPrefix(callChannelsInfo); n != 1 {
-		t.Errorf("channels/info called %d times; want exactly 1 — one batched conditional request, not a per-channel loop (sequence: %v)", n, f.calls)
+	if n := f.countPrefix(callChannelsInfo); n != 2 {
+		t.Errorf("channels/info called %d times; want exactly 2 — the fixture spans two context teams (T_HOME, T_OTHER), and each gets one batched conditional request (sequence: %v)", n, f.calls)
 	}
 	if n := f.countPrefix(callUsersInfo); n != 1 {
 		t.Errorf("users/info called %d times; want exactly 1 (sequence: %v)", n, f.calls)

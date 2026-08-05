@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -411,8 +412,7 @@ func (f *fakeDeps) record(name string) {
 func (f *fakeDeps) log(format string, args ...any) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	_ = args
-	f.logs = append(f.logs, format)
+	f.logs = append(f.logs, fmt.Sprintf(format, args...))
 }
 
 func (f *fakeDeps) logged() []string {
@@ -1218,8 +1218,8 @@ func TestRun_OpensTheChannelAfterCounts(t *testing.T) {
 		prepare func(*fakeDeps)
 		want    []string
 	}{
-		{"view honoured", func(f *fakeDeps) { f.viewChannelID = "C_WANT" }, []string{callUserBoot, callCounts, callView, callChannelsInfo, callUsersInfo}},
-		{"fallback", func(f *fakeDeps) { f.viewChannelID = "C_LASTVIEWED" }, []string{callUserBoot, callCounts, callView, callHistory, callChannelsInfo, callUsersInfo}},
+		{"view honoured", func(f *fakeDeps) { f.viewChannelID = "C_WANT" }, []string{callUserBoot, callCounts, callView, callChannelsInfo, callChannelsInfo, callUsersInfo}},
+		{"fallback", func(f *fakeDeps) { f.viewChannelID = "C_LASTVIEWED" }, []string{callUserBoot, callCounts, callView, callHistory, callChannelsInfo, callChannelsInfo, callUsersInfo}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeDeps()

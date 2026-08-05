@@ -38,6 +38,11 @@ type Client struct {
 // New returns a Client. httpClient must be one built with
 // slackhttp.BrowserTransport so requests carry the browser headers and
 // edgeapi envelope; pass the same client slack.Client uses.
+//
+// teamID is the workspace-scope default: most endpoints are keyed
+// under it, and their callers pass it through to call. It is not the
+// team on every request path — ChannelsInfo takes the owning team
+// per call, because on Grid one user's conversations span teams.
 func New(token, teamID string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
@@ -52,7 +57,13 @@ func New(token, teamID string, httpClient *http.Client) *Client {
 
 // call POSTs payload (with the token merged in) to
 // /cache/<teamID>/<endpoint> and decodes the response into out.
-func (c *Client) call(ctx context.Context, endpoint string, payload map[string]any, out any) error {
+//
+// teamID is a per-request argument, not read from the client: on
+// Enterprise Grid the conversations one call asks about are owned by
+// different teams within the org, and the edge cache keys records
+// under the owning team. Callers whose scope is the workspace pass
+// the client's team; ChannelsInfo passes the owning team.
+func (c *Client) call(ctx context.Context, teamID, endpoint string, payload map[string]any, out any) error {
 	body := make(map[string]any, len(payload)+1)
 	for k, v := range payload {
 		body[k] = v
@@ -70,7 +81,7 @@ func (c *Client) call(ctx context.Context, endpoint string, payload map[string]a
 		return fmt.Errorf("edge %s: encoding request: %w", endpoint, err)
 	}
 
-	url := fmt.Sprintf("%s/cache/%s/%s", c.baseURL, c.teamID, endpoint)
+	url := fmt.Sprintf("%s/cache/%s/%s", c.baseURL, teamID, endpoint)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(encoded))
 	if err != nil {
 		return fmt.Errorf("edge %s: building request: %w", endpoint, err)

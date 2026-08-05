@@ -122,7 +122,7 @@ func (c *Client) UsersList(ctx context.Context, channelID string, count int) (us
 		// for why the value itself does not leave this function.
 		NextMarker string `json:"next_marker"`
 	}
-	if err := c.call(ctx, "users/list", payload, &resp); err != nil {
+	if err := c.call(ctx, c.teamID, "users/list", payload, &resp); err != nil {
 		return nil, false, err
 	}
 	return resp.Results, resp.NextMarker != "", nil
@@ -175,7 +175,7 @@ func (c *Client) ChannelsMembership(ctx context.Context, channelID string, userI
 		Members    []string `json:"members"`
 		NonMembers []string `json:"non_members"`
 	}
-	if err := c.call(ctx, "channels/membership", map[string]any{
+	if err := c.call(ctx, c.teamID, "channels/membership", map[string]any{
 		"channel": channelID,
 		"users":   userIDs,
 		// Sent explicitly as false in 10 of 10 observations, not
@@ -232,7 +232,7 @@ func (c *Client) UsersCounts(ctx context.Context, channelID string) (Counts, err
 	var resp struct {
 		Counts Counts `json:"counts"`
 	}
-	if err := c.call(ctx, "users/counts", map[string]any{
+	if err := c.call(ctx, c.teamID, "users/counts", map[string]any{
 		"channel": channelID,
 		// false explicitly, 7 of 7 — see ChannelsMembership.
 		"as_admin": false,
