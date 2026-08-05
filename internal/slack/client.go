@@ -385,10 +385,29 @@ func wsUpgradeHeaders() http.Header {
 // Events are dispatched to the provided handler in a goroutine.
 // Call this after Connect.
 func (c *Client) StartWebSocket(handler EventHandler) error {
+	// start_args matches the official client's, key for key, from the
+	// 2026-08-02 coldboot capture. slk used to send only
+	// agent/connect_only/ms_latest, and at some point user_typing
+	// frames stopped arriving — typing indicators silently disappeared
+	// while everything else on the socket kept working. Which key
+	// gates typing delivery is undocumented; the capture is the
+	// contract, so all of them go out. agent_version is the same
+	// version_ts the envelope carries (_x_version_ts); without an
+	// envelope it is simply empty, matching the no-envelope clients
+	// the envelope doc describes.
+	agentVersion := ""
+	if c.envelope != nil {
+		agentVersion = c.envelope.VersionTS()
+	}
+	startArgs := fmt.Sprintf(
+		"?agent=client&org_wide_aware=true&agent_version=%s&eac_cache_ts=true&cache_ts=0&name_tagging=true&only_self_subteams=true&connect_only=true&ms_latest=true",
+		agentVersion,
+	)
 	wsURL := fmt.Sprintf(
-		"%s/?token=%s&sync_desync=1&slack_client=desktop&start_args=%%3Fagent%%3Dclient%%26connect_only%%3Dtrue%%26ms_latest%%3Dtrue&no_query_on_subscribe=1&flannel=3&lazy_channels=1&gateway_server=%s-1&batch_presence_aware=1",
+		"%s/?token=%s&sync_desync=1&slack_client=desktop&start_args=%s&no_query_on_subscribe=1&flannel=3&lazy_channels=1&gateway_server=%s-1&batch_presence_aware=1",
 		c.wsBaseURL,
 		url.QueryEscape(c.token),
+		url.QueryEscape(startArgs),
 		c.teamID,
 	)
 
