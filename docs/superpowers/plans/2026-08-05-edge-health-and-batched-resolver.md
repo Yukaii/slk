@@ -17,6 +17,8 @@
 - Existing resolver tests (cmd/slk/user_resolver_test.go) construct with `newUserResolver("T1", newTestClient(t, srv), db, nil, nil)` — they get two new nil params and must behave identically (nil batcher → per-user path).
 - `avatar.Cache.Preload(userID, "")` is safe on a nil cache; a non-empty URL with a nil cache is not. Tests pass empty avatar URLs or a real cache, matching the existing convention.
 
+> **Amendment record (post-implementation):** two code-review rounds changed Task 2's exact code after this plan was written: the majority base is NON-IM ids on both sides (not `len(groups[team])*2 >= len(updated)`), the wholesale comment reads "can only fail wholesale via callErr", and a 50/50 tie is documented as intentionally not-a-majority (commit 9a69d04). Task 6's ResolveNow race comment and the empty-name fall-through in both `resolveDMNames` and `flush` were added in commits 26a6ac6 and 6a584d7. The snippets below are the plan of record at write time; the code and its comments are authoritative.
+
 ---
 
 ### Task 1: edge.Health
