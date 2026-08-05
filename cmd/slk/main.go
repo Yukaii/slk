@@ -495,6 +495,18 @@ func (r *userResolver) flush() {
 	}
 	returned := make(map[string]struct{}, len(users))
 	for _, u := range users {
+		name := u.Profile.DisplayName
+		if name == "" {
+			name = u.Profile.RealName
+		}
+		if name == "" {
+			name = u.Name
+		}
+		if name == "" {
+			// Unobserved, but an empty record would otherwise cache
+			// an empty name and blank a rendered one.
+			continue
+		}
 		returned[u.ID] = struct{}{}
 		r.applyEdgeUser(u)
 	}

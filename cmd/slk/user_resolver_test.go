@@ -144,9 +144,12 @@ func edgeUserRecord(id, name, display, real, teamID string, version int64, isBot
 
 func TestUserResolver_BatchesMissesThroughEdge(t *testing.T) {
 	// Measured on the first working Grid session: 282 users.info
-	// calls, one per miss, with no coalescing. edge users/info takes
-	// 80 ids a request and returns full records inline — the same
-	// misses are ~4 requests.
+	// calls on a cold boot. Task 5's A/B later refined the
+	// attribution: the Request queue coalesces the render/WS-path
+	// misses this test pins, while the unresolved-DM sweep was the
+	// dominant cold-boot source (batched separately, through
+	// ResolveNow). edge users/info takes 80 ids a request and
+	// returns full records inline — the same misses are ~4 requests.
 	db := newTestDB(t)
 	batcher := &fakeBatcher{res: []edge.User{
 		edgeUserRecord("U001", "alice", "Alice", "", "T1", 1783337599010, false),
@@ -250,6 +253,61 @@ func TestUserResolver_EdgeMissFallsBackToPerUser(t *testing.T) {
 	}
 	if got := profiles.Load(); got != 1 {
 		t.Errorf("per-user users.info calls = %d; want 1 — only the id edge missed", got)
+	}
+}
+
+func TestUserResolver_EmptyNameEdgeRecordFallsBackToPerUser(t *testing.T) {
+	// Unobserved in captures, but symmetric to the sweep's guard: an
+	// edge record with all three name fields empty must not be
+	// cached (its empty DisplayName would satisfy Request's
+	// cache-skip gate permanently) nor emitted (an empty
+	// UserResolvedMsg would blank a rendered in-history name).
+	db := newTestDB(t)
+	batcher := &fakeBatcher{res: []edge.User{
+		edgeUserRecord("U001", "", "", "", "T1", 1, false),
+		edgeUserRecord("U002", "bob", "Bob", "", "T1", 1, false),
+	}}
+	var profiles atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		profiles.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"user":{"id":"U001","name":"alice","team_id":"T1","profile":{"display_name":"Alice"}}}`))
+	}))
+	defer srv.Close()
+
+	var sentMu sync.Mutex
+	var sent []tea.Msg
+	r := newUserResolver("T1", newTestClient(t, srv), db, nil, func(m tea.Msg) {
+		sentMu.Lock()
+		sent = append(sent, m)
+		sentMu.Unlock()
+	}, batcher, nil)
+	r.Request("U001")
+	r.Request("U002")
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if u, err := db.GetUser("U001"); err == nil && u.DisplayName == "Alice" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	u1, err := db.GetUser("U001")
+	if err != nil || u1.DisplayName != "Alice" {
+		t.Fatalf("U001 cached as %+v (err=%v); want the per-user fallback's Alice — the empty edge record must be treated as a miss", u1, err)
+	}
+	if got := profiles.Load(); got != 1 {
+		t.Errorf("per-user users.info calls = %d; want 1 — only the empty-name id", got)
+	}
+	if u2, err := db.GetUser("U002"); err != nil || u2.DisplayName != "Bob" {
+		t.Errorf("U002 cached as %+v (err=%v); the good record in the same batch must still apply", u2, err)
+	}
+	sentMu.Lock()
+	defer sentMu.Unlock()
+	for _, m := range sent {
+		if msg, ok := m.(ui.UserResolvedMsg); ok && msg.DisplayName == "" {
+			t.Errorf("an empty-name UserResolvedMsg was sent for %s; that blanks a rendered in-history name", msg.UserID)
+		}
 	}
 }
 
