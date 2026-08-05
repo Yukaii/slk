@@ -965,7 +965,322 @@ git commit -m "feat(slk): wire edge health from bootstrap through to the user re
 
 ---
 
-### Task 5: live verification (cold-cache A/B)
+### Task 6: batch the unresolved-DM sweep (added after Task 5's measurement)
+
+**Files:**
+- Modify: `cmd/slk/main.go` (userResolver.ResolveNow; extract the DM sweep into a testable resolveDMNames)
+- Test: `cmd/slk/user_resolver_test.go`
+
+**Why this task exists (the measurement that falsified Task 3's
+assumption):** Task 5's cold-boot A/B showed the batcher absorbing
+almost nothing — 116 users.info with it vs 99 without. Reading the
+code showed why: the dominant cold-boot users.info source is not
+`UserResolver.Request` at all. The unresolved-DM sweep
+(cmd/slk/main.go, the `if len(wctx.UnresolvedDMs) > 0` block in
+connectWorkspace) loops every DM whose counterparty the cache does not
+know and calls `resolveUser`, which issues one synchronous
+`GetUserProfile` per DM. The sweep also cannot simply call `Request`:
+it needs results mapped to channel ids — `DMNameResolvedMsg` renames
+sidebar DM rows and re-buckets app DMs (internal/ui/reducer_workspace.go:92),
+while `UserResolvedMsg` only patches in-history names
+(reducer_workspace.go:107).
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to `cmd/slk/user_resolver_test.go` (the fakeBatcher and
+edgeUserRecord helpers from Task 3 are reused):
+
+```go
+func TestUserResolver_ResolveNowBatchesAndApplies(t *testing.T) {
+	db := newTestDB(t)
+	batcher := &fakeBatcher{res: []edge.User{
+		edgeUserRecord("U001", "alice", "Alice", "", "T1", 1783337599010, false),
+		edgeUserRecord("U002", "bob", "", "Bob Real", "T1", 1783337599011, false),
+	}}
+	r := newUserResolver("T1", nil, db, nil, nil, batcher, nil)
+
+	got := r.ResolveNow([]string{"U001", "U002"})
+
+	if len(got) != 2 {
+		t.Fatalf("ResolveNow returned %d records; want 2", len(got))
+	}
+	calls := batcher.calls()
+	if len(calls) != 1 {
+		t.Fatalf("edge batches = %d; want 1", len(calls))
+	}
+	if want := map[string]int64{"U001": 0, "U002": 0}; !reflect.DeepEqual(calls[0], want) {
+		t.Errorf("batch = %v; want %v", calls[0], want)
+	}
+	// Applied: cache rows exist and carry versions, so the sweep's
+	// callers and conditional revalidation both read them.
+	for _, id := range []string{"U001", "U002"} {
+		if _, err := db.GetUser(id); err != nil {
+			t.Errorf("%s was not cached by ResolveNow: %v", id, err)
+		}
+	}
+	versions, err := db.UserVersions("T1")
+	if err != nil {
+		t.Fatalf("UserVersions: %v", err)
+	}
+	if versions["U001"] != 1783337599010 {
+		t.Errorf("U001 version = %d; want 1783337599010", versions["U001"])
+	}
+}
+
+func TestUserResolver_ResolveNowReturnsNilWhenDegraded(t *testing.T) {
+	db := newTestDB(t)
+	batcher := &fakeBatcher{}
+	r := newUserResolver("T1", nil, db, nil, nil, batcher, func() bool { return true })
+
+	if got := r.ResolveNow([]string{"U001"}); got != nil {
+		t.Errorf("a degraded workspace resolved %v through edge; want nil so the caller falls back per-user", got)
+	}
+	if n := len(batcher.calls()); n != 0 {
+		t.Errorf("a degraded workspace made %d edge calls; want 0", n)
+	}
+}
+
+func TestUserResolver_ResolveNowReturnsNilOnError(t *testing.T) {
+	db := newTestDB(t)
+	batcher := &fakeBatcher{err: errors.New("ratelimited")}
+	r := newUserResolver("T1", nil, db, nil, nil, batcher, nil)
+
+	if got := r.ResolveNow([]string{"U001"}); got != nil {
+		t.Errorf("a failed edge call returned %v; want nil", got)
+	}
+	if _, err := db.GetUser("U001"); err == nil {
+		t.Error("U001 was cached from a response the resolver rejected")
+	}
+}
+
+func TestUserResolver_ResolveNowSkipsEmptyInput(t *testing.T) {
+	db := newTestDB(t)
+	batcher := &fakeBatcher{}
+	r := newUserResolver("T1", nil, db, nil, nil, batcher, nil)
+
+	if got := r.ResolveNow(nil); got != nil {
+		t.Errorf("ResolveNow(nil) = %v; want nil", got)
+	}
+	if got := r.ResolveNow([]string{""}); got != nil {
+		t.Errorf("ResolveNow([\"\"]) = %v; want nil — an updated_ids map containing \"\" is a request shape nothing observed produces", got)
+	}
+	if n := len(batcher.calls()); n != 0 {
+		t.Errorf("empty input produced %d edge calls; want 0", n)
+	}
+}
+
+func TestResolveDMNames(t *testing.T) {
+	// The sweep maps resolutions to CHANNEL ids: DMNameResolvedMsg
+	// renames the sidebar row and re-buckets app DMs, which
+	// UserResolvedMsg (history patching) cannot do.
+	db := newTestDB(t)
+	batcher := &fakeBatcher{res: []edge.User{
+		edgeUserRecord("U_ALICE", "alice", "Alice A", "", "T1", 1, false),
+		edgeUserRecord("U_APP", "someapp", "Some App", "", "T1", 1, true),
+	}}
+	wctx := &WorkspaceContext{
+		TeamID:        "T1",
+		UserNames:     map[string]string{},
+		BotUserIDs:    map[string]bool{},
+		UserResolver:  newUserResolver("T1", nil, db, nil, nil, batcher, nil),
+		UnresolvedDMs: []UnresolvedDM{
+			{ChannelID: "D_ALICE", UserID: "U_ALICE"},
+			{ChannelID: "D_APP", UserID: "U_APP"},
+		},
+	}
+	var mu sync.Mutex
+	var sent []tea.Msg
+	resolveDMNames(wctx, db, nil, func(m tea.Msg) {
+		mu.Lock()
+		sent = append(sent, m)
+		mu.Unlock()
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	var alice, app *ui.DMNameResolvedMsg
+	for _, m := range sent {
+		if dm, ok := m.(ui.DMNameResolvedMsg); ok {
+			switch dm.ChannelID {
+			case "D_ALICE":
+				d := dm
+				alice = &d
+			case "D_APP":
+				d := dm
+				app = &d
+			}
+		}
+	}
+	if alice == nil || alice.DisplayName != "Alice A" {
+		t.Errorf("D_ALICE got %+v; want a DMNameResolvedMsg naming Alice A", alice)
+	}
+	if app == nil || app.DisplayName != "Some App" || !app.IsBot {
+		t.Errorf("D_APP got %+v; want a DMNameResolvedMsg naming Some App with IsBot true — that flag re-buckets the row into the Apps section", app)
+	}
+	if !wctx.BotUserIDs["U_APP"] {
+		t.Error("U_APP was not recorded in BotUserIDs")
+	}
+	if n := len(batcher.calls()); n != 1 {
+		t.Errorf("the sweep made %d edge calls; want 1 for any number of DMs", n)
+	}
+}
+```
+
+Check the `UnresolvedDM` struct's field names before writing the test
+(`rg -n 'type UnresolvedDM' cmd/slk/main.go`) — adjust the literal if
+they differ.
+
+Run: `go test ./cmd/slk/ -run 'TestUserResolver_ResolveNow|TestResolveDMNames' 2>&1 | tail -3`
+Expected: build failure — ResolveNow/resolveDMNames undefined.
+
+- [ ] **Step 2: Implement ResolveNow**
+
+In `cmd/slk/main.go`, after `flush`:
+
+```go
+// ResolveNow resolves ids immediately through one edge users/info
+// batch and returns the records edge resolved. Unlike Request it
+// blocks the caller, so it is for background goroutines that need the
+// results — the unresolved-DM sweep maps them to channel ids and
+// cannot use the fire-and-forget queue. Ids edge does not resolve are
+// simply absent from the result; the caller falls back per-user.
+// Nil means "resolve everything per-user": no edge client, a degraded
+// workspace, a failed call, or nothing worth sending.
+//
+// Note applyEdgeUser's inflight.Delete is a no-op for these ids —
+// they were never queued. A Request racing a ResolveNow for the same
+// id can produce one duplicate users.info; the upserts are idempotent
+// and the window is a cache miss wide, so no guard is taken.
+func (r *userResolver) ResolveNow(ids []string) []edge.User {
+	if r == nil || r.batcher == nil || len(ids) == 0 {
+		return nil
+	}
+	if r.degraded != nil && r.degraded() {
+		return nil
+	}
+	updated := make(map[string]int64, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			updated[id] = 0
+		}
+	}
+	if len(updated) == 0 {
+		return nil
+	}
+	users, err := r.batcher.UsersInfo(context.Background(), updated)
+	if err != nil {
+		debuglog.Cache("userResolver: ResolveNow edge users/info for %d users team=%s: %v (caller falls back per-user)", len(updated), r.teamID, err)
+		return nil
+	}
+	for _, u := range users {
+		r.applyEdgeUser(u)
+	}
+	return users
+}
+```
+
+- [ ] **Step 3: Extract resolveDMNames and batch the sweep**
+
+Replace the `// Resolve unknown DM user names in background` block in
+connectWorkspace (the `if len(wctx.UnresolvedDMs) > 0 { go func() {...}() }`
+statement) with:
+
+```go
+		// Resolve unknown DM user names in background
+		if len(wctx.UnresolvedDMs) > 0 {
+			go resolveDMNames(wctx, db, avatarCache, func(msg tea.Msg) {
+				if p != nil {
+					p.Send(msg)
+				}
+			})
+		}
+```
+
+and add the function (near resolveUser):
+
+```go
+// resolveDMNames resolves the display names of unresolved DM
+// counterparties, one edge users/info batch for the whole sweep, with
+// the per-user resolveUser loop as the fallback for ids edge did not
+// return. Batched because the sweep is the dominant cold-boot
+// users.info source: one synchronous GetUserProfile per unresolved DM,
+// measured at ~100 calls on a two-workspace cold boot and 282 in a
+// full Grid session. The mapping to channel ids is why this cannot go
+// through UserResolver.Request: DMNameResolvedMsg renames the sidebar
+// row and re-buckets app DMs, while UserResolvedMsg only patches
+// in-history names.
+func resolveDMNames(wctx *WorkspaceContext, db *cache.DB, avatarCache *avatar.Cache, send func(tea.Msg)) {
+	dmIDs := make([]string, 0, len(wctx.UnresolvedDMs))
+	for _, dm := range wctx.UnresolvedDMs {
+		dmIDs = append(dmIDs, dm.UserID)
+	}
+	byEdge := make(map[string]edge.User)
+	for _, u := range wctx.UserResolver.ResolveNow(dmIDs) {
+		byEdge[u.ID] = u
+	}
+	for _, dm := range wctx.UnresolvedDMs {
+		if u, ok := byEdge[dm.UserID]; ok {
+			name := u.Profile.DisplayName
+			if name == "" {
+				name = u.Profile.RealName
+			}
+			if name == "" {
+				name = u.Name
+			}
+			// edge users/info carries no is_app_user: a Slack app's DM
+			// resolved here may bucket as "dm" rather than "app" until
+			// something else classifies it. No capture shows that
+			// field on this endpoint, so none is invented; the
+			// per-user fallback below classifies the ids edge missed.
+			if u.IsBot {
+				wctx.BotUserIDs[dm.UserID] = true
+			}
+			if name != "" && send != nil {
+				send(ui.DMNameResolvedMsg{
+					ChannelID:   dm.ChannelID,
+					DisplayName: name,
+					IsBot:       u.IsBot,
+				})
+			}
+			continue
+		}
+		resolved, isBot := resolveUser(wctx.Client, dm.UserID, wctx.UserNames, db, avatarCache)
+		if isBot {
+			wctx.BotUserIDs[dm.UserID] = true
+		}
+		if resolved != dm.UserID && send != nil {
+			send(ui.DMNameResolvedMsg{
+				ChannelID:   dm.ChannelID,
+				DisplayName: resolved,
+				IsBot:       isBot,
+			})
+		}
+	}
+}
+```
+
+- [ ] **Step 4: Run the tests**
+
+Run: `go test -count=1 ./cmd/slk/ -run 'TestUserResolver|TestResolveDMNames' 2>&1 | tail -3`
+Expected: PASS. Then `go build ./... && go vet ./... && go test -count=1 ./... 2>&1 | grep -v '^ok\|no test files' | head -5` — no output.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add cmd/slk/
+git commit -m "feat(slk): batch the unresolved-DM sweep through edge users/info
+
+The sweep — one synchronous GetUserProfile per unresolved DM — is the
+dominant cold-boot users.info source, measured at ~100 calls on a
+two-workspace boot and 282 in a full Grid session. Task 5's A/B
+showed the Request queue absorbing almost none of it. The sweep now
+resolves its whole counterparty list in one edge users/info call via
+ResolveNow and falls back per-user only for ids edge did not return."
+```
+
+---
+
+### Task 7: live verification (cold-cache A/B)
 
 **Files:** none modified; produces the merge-gate evidence.
 
@@ -981,15 +1296,24 @@ mkdir -p $COLDXDG/slk
 cp -r ~/.local/share/slk/tokens $COLDXDG/slk/
 ```
 
-- [ ] **Step 2: Cold boot with the new binary**
+- [ ] **Step 2: Cold boot with the new binary (and a main-built baseline)**
+
+Build the baseline from `main` first (`git archive main | tar -x -C <dir>`, build there) so the comparison is exact. Run both cold, in either order:
 
 ```bash
 cd /tmp/opencode/slk-repro
-XDG_DATA_HOME=$COLDXDG SLK_DEBUG=1 script -qec 'timeout -s INT 25 /tmp/slk-batched' /dev/null >/dev/null 2>&1
-grep -A25 'shutdown API request tally' slk-debug.log
+XDG_DATA_HOME=$COLDXDG SLK_DEBUG=1 script -qec 'timeout -s INT 25 /tmp/slk-mainline' /dev/null >/dev/null 2>&1
+mv slk-debug.log cold-main.log
+# fresh temp XDG with the same tokens for the new binary
+XDG_DATA_HOME=$COLDXDG2 SLK_DEBUG=1 script -qec 'timeout -s INT 25 /tmp/slk-batched' /dev/null >/dev/null 2>&1
+mv slk-debug.log cold-batched.log
 ```
 
-Expected: `edge:users/info` appears (a small number — 1-2 per workspace needing resolution), and `users.info` is dramatically lower than a cold boot used to produce (the handoff measured ~200; healthy warm-ish caches may show few misses at all — in that case note it and rely on Step 3).
+Expected after Task 6: the batched binary's `users.info` count is near
+zero (only ids edge genuinely cannot resolve), `edge:users/info` is a
+small number (boot revalidation plus one batch per workspace needing
+resolution), and the total drops correspondingly against the main
+baseline.
 
 - [ ] **Step 3: Warm boot regression check**
 
