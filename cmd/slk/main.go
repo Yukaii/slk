@@ -3905,13 +3905,31 @@ func (h *rtmEventHandler) OnConnect() {
 	// disconnect window; a fresh full fetch reconciles divergence.
 	// Inactive channels stay as-is — they'll re-fetch on their next
 	// EnsureFresh via the channel-switch fetcher path.
-	if h.wsCtx != nil && h.wsCtx.Membership != nil && h.activeChannelID != nil {
-		activeID := h.activeChannelID()
-		if activeID != "" {
-			h.wsCtx.Membership.ForceStale(activeID)
-			h.wsCtx.Membership.EnsureFresh(context.Background(), activeID)
-		}
+	h.refreshActiveMembership()
+}
+
+// refreshActiveMembership force-stales and re-fetches membership for
+// the channel on screen. Gated on isActive because activeChannelID
+// reads the GLOBAL UI active channel (app.ActiveChannelID), and every
+// workspace's handler runs OnConnect: without the gate, workspaces
+// that don't own the on-screen channel fetched it anyway, failed with
+// channel_not_found, and — because a failed fetch leaves the cache
+// stale — re-fired on every reconnect. Measured live: a flapping
+// session started 42 conversations.members in 25 seconds with no user
+// interaction.
+func (h *rtmEventHandler) refreshActiveMembership() {
+	if h.wsCtx == nil || h.wsCtx.Membership == nil || h.activeChannelID == nil {
+		return
 	}
+	if h.isActive != nil && !h.isActive() {
+		return
+	}
+	activeID := h.activeChannelID()
+	if activeID == "" {
+		return
+	}
+	h.wsCtx.Membership.ForceStale(activeID)
+	h.wsCtx.Membership.EnsureFresh(context.Background(), activeID)
 }
 
 // syncOnReconnect kicks off the bounded catch-up pass for this

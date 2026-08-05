@@ -336,6 +336,70 @@ func TestBackgroundFetchDoesNotResolveEveryMember(t *testing.T) {
 	}
 }
 
+// TestBackgroundFetchFailureSuppressesImmediateRefetch pins the
+// failure side of the fetch ledger. A failed conversations.members
+// never bumps last_full_fetch_at, so without a failure record every
+// EnsureFresh — and OnConnect's ForceStale+EnsureFresh pair fires on
+// every websocket reconnect — re-issues the call. Measured live: the
+// active channel was a DM the workspace's token could not see
+// (channel_not_found), the socket flapped, and a 25-second session
+// started 42 conversations.members requests, the exact amplification
+// shape this package's TTL exists to prevent.
+func TestBackgroundFetchFailureSuppressesImmediateRefetch(t *testing.T) {
+	mgr, api, sink, db := newManagerForTest(t)
+	defer db.Close()
+	api.err = fmt.Errorf("channel_not_found")
+
+	mgr.EnsureFresh(context.Background(), "C1")
+	waitForPush(t, sink, 1)
+	waitForCallCount(t, api, 1)
+
+	// A reconnect force-stales the channel and asks again. The fetch
+	// must not re-fire within the failure backoff window.
+	mgr.ForceStale("C1")
+	mgr.EnsureFresh(context.Background(), "C1")
+	time.Sleep(100 * time.Millisecond)
+
+	if c := api.callCount(); c != 1 {
+		t.Errorf("failed fetch re-issued within the backoff window: %d calls, want 1 — this is the reconnect-flap amplifier", c)
+	}
+}
+
+// TestBackgroundFetchRetriesAfterBackoffExpiry: the backoff throttles
+// retries, it does not cancel them. Once the window has passed a stale
+// channel must be fetched again — a transient error must not wedge
+// membership for the full 24h TTL.
+func TestBackgroundFetchRetriesAfterBackoffExpiry(t *testing.T) {
+	mgr, api, sink, db := newManagerForTest(t)
+	defer db.Close()
+	api.err = fmt.Errorf("channel_not_found")
+
+	mgr.EnsureFresh(context.Background(), "C1")
+	waitForPush(t, sink, 1)
+	waitForCallCount(t, api, 1)
+
+	// Simulate a failure far enough in the past that the backoff has
+	// expired, then recover.
+	mgr.mu.Lock()
+	mgr.lastFailed["C1"] = time.Now().Add(-2 * FailureBackoff)
+	mgr.mu.Unlock()
+	api.err = nil
+	api.result = []string{"U1"}
+
+	mgr.EnsureFresh(context.Background(), "C1")
+	waitForCallCount(t, api, 2)
+	waitForPush(t, sink, 2)
+
+	// A successful fetch clears the failure record, so the next
+	// EnsureFresh is governed by the normal TTL, not the backoff.
+	mgr.mu.Lock()
+	_, stillMarked := mgr.lastFailed["C1"]
+	mgr.mu.Unlock()
+	if stillMarked {
+		t.Error("lastFailed not cleared by a successful fetch; a recovered channel would stay throttled")
+	}
+}
+
 func TestEnsureFreshConcurrentDoesNotDuplicate(t *testing.T) {
 	mgr, api, _, db := newManagerForTest(t)
 	defer db.Close()
