@@ -224,3 +224,47 @@ func (db *DB) UpdateUserFromEdge(u EdgeUserUpdate) error {
 	}
 	return nil
 }
+
+// UpsertUserFromEdge is UpdateUserFromEdge with row-creating
+// semantics, for callers whose whole case is that the row does not
+// exist yet — the batched user resolver's cache misses. (Bootstrap
+// uses UpdateUserFromEdge because hydrateFirstSight has already
+// inserted placeholder rows; UPDATE-only there is a feature: it
+// cannot invent rows.) workspaceID is taken explicitly because
+// EdgeUserUpdate does not carry it.
+//
+// The preserve-on-empty avatar contract is identical to
+// UpdateUserFromEdge, and for the same reason. presence and
+// updated_at are never touched: on insert they take the column
+// defaults, on conflict they keep what they had.
+func (db *DB) UpsertUserFromEdge(workspaceID string, u EdgeUserUpdate) error {
+	var err error
+	if u.AvatarURL != "" {
+		_, err = db.conn.Exec(`
+			INSERT INTO users (id, workspace_id, name, display_name, avatar_url, is_bot, is_external, version)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				name=excluded.name,
+				display_name=excluded.display_name,
+				avatar_url=excluded.avatar_url,
+				is_bot=excluded.is_bot,
+				is_external=excluded.is_external,
+				version=excluded.version
+		`, u.ID, workspaceID, u.Name, u.DisplayName, u.AvatarURL, boolToInt(u.IsBot), boolToInt(u.IsExternal), u.Version)
+	} else {
+		_, err = db.conn.Exec(`
+			INSERT INTO users (id, workspace_id, name, display_name, is_bot, is_external, version)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				name=excluded.name,
+				display_name=excluded.display_name,
+				is_bot=excluded.is_bot,
+				is_external=excluded.is_external,
+				version=excluded.version
+		`, u.ID, workspaceID, u.Name, u.DisplayName, boolToInt(u.IsBot), boolToInt(u.IsExternal), u.Version)
+	}
+	if err != nil {
+		return fmt.Errorf("upserting user %s from edge: %w", u.ID, err)
+	}
+	return nil
+}

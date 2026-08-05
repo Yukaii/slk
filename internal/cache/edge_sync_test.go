@@ -234,6 +234,69 @@ func TestUpdateUserFromEdge_WritesAvatarWhenSupplied(t *testing.T) {
 	}
 }
 
+// UpsertUserFromEdge is the row-creating counterpart of
+// UpdateUserFromEdge, for the batched user resolver whose misses are
+// by definition rows that do not exist. It must keep every contract of
+// the UPDATE — above all the empty-avatar preserve — while inserting
+// when the row is missing.
+func TestUpsertUserFromEdge(t *testing.T) {
+	db := openEdgeSyncTestDB(t)
+	seedWorkspace(t, db, "T1")
+
+	// 1. A user that does not exist is INSERTED, with every column the
+	// update carries.
+	if err := db.UpsertUserFromEdge("T1", EdgeUserUpdate{
+		ID: "U1", Name: "alice", DisplayName: "Alice",
+		AvatarURL: "https://example.invalid/a.png",
+		IsBot:     true, IsExternal: true, Version: sampleUserVersion,
+	}); err != nil {
+		t.Fatalf("UpsertUserFromEdge: %v", err)
+	}
+	u := getUserRow(t, db, "U1")
+	if u.Name != "alice" || u.DisplayName != "Alice" || !u.IsBot || !u.IsExternal {
+		t.Errorf("inserted row missing columns: %+v", u)
+	}
+	if u.AvatarURL != "https://example.invalid/a.png" {
+		t.Errorf("avatar_url = %q; want the supplied one", u.AvatarURL)
+	}
+	// 4. version is written and readable through UserVersions — the
+	// resolver's inserts are what conditional revalidation later reads.
+	vers, err := db.UserVersions("T1")
+	if err != nil {
+		t.Fatalf("UserVersions: %v", err)
+	}
+	if vers["U1"] != sampleUserVersion {
+		t.Errorf("version = %d; want %d — an unstamped row is sent as 0 in updated_ids and refetched in full on every boot, forever", vers["U1"], sampleUserVersion)
+	}
+
+	// 2. Empty AvatarURL on an existing row preserves the stored avatar,
+	// the same contract UpdateUserFromEdge holds.
+	if err := db.UpsertUserFromEdge("T1", EdgeUserUpdate{
+		ID: "U1", Name: "alice2", DisplayName: "Alice Two",
+		Version: sampleUserVersion + 1,
+	}); err != nil {
+		t.Fatalf("UpsertUserFromEdge (empty avatar): %v", err)
+	}
+	u = getUserRow(t, db, "U1")
+	if u.AvatarURL != "https://example.invalid/a.png" {
+		t.Errorf("avatar_url = %q; want the original preserved — an empty AvatarURL means 'this source has none', not 'this user has none'", u.AvatarURL)
+	}
+	if u.Name != "alice2" || u.DisplayName != "Alice Two" {
+		t.Errorf("conflict path did not write edge-owned columns: %+v", u)
+	}
+
+	// 3. A non-empty AvatarURL replaces the stored one.
+	if err := db.UpsertUserFromEdge("T1", EdgeUserUpdate{
+		ID: "U1", Name: "alice2", DisplayName: "Alice Two",
+		AvatarURL: "https://example.invalid/new.png", Version: sampleUserVersion + 2,
+	}); err != nil {
+		t.Fatalf("UpsertUserFromEdge (avatar): %v", err)
+	}
+	if got := getUserRow(t, db, "U1").AvatarURL; got != "https://example.invalid/new.png" {
+		t.Errorf("avatar_url = %q; want the new one — preserve must not mean ignore", got)
+	}
+}
+
 func TestUpdateFromEdge_UnknownRowIsANoOpNotAnInsert(t *testing.T) {
 	// These are revalidation writers. A row we have never seen is
 	// hydrated through the normal Upsert path, which knows every
