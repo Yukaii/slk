@@ -415,6 +415,19 @@ type App struct {
 	// cycling locate sibling attachments). See internal/ui/imagepreview.go.
 	preview *imagePreviewController
 
+	// sixelFrames is the shared frame store correlating every sixel
+	// App.View with the Bubble Tea frame that actually flushes. The App
+	// publishes immutable placement snapshots here; FrameOutput (wired
+	// in main) takes the exact flushed frame and paints it after the
+	// text diff. nil until SetSixelFrameStore runs.
+	sixelFrames *imgpkg.SixelFrameStore
+
+	// forceSixelRepaint marks the next published frame for a full
+	// erase/repaint. Set on a real terminal resize (width or height
+	// actually changed), consumed by finalizeSixelView after the next
+	// publication.
+	forceSixelRepaint bool
+
 	// Compositor memo (Stage A perf). bubbletea v2 calls View() after
 	// EVERY message -- every keystroke, key-repeat, mouse-motion, and
 	// tick -- synchronously in the event loop (tea.go render-on-update).
@@ -642,8 +655,15 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		// Only a real size change forces a sixel repaint; a duplicate
+		// size message (same dimensions) must not erase and repaint
+		// every image pointlessly.
+		changed := a.width != msg.Width || a.height != msg.Height
 		a.width = msg.Width
 		a.height = msg.Height
+		if changed {
+			a.forceSixelRepaint = true
+		}
 		return a, nil
 
 	case scrollFlushMsg:
@@ -1975,6 +1995,14 @@ func (a *App) SetImageContext(ctx imgrender.ImageContext) {
 	a.threadPanel.SetImageContext(ctx)
 }
 
+// SetSixelFrameStore wires the shared frame store used to correlate
+// every published sixel frame with the Bubble Tea frame that flushes.
+// The store is created in main and shared with FrameOutput; without it
+// the App still renders but publishes nothing.
+func (a *App) SetSixelFrameStore(frames *imgpkg.SixelFrameStore) {
+	a.sixelFrames = frames
+}
+
 // SetEmojiContext forwards the emoji rendering context to both the
 // messages pane and the thread pane. They each hold their own copy
 // because they have independent render caches and call paths.
@@ -2549,8 +2577,7 @@ func (a *App) renderTypingLine() string {
 
 func (a *App) View() tea.View {
 	if v, handled := a.renderEarlyFallback(); handled {
-		v.WindowTitle = a.windowTitle
-		return v
+		return a.finalizeSixelView(v, nil)
 	}
 
 	// Perf instrumentation: wall-clock the main View() path so we can
@@ -2643,7 +2670,6 @@ func (a *App) View() tea.View {
 	v := tea.NewView(screen)
 	v.AltScreen = true
 	v.MouseMode = tea.MouseModeCellMotion
-	v.WindowTitle = a.windowTitle
 	if debuglog.Enabled() {
 		// panel: 0=workspace 1=sidebar 2=messages 3=thread
 		// view:  0=channels 1=threads
@@ -2652,6 +2678,83 @@ func (a *App) View() tea.View {
 			int(a.focusedPanel), int(a.view), a.mode.String(),
 			a.threadVisible, a.sidebarVisible, previewActive)
 	}
+	return a.finalizeSixelView(v, a.collectSixelPlacements(frame))
+}
+
+// collectSixelPlacements gathers the desired sixel placements for the
+// current screen. The preview overlay replaces the messages/thread
+// regions entirely when active, so it takes priority; otherwise every
+// visible window leaf contributes its own placements, mapped through
+// its own rectangle (split windows sit at their own origins, not the
+// unsplit messages-pane origin). The thread pane still renders
+// halfblock.
+func (a *App) collectSixelPlacements(frame panelLayoutFrame) []imgpkg.SixelPlacement {
+	if a.preview.Active() {
+		want := make([]imgpkg.SixelPlacement, 0, 1)
+		if ov := a.preview.Overlay(); ov != nil {
+			if sp := ov.SixelPaint(); sp != nil {
+				if pl, ok := a.absolutePreviewSixelPlacement(*sp); ok {
+					want = append(want, pl)
+				}
+			}
+		}
+		return want
+	}
+	if a.view != ViewChannels {
+		return nil
+	}
+	// The same bounds renderWindowsRegion uses, so leaf rectangles
+	// match the panes actually drawn.
+	bounds := wintree.Rect{
+		X: 0,
+		Y: 0,
+		W: frame.MsgWidth + frame.MsgBorder,
+		H: frame.ContentHeight,
+	}
+	rects := a.wins.ComputeRects(bounds)
+	out := make([]imgpkg.SixelPlacement, 0, 2)
+	for _, id := range a.wins.Leaves() {
+		rect, ok := rects[id]
+		model := a.winModels[id]
+		if !ok || model == nil || rect.W < 1 || rect.H < 1 {
+			continue
+		}
+		out = append(out, absoluteWindowSixelPlacements(
+			model.SixelPlacements(), model.ChromeHeight(), rect, a.layout.SidebarEnd(),
+		)...)
+	}
+	return out
+}
+
+// finalizeSixelView is the single exit point for every App.View path,
+// including the early fallback. It:
+//
+//   - sets the real window title for non-sixel protocols;
+//   - publishes an empty frame when no sixel surface is visible, so old
+//     pixels erase;
+//   - attaches each placement's guard from the complete screen string;
+//   - publishes the frame with the themed erase background and the
+//     pending resize force, then clears the force flag;
+//   - marks the title with the frame ID so FrameOutput can correlate
+//     the exact flushed Bubble Tea frame.
+//
+// It never writes to the terminal; painting happens later in
+// FrameOutput after the text diff for the same frame.
+func (a *App) finalizeSixelView(v tea.View, placements []imgpkg.SixelPlacement) tea.View {
+	if a.imgProtocol != imgpkg.ProtoSixel || a.sixelFrames == nil {
+		v.WindowTitle = a.windowTitle
+		return v
+	}
+	for i := range placements {
+		placements[i].Guard = frameGuard(v.Content, placements[i].Row-1, placements[i].Rows)
+	}
+	id := a.sixelFrames.Publish(imgpkg.SixelFrame{
+		Placements: placements,
+		EraseSGR:   messages.BgANSI(),
+		Force:      a.forceSixelRepaint,
+	})
+	a.forceSixelRepaint = false
+	v.WindowTitle = imgpkg.FrameTitle(a.windowTitle, id)
 	return v
 }
 
