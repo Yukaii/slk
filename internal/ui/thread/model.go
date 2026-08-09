@@ -1908,6 +1908,17 @@ func (m *Model) renderThreadMessage(msg messages.MessageItem, width int, userNam
 			} else {
 				style = styles.ReactionPillOther
 			}
+			// The kitty image placement encodes the image ID in the
+			// fg color and ends with \e[39m (fg → default), wiping
+			// the pill style's fg before the count prints. Re-assert
+			// the style's fg between the placement and the count.
+			if placedFlush != nil {
+				if fg := style.GetForeground(); fg != nil {
+					pillText = emojiStr +
+						ansi.Style{}.ForegroundColor(fg).String() +
+						fmt.Sprintf("%d", r.Count)
+				}
+			}
 			pills = append(pills, style.Render(pillText))
 			pillEmojis = append(pillEmojis, r.Emoji)
 			// Image emoji in reaction pills land in the same per-frame
