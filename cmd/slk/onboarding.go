@@ -132,6 +132,8 @@ func desktopErrorMessage(err error) string {
 		return "Your system keyring is locked. Unlock it (log in to your desktop session) and retry."
 	case errors.Is(err, slackdesktop.ErrNoSecretService):
 		return "No system keyring/secret service found. slk needs it to read the Slack session."
+	case errors.Is(err, slackdesktop.ErrSecretNotFound):
+		return "No Slack entry found in your keyring. Sign in to the Slack desktop app (and make sure it uses the system keyring), then retry."
 	case errors.Is(err, slackdesktop.ErrDecryptFailed):
 		return "Could not decrypt the Slack session cookie. Please file an issue with your OS + Slack version."
 	default:
