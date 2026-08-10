@@ -899,6 +899,16 @@ func run() error {
 
 	// Create app
 	app := ui.NewApp()
+	// Frame-correlated sixel output: the App publishes immutable
+	// placement snapshots into sixelFrames; terminalOutput strips the
+	// internal frame marker from Bubble Tea's window title, takes the
+	// exact flushed frame, and paints its sixel operations after the
+	// text diff. Kitty uploads share the same serialized writer so
+	// byte streams from different goroutines can't interleave.
+	sixelFrames := imgpkg.NewSixelFrameStore()
+	terminalOutput := imgpkg.NewFrameOutput(os.Stdout, sixelFrames)
+	imgpkg.KittyOutput = terminalOutput.SideChannel()
+	app.SetSixelFrameStore(sixelFrames)
 	app.SetHelpFooter(versionpkg.ModalFooter(version))
 	app.SetClipboardAvailable(clipboardOK)
 	if sr := notify.NewStatusReporter(cfg.Notifications.StatusCommand); sr != nil {
@@ -1015,6 +1025,12 @@ func run() error {
 	// Cell pixel metrics for sizing decisions.
 	pxW, pxH := imgpkg.CellPixels(int(os.Stdout.Fd()))
 	debuglog.ImgRender("cell pixels: %dx%d", pxW, pxH)
+	// Sixel encodes at absolute pixel dimensions — the terminal paints
+	// one sixel pixel per device pixel rather than scaling into a cell
+	// box the way kitty does. Hand it the measured metrics so an image
+	// occupying N rows of layout is encoded N*cellHeight pixels tall and
+	// actually lands on those rows.
+	imgpkg.SetCellPixels(pxW, pxH)
 
 	// Wire the inline-image pipeline into the messages pane. SendMsg
 	// stays nil here because tea.NewProgram has not run yet; we re-call
@@ -1884,8 +1900,11 @@ func run() error {
 	// activeTeamID == "" and both set InitialActive=true.
 	var firstReady sync.Once
 
-	// Start the TUI immediately (shows loading overlay)
-	p = tea.NewProgram(app)
+	// Start the TUI immediately (shows loading overlay). All output —
+	// every protocol — flows through the frame-correlated writer: it is
+	// a serialized pass-through for non-sixel frames (no marker present)
+	// and the sixel paint site for marked frames.
+	p = tea.NewProgram(app, tea.WithOutput(terminalOutput))
 
 	// Now that `p` exists, re-install the ImageContext with a real
 	// SendMsg callback so the prefetcher can dispatch ImageReadyMsg
