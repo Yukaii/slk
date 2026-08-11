@@ -2038,7 +2038,6 @@ func (m *Model) renderMessagePlain(msg MessageItem, width int, avatarStr string,
 					emojiStr = ":" + legacyName + ":"
 				}
 			}
-			pillText := fmt.Sprintf("%s%d", emojiStr, r.Count)
 			var style lipgloss.Style
 			if isSelected && m.reactionNavActive && i == m.reactionNavIndex {
 				style = styles.ReactionPillSelected
@@ -2047,6 +2046,7 @@ func (m *Model) renderMessagePlain(msg MessageItem, width int, avatarStr string,
 			} else {
 				style = styles.ReactionPillOther
 			}
+			pillText := ReactionPillText(emojiStr, r.Count, style, placedFlush != nil)
 			pills = append(pills, style.Render(pillText))
 			pillEmojis = append(pillEmojis, r.Emoji)
 			// Image emoji in reaction pills land in the same per-frame
