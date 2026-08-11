@@ -2031,7 +2031,6 @@ func (m *Model) renderMessagePlain(msg MessageItem, width int, avatarStr string,
 					emojiStr = ":" + legacyName + ":"
 				}
 			}
-			pillText := fmt.Sprintf("%s%d", emojiStr, r.Count)
 			var style lipgloss.Style
 			if isSelected && m.reactionNavActive && i == m.reactionNavIndex {
 				style = styles.ReactionPillSelected
@@ -2040,17 +2039,7 @@ func (m *Model) renderMessagePlain(msg MessageItem, width int, avatarStr string,
 			} else {
 				style = styles.ReactionPillOther
 			}
-			// The kitty image placement encodes the image ID in the
-			// fg color and ends with \e[39m (fg → default), wiping
-			// the pill style's fg before the count prints. Re-assert
-			// the style's fg between the placement and the count.
-			if placedFlush != nil {
-				if fg := style.GetForeground(); fg != nil {
-					pillText = emojiStr +
-						ansi.Style{}.ForegroundColor(fg).String() +
-						strconv.Itoa(r.Count)
-				}
-			}
+			pillText := ReactionPillText(emojiStr, r.Count, style, placedFlush != nil)
 			pills = append(pills, style.Render(pillText))
 			pillEmojis = append(pillEmojis, r.Emoji)
 			// Image emoji in reaction pills land in the same per-frame
