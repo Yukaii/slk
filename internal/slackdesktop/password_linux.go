@@ -24,17 +24,24 @@ var slackSecretQueries = []map[string]string{
 	},
 }
 
-// keyringPassword fetches the "Slack Safe Storage" password from the
+// keyringPasswords fetches the "Slack Safe Storage" password from the
 // Secret Service. Slack stores it using Chromium's schema with libsecret
 // implementations and QtKeychain's schema with KDE Wallet.
-func keyringPassword() ([]byte, error) {
+//
+// The Secret Service queries are already attribute-qualified, so unlike macOS
+// there is no ambiguity to resolve here: a single candidate is returned.
+func keyringPasswords() ([][]byte, error) {
 	service, err := gosecret.NewService()
 	if err != nil {
 		return nil, ErrNoSecretService
 	}
 	defer service.Close()
 
-	return findKeyringPassword(service.SearchItems)
+	pw, err := findKeyringPassword(service.SearchItems)
+	if err != nil {
+		return nil, err
+	}
+	return [][]byte{pw}, nil
 }
 
 func findKeyringPassword(searchItems searchSecretItemsFunc) ([]byte, error) {
