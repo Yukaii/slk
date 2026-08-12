@@ -1108,6 +1108,7 @@ func run() error {
 	app.SetTypingEnabled(cfg.Animations.TypingIndicators)
 	app.SetSidebarStaleThreshold(time.Duration(cfg.Sidebar.HideInactiveAfterDays) * 24 * time.Hour)
 	app.SetMouseWheelLines(cfg.Appearance.MouseWheelLines)
+	app.SetColoredUsernames(cfg.Appearance.ColoredUsernames)
 
 	// Wire theme switcher
 	app.SetThemeItems(styles.ThemeNames())

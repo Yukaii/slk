@@ -2,6 +2,7 @@
 package styles
 
 import (
+	"hash/fnv"
 	"image/color"
 
 	"charm.land/lipgloss/v2"
@@ -114,10 +115,25 @@ var (
 			Padding(0, 1)
 
 	// Messages
-	Username = lipgloss.NewStyle().
-			Background(Background).
-			Foreground(Primary).
-			Bold(true)
+
+	// UserColorPalette is the fixed set of colors used to deterministically
+	// color usernames by hashing user IDs, mirroring how Slack clients assign
+	// stable per-user colors. Mid-brightness colors are chosen for adequate
+	// contrast on both dark and light theme backgrounds.
+	UserColorPalette = []color.Color{
+		lipgloss.Color("#E01E5A"),
+		lipgloss.Color("#3B82F6"),
+		lipgloss.Color("#2EB67D"),
+		lipgloss.Color("#8B5CF6"),
+		lipgloss.Color("#F43F5E"),
+		lipgloss.Color("#06B6D4"),
+		lipgloss.Color("#F97316"),
+		lipgloss.Color("#10B981"),
+		lipgloss.Color("#6366F1"),
+		lipgloss.Color("#C026D3"),
+		lipgloss.Color("#0EA5E9"),
+		lipgloss.Color("#DB2777"),
+	}
 
 	Timestamp = lipgloss.NewStyle().
 			Background(Background).
@@ -392,6 +408,33 @@ func SelectionBorderColor(focused bool) color.Color {
 	return TextMuted
 }
 
+// UserColor returns a deterministic color for the given user ID by hashing
+// it into UserColorPalette via FNV-1a. Returns Primary for empty IDs (e.g.
+// some bot messages) so they fall back to the theme default.
+func UserColor(userID string) color.Color {
+	if userID == "" {
+		return Primary
+	}
+	h := fnv.New32a()
+	h.Write([]byte(userID))
+	return UserColorPalette[h.Sum32()%uint32(len(UserColorPalette))]
+}
+
+// Username returns a lipgloss style for rendering a username. When colored
+// is true and userID is non-empty, the foreground color is deterministically
+// derived from userID via UserColor. Otherwise the theme default (Primary)
+// is used.
+func Username(userID string, colored bool) lipgloss.Style {
+	fg := Primary
+	if colored && userID != "" {
+		fg = UserColor(userID)
+	}
+	return lipgloss.NewStyle().
+		Background(Background).
+		Foreground(fg).
+		Bold(true)
+}
+
 func buildStyles() {
 	FocusedBorder = lipgloss.NewStyle().
 		BorderStyle(lipgloss.ThickBorder()).BorderForeground(Primary).BorderBackground(Background).Background(Background)
@@ -415,8 +458,6 @@ func buildStyles() {
 		Background(Error).Foreground(lipgloss.Color("#FFFFFF")).Padding(0, 1)
 	SectionHeader = lipgloss.NewStyle().
 		Background(SidebarBackground).Foreground(SidebarTextMuted).Bold(true).Padding(0, 1)
-	Username = lipgloss.NewStyle().
-		Background(Background).Foreground(Primary).Bold(true)
 	Timestamp = lipgloss.NewStyle().
 		Background(Background).Foreground(TextMuted).Italic(true)
 	MessageText = lipgloss.NewStyle().

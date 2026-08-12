@@ -1984,6 +1984,15 @@ func (a *App) SetAvatarFunc(fn messages.AvatarFunc) {
 	a.threadPanel.SetAvatarFunc(fn)
 }
 
+// SetColoredUsernames enables or disables deterministic per-user coloring
+// of usernames across all message panes and the thread panel.
+func (a *App) SetColoredUsernames(enabled bool) {
+	for _, m := range a.allWinModels() {
+		m.SetColoredUsernames(enabled)
+	}
+	a.threadPanel.SetColoredUsernames(enabled)
+}
+
 // SetImageContext configures the inline-image rendering pipeline on the
 // messages pane. Should be called once at startup, before the first
 // View(). Pass a zero-valued ImageContext to disable inline rendering.

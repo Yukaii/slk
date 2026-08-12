@@ -366,6 +366,12 @@ type Model struct {
 	// color is baked into viewEntry.linesSelected during buildCache, so
 	// SetFocused must invalidate the cache.
 	focused bool
+
+	// coloredUsernames enables deterministic per-user coloring of the
+	// username in each message row. Set from config via
+	// SetColoredUsernames; invalidates the render cache so existing rows
+	// pick up the new coloring.
+	coloredUsernames bool
 }
 
 // SetFocused records whether the messages pane currently holds user focus
@@ -1329,6 +1335,15 @@ func (m *Model) SetUserNames(names map[string]string) {
 	m.dirty()
 }
 
+// SetColoredUsernames enables or disables deterministic per-user coloring
+// of usernames. Invalidates the render cache so existing rows re-render
+// with the new coloring.
+func (m *Model) SetColoredUsernames(enabled bool) {
+	m.coloredUsernames = enabled
+	m.cache = nil
+	m.dirty()
+}
+
 // SetCurrentUser records the authenticated user ID so UpdateReaction can
 // flag the current user's own reactions (HasReacted) correctly.
 func (m *Model) SetCurrentUser(userID string) {
@@ -1914,7 +1929,7 @@ func (m *Model) blockkitContext(msg MessageItem, userNames, channelNames map[str
 func (m *Model) renderMessagePlain(msg MessageItem, width int, avatarStr string, userNames map[string]string, channelNames map[string]string, isSelected bool, stats *entryPerfStats) (
 	content string, flushes []func(io.Writer) error, sixelRows map[int]sixelEntry, hits []entryHit, reactionHits []reactionEntryHit,
 ) {
-	line := styles.Username.Render(msg.UserName) + lipgloss.NewStyle().Background(styles.Background).Render("  ") + styles.Timestamp.Render(msg.Timestamp)
+	line := styles.Username(msg.UserID, m.coloredUsernames).Render(msg.UserName) + lipgloss.NewStyle().Background(styles.Background).Render("  ") + styles.Timestamp.Render(msg.Timestamp)
 
 	// If we have an avatar, reserve space on the left for it
 	contentWidth := width - 4
