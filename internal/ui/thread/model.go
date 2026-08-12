@@ -96,6 +96,7 @@ type Model struct {
 	threadTS          string
 	selected          int
 	focused           bool
+	coloredUsernames  bool
 	avatarFn          messages.AvatarFunc
 	userNames         map[string]string
 	channelNames      map[string]string
@@ -586,6 +587,14 @@ func (m *Model) SetAvatarFunc(fn messages.AvatarFunc) {
 func (m *Model) SetUserNames(names map[string]string) {
 	m.userNames = names
 	m.userNamesV++
+	m.InvalidateCache()
+}
+
+// SetColoredUsernames enables or disables deterministic per-user coloring
+// of usernames. Invalidates the render cache so existing rows re-render
+// with the new coloring.
+func (m *Model) SetColoredUsernames(enabled bool) {
+	m.coloredUsernames = enabled
 	m.InvalidateCache()
 }
 
@@ -1787,7 +1796,7 @@ func (m *Model) blockkitContext(msg messages.MessageItem, userNames, channelName
 }
 
 func (m *Model) renderThreadMessage(msg messages.MessageItem, width int, userNames map[string]string, channelNames map[string]string, isSelected bool) (string, []func(io.Writer) error, []reactionEntryHit) {
-	line := styles.Username.Render(msg.UserName) + lipgloss.NewStyle().Background(styles.Background).Render("  ") + styles.Timestamp.Render(msg.Timestamp)
+	line := styles.Username(msg.UserID, m.coloredUsernames).Render(msg.UserName) + lipgloss.NewStyle().Background(styles.Background).Render("  ") + styles.Timestamp.Render(msg.Timestamp)
 
 	contentWidth := width - 4
 	if contentWidth < 20 {

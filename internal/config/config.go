@@ -96,6 +96,10 @@ type Appearance struct {
 	// East-Asian-Wide convention; 1 is an escape hatch if 2 looks too
 	// large in a given font. Clamped to {1, 2} at load time.
 	EmojiCells int `toml:"emoji_cells"`
+	// ColoredUsernames, when true, colors each user's name deterministically
+	// by hashing their user ID — mirroring how Slack clients assign stable
+	// per-user colors. Default off.
+	ColoredUsernames bool `toml:"colored_usernames"`
 }
 
 type Animations struct {

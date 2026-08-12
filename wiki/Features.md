@@ -97,5 +97,6 @@ See [[Terminal Compatibility|Terminal-Compatibility]] for which protocol your te
 - Drop-in custom themes (`~/.config/slk/themes/*.toml`)
 - Live theme switcher (`Ctrl+y`)
 - TOML config for appearance, animations, notifications, and channel sections
+- Deterministic per-user username coloring, opt-in via `colored_usernames`
 
 See [[Configuration]] for the full `config.toml` reference and [[Keybindings]] for the key map.

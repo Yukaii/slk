@@ -15,6 +15,7 @@ theme = "dracula"
 timestamp_format = "3:04 PM"
 image_protocol = "auto"   # auto | kitty | sixel | halfblock | off
 max_image_rows = 20       # cap inline image height in terminal rows
+colored_usernames = false # color each user's name by ID hash (Slack-style)
 
 [animations]
 enabled = true
