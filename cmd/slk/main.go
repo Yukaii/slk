@@ -995,6 +995,37 @@ func run() error {
 			}
 		}
 	}
+
+	// Sixel capability probe (issue #116). Detect only knows the handful
+	// of terminals it can name from $TERM / $TERM_PROGRAM, so plenty of
+	// sixel-capable terminals (xterm -ti vt340, DomTerm, toyterm, foot
+	// behind a generic TERM, …) land on halfblock and render the blocky
+	// mosaic even though real pixels would work. Ask the terminal
+	// directly via DA1 before settling for halfblock.
+	//
+	// Only in auto mode — an explicit image_protocol=halfblock must stay
+	// half-block — and never inside a multiplexer: tmux keeps sixel off
+	// by policy (see Detect's doc comment) and zellij has no sixel path
+	// at all, so probing there only risks paying the full timeout for an
+	// answer we would ignore.
+	if proto == imgpkg.ProtoHalfBlock &&
+		imgpkg.IsAutoProtocol(cfg.Appearance.ImageProtocol) &&
+		os.Getenv("TMUX") == "" && os.Getenv("ZELLIJ") == "" &&
+		term.IsTerminal(int(os.Stdin.Fd())) {
+		state, err := term.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			debuglog.ImgRender("sixel probe skipped: cannot enter raw mode: %v", err)
+		} else {
+			ok := imgpkg.ProbeSixel(os.Stdout, os.Stdin, 200*time.Millisecond)
+			if rerr := term.Restore(int(os.Stdin.Fd()), state); rerr != nil {
+				debuglog.ImgRender("term restore after sixel probe: %v", rerr)
+			}
+			if ok {
+				debuglog.ImgRender("sixel probe succeeded, upgrading halfblock to sixel")
+				proto = imgpkg.ProtoSixel
+			}
+		}
+	}
 	debuglog.ImgRender("image protocol: %s", proto)
 
 	// Reconcile the emoji-as-images flag with the post-probe protocol.
