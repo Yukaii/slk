@@ -28,7 +28,7 @@
 
 ## Images
 
-- Inline image attachments render automatically in the messages pane: kitty graphics protocol on capable terminals (kitty, ghostty, recent WezTerm), sixel on foot/mlterm, half-block (`▀`) fallback everywhere else
+- Inline image attachments render automatically in the messages pane: kitty graphics protocol on capable terminals (kitty, ghostty, recent WezTerm), sixel on foot/mlterm and on any terminal that advertises sixel in its DA1 reply (xterm with sixel support, DomTerm, toyterm, …), half-block (`▀`) fallback everywhere else
 - User avatars use the same kitty graphics path on capable terminals for sharper pixels; sixel and other terminals fall back to half-block
 - Click any inline image (or press `O` on the selected message) for a full-screen in-app preview
 - `Enter` from the preview launches the OS image viewer

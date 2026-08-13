@@ -109,9 +109,12 @@ tmux show -gv allow-passthrough
 Expected output: `on` (or `all`).
 
 If passthrough is off, `slk` detects this at startup and falls back to
-half-block rendering automatically — no config change needed. To force a
-specific renderer regardless of detection, set `image_protocol` in
-`config.toml` to `kitty`, `sixel`, `halfblock`, or `off`.
+half-block rendering automatically — no config change needed. Outside a
+multiplexer, terminals that don't do kitty graphics are asked whether
+they speak sixel (a DA1 query), so sixel-capable terminals get real
+pixels instead of the half-block mosaic. To force a specific renderer
+regardless of detection, set `image_protocol` in `config.toml` to
+`kitty`, `sixel`, `halfblock`, or `off`.
 
 ## Unread indicator in tmux
 
