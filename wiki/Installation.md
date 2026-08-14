@@ -81,6 +81,9 @@ On Linux, `Ctrl+V` paste-to-upload needs slightly different setup depending on y
 
 slk auto-detects the session via `WAYLAND_DISPLAY` at startup. On headless Linux (or when neither dependency is met), slk runs but `Ctrl+V` smart-paste is disabled.
 
+Clipboard copying is independent of those native readers and uses OSC 52
+through the terminal, so copy remains available when smart-paste is disabled.
+
 ```bash
 git clone https://github.com/gammons/slk.git
 cd slk

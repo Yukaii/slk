@@ -113,7 +113,7 @@ Last updated: 2026-05-03
 - [ ] Search (`:search <query>` or `Ctrl+/`)
 - [ ] File downloads (browser-style "save attachment" command; uploads via Ctrl+V paste are implemented)
 - [x] Self presence and DND/snooze controls (Ctrl+S menu, live status bar segment, notification suppression)
-- [ ] OSC 52 clipboard integration (yank message text)
+- [x] OSC 52 clipboard integration for message selection and permalink copying
 ### Low Priority
 
 - [ ] Quiet hours for notifications

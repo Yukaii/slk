@@ -443,8 +443,9 @@ func TestHandleInsertMode_EmptyEnterStaysInInsert(t *testing.T) {
 
 func TestCopyPermalink_FromMessagesPane(t *testing.T) {
 	app := NewApp()
-	app.SetClipboardAvailable(true)
-	app.SetClipboardWriter(func(format clipboard.Format, data []byte) <-chan struct{} {
+	var copied string
+	app.SetClipboardWriter(func(text string) tea.Cmd {
+		copied = text
 		return nil
 	})
 	app.activeChannelID = "C123"
@@ -471,6 +472,9 @@ func TestCopyPermalink_FromMessagesPane(t *testing.T) {
 	if !found {
 		t.Fatalf("expected statusbar.PermalinkCopiedMsg in batch, got %#v", msg)
 	}
+	if copied != "https://example.slack.com/archives/C123/p1700000001000200" {
+		t.Errorf("clipboard = %q", copied)
+	}
 	if gotCh != "C123" {
 		t.Errorf("channel = %q, want C123", gotCh)
 	}
@@ -481,8 +485,9 @@ func TestCopyPermalink_FromMessagesPane(t *testing.T) {
 
 func TestCopyPermalink_FromThreadPane(t *testing.T) {
 	app := NewApp()
-	app.SetClipboardAvailable(true)
-	app.SetClipboardWriter(func(format clipboard.Format, data []byte) <-chan struct{} {
+	var copied string
+	app.SetClipboardWriter(func(text string) tea.Cmd {
+		copied = text
 		return nil
 	})
 	parent := messages.MessageItem{TS: "1700000000.000100"}
@@ -518,6 +523,9 @@ func TestCopyPermalink_FromThreadPane(t *testing.T) {
 	}
 	if !drainForPermalinkCopied(t, cmd()) {
 		t.Fatal("expected PermalinkCopiedMsg")
+	}
+	if copied != "https://example.slack.com/archives/C999/p1700000050000400?thread_ts=1700000000.000100&cid=C999" {
+		t.Errorf("clipboard = %q", copied)
 	}
 	if gotCh != "C999" {
 		t.Errorf("channel = %q, want C999", gotCh)
@@ -605,10 +613,7 @@ func drainForPermalinkCopied(t *testing.T, msg tea.Msg) bool {
 
 func TestCopyPermalink_ShiftYTriggersCopy(t *testing.T) {
 	app := NewApp()
-	app.SetClipboardAvailable(true)
-	app.SetClipboardWriter(func(format clipboard.Format, data []byte) <-chan struct{} {
-		return nil
-	})
+	app.SetClipboardWriter(func(string) tea.Cmd { return nil })
 	app.activeChannelID = "C123"
 	app.focusedPanel = PanelMessages
 	app.messagepane.SetMessages([]messages.MessageItem{

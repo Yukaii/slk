@@ -8,7 +8,6 @@ import (
 	"github.com/gammons/slk/internal/ids"
 	"github.com/gammons/slk/internal/ui/messages"
 	"github.com/gammons/slk/internal/ui/statusbar"
-	"golang.design/x/clipboard"
 )
 
 func newTestAppWithMessages(t *testing.T) *App {
@@ -46,10 +45,9 @@ func drainBatch(cmd tea.Cmd) []tea.Msg {
 
 func TestApp_DragInMessagesEmitsClipboardAndToast(t *testing.T) {
 	a := newTestAppWithMessages(t)
-	a.SetClipboardAvailable(true)
-	var gotData []byte
-	a.SetClipboardWriter(func(format clipboard.Format, data []byte) <-chan struct{} {
-		gotData = data
+	var gotData string
+	a.SetClipboardWriter(func(text string) tea.Cmd {
+		gotData = text
 		return nil
 	})
 	pressX := a.layout.sidebarEnd + 2
@@ -89,9 +87,8 @@ func TestApp_DragInMessagesEmitsClipboardAndToast(t *testing.T) {
 
 func TestApp_PlainClickDoesNotCopy(t *testing.T) {
 	a := newTestAppWithMessages(t)
-	a.SetClipboardAvailable(true)
 	var wrote bool
-	a.SetClipboardWriter(func(format clipboard.Format, data []byte) <-chan struct{} {
+	a.SetClipboardWriter(func(string) tea.Cmd {
 		wrote = true
 		return nil
 	})
@@ -414,10 +411,9 @@ func TestDrag_MotionCoalescing_DefersExtendSelectionAt(t *testing.T) {
 // position even if the flush tick hasn't fired yet.
 func TestDrag_MotionCoalescing_ReleaseFlushesPending(t *testing.T) {
 	a := newTestAppWithMessages(t)
-	a.SetClipboardAvailable(true)
-	var gotData []byte
-	a.SetClipboardWriter(func(format clipboard.Format, data []byte) <-chan struct{} {
-		gotData = data
+	var gotData string
+	a.SetClipboardWriter(func(text string) tea.Cmd {
+		gotData = text
 		return nil
 	})
 	pressX := a.layout.sidebarEnd + 2

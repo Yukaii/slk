@@ -96,9 +96,6 @@ var reduceIO reducerFunc = func(a *App, msg tea.Msg) (tea.Cmd, bool) {
 		a.statusbar.ShowCopied(m.N)
 		return copiedClearAfter(2 * time.Second), true
 
-	case statusbar.CopyFailedMsg:
-		return toastWithClear(a, "Failed to copy selection", 2*time.Second), true
-
 	case statusbar.CopiedClearMsg:
 		_ = m
 		a.statusbar.ClearCopied()
