@@ -48,3 +48,12 @@ needed), so sessions stay fresh on their own.
 If you ever sign out of the desktop app, just sign back in — slk will pick the
 session back up the next time it needs to re-mint. See the auth caveat in
 [[Tradeoffs and Non-Goals|Tradeoffs-and-Non-Goals]].
+
+## Enterprise Grid
+
+slk reuses the **desktop app's** existing signed-in session (the same session
+your admin already sanctioned) rather than a browser session, which avoids the
+session-anomaly alerts that browser-token extraction can trigger. If you're on
+Enterprise Grid and still hit a sign-out or security alert after adding a
+workspace, please file an issue — include your OS and Slack desktop version.
+See [#5](https://github.com/gammons/slk/issues/5) for history.
