@@ -182,17 +182,17 @@ type App struct {
 	// a status_command is configured (config: notifications.status_command).
 	statusReport StatusReportFunc
 
-	// clipboardAvailable is set at startup based on the result of
-	// clipboard.Init(). When false, Ctrl+V smart-paste is a no-op.
+	// clipboardAvailable is set from the native clipboard reader's startup
+	// result. It gates Ctrl+V smart-paste only; OSC 52 writes do not depend on
+	// native clipboard initialization.
 	clipboardAvailable bool
 
-	// clipboardRead is the function used by smartPaste to read OS
-	// clipboard contents. Tests inject fakes via SetClipboardReader.
+	// clipboardRead is the function used by smartPaste to read OS clipboard
+	// contents. Tests inject fakes via SetClipboardReader.
 	clipboardRead clipboardReader
 
-	// clipboardWrite is the function used by copyPermalink and drag-copy
-	// to write OS clipboard contents. Tests inject fakes via
-	// SetClipboardWriter.
+	// clipboardWrite creates OSC 52 write commands for permalink and drag-copy
+	// actions. Tests inject fakes via SetClipboardWriter.
 	clipboardWrite clipboardWriter
 
 	// threads is the App's ThreadService collaborator (fetch / mark /
@@ -1041,13 +1041,10 @@ func (a *App) copyPermalinkOfSelected() tea.Cmd {
 			// false success toast.
 			return nil
 		}
-
-		if !a.clipboardAvailable {
-			return statusbar.PermalinkCopyFailedMsg{}
-		}
-		_ = a.clipboardWrite(clipboard.FmtText, []byte(url))
-
-		return statusbar.PermalinkCopiedMsg{}
+		return tea.Batch(
+			a.clipboardWrite(url),
+			func() tea.Msg { return statusbar.PermalinkCopiedMsg{} },
+		)()
 	}
 }
 
@@ -1911,9 +1908,9 @@ func (a *App) SetUploader(fn UploadFunc) {
 	a.uploader = fn
 }
 
-// SetClipboardAvailable signals whether the OS clipboard library
-// initialized successfully. When false, the smart-paste code path
-// is short-circuited.
+// SetClipboardAvailable reports whether native clipboard reads initialized
+// successfully. It controls Ctrl+V smart-paste only; OSC 52 writes remain
+// available in headless and CGO-free environments.
 func (a *App) SetClipboardAvailable(ok bool) {
 	a.clipboardAvailable = ok
 }
@@ -1929,9 +1926,8 @@ func (a *App) SetClipboardReader(fn clipboardReader) {
 	a.clipboardRead = fn
 }
 
-// SetClipboardWriter replaces the clipboard write function. Used by
-// tests to inject a fake writer. Pass nil to restore the default
-// real clipboard writer.
+// SetClipboardWriter replaces the OSC 52 command factory. Used by tests to
+// capture copied text. Pass nil to restore tea.SetClipboard.
 func (a *App) SetClipboardWriter(fn clipboardWriter) {
 	if fn == nil {
 		a.clipboardWrite = defaultClipboardWriter

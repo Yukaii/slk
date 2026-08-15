@@ -385,11 +385,6 @@ type CopiedMsg struct {
 	N int
 }
 
-// CopyFailedMsg is delivered when a mouse-selection copy operation fails
-// (e.g. because the system clipboard driver is unavailable). App handles
-// it by setting the toast to "Failed to copy selection" and scheduling a CopiedClearMsg.
-type CopyFailedMsg struct{}
-
 // CopiedClearMsg is the follow-up tick that clears the toast.
 type CopiedClearMsg struct{}
 
