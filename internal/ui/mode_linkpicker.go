@@ -18,6 +18,7 @@ func handleLinkPickerMode(a *App, msg tea.KeyMsg) tea.Cmd {
 		if a.pickerKind == "files" {
 			files := a.pickerFiles
 			a.pickerFiles = nil
+			a.pickerKind = ""
 			if item.Index < 0 || item.Index >= len(files) {
 				return nil
 			}
@@ -31,6 +32,7 @@ func handleLinkPickerMode(a *App, msg tea.KeyMsg) tea.Cmd {
 		// esc/q closed the picker.
 		a.SetMode(ModeNormal)
 		a.pickerFiles = nil
+		a.pickerKind = ""
 	}
 	return nil
 }

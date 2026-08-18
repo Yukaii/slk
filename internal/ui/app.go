@@ -1144,7 +1144,11 @@ func (a *App) downloadFilesOfSelected() tea.Cmd {
 	default:
 		items := make([]linkpicker.Item, len(files))
 		for i, f := range files {
-			items[i] = linkpicker.Item{Label: f.Name, Detail: humanSize(f.Size)}
+			var detail string
+			if f.Size > 0 {
+				detail = humanSize(f.Size)
+			}
+			items[i] = linkpicker.Item{Label: f.Name, Detail: detail}
 		}
 		a.pickerKind = "files"
 		a.pickerFiles = files
