@@ -51,13 +51,20 @@ func (d *Downloader) Download(ctx context.Context, rawURL, name string) (string,
 	teamID := slackhttp.TeamIDFromFilesURL(rawURL)
 	var lastErr error
 	for _, auth := range auths {
-		body, status, err := d.get(ctx, rawURL, auth)
+		body, contentType, status, err := d.get(ctx, rawURL, auth)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 		if status != http.StatusOK {
 			lastErr = fmt.Errorf("HTTP %d", status)
+			continue
+		}
+		// Slack answers a failed-auth url_private request with its
+		// 200 text/html login page; treat that as an auth failure and
+		// try the next workspace's credentials.
+		if strings.HasPrefix(strings.ToLower(contentType), "text/html") {
+			lastErr = fmt.Errorf("HTTP 200 with text/html (auth failure)")
 			continue
 		}
 		path, err := d.writeUnique(name, body)
@@ -71,10 +78,12 @@ func (d *Downloader) Download(ctx context.Context, rawURL, name string) (string,
 }
 
 // get issues one HTTP GET with the given auth attached (if non-empty).
-func (d *Downloader) get(ctx context.Context, rawURL string, auth slackhttp.TeamAuth) ([]byte, int, error) {
+// It returns the response Content-Type alongside the status; the body
+// is read only on 200.
+func (d *Downloader) get(ctx context.Context, rawURL string, auth slackhttp.TeamAuth) ([]byte, string, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, 0, err
+		return nil, "", 0, err
 	}
 	if auth.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+auth.Token)
@@ -86,21 +95,22 @@ func (d *Downloader) get(ctx context.Context, rawURL string, auth slackhttp.Team
 	}
 	resp, err := d.http.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, "", 0, err
 	}
 	defer resp.Body.Close()
+	contentType := resp.Header.Get("Content-Type")
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, resp.Body)
-		return nil, resp.StatusCode, nil
+		return nil, contentType, resp.StatusCode, nil
 	}
 	body, err := io.ReadAll(resp.Body)
-	return body, resp.StatusCode, err
+	return body, contentType, resp.StatusCode, err
 }
 
 // writeUnique writes body to dir/name, suffixing "-2", "-3", ...
 // before the extension on collision. Never overwrites.
 func (d *Downloader) writeUnique(name string, body []byte) (string, error) {
-	if err := os.MkdirAll(d.dir, 0o755); err != nil {
+	if err := os.MkdirAll(d.dir, 0o700); err != nil {
 		return "", err
 	}
 	base := sanitizeName(name)
@@ -112,7 +122,7 @@ func (d *Downloader) writeUnique(name string, body []byte) (string, error) {
 			candidate = fmt.Sprintf("%s-%d%s", stem, i, ext)
 		}
 		path := filepath.Join(d.dir, candidate)
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if errors.Is(err, os.ErrExist) {
 			continue
 		}

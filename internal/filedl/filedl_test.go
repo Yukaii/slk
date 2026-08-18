@@ -42,7 +42,7 @@ func TestGetSendsAuthHeaders(t *testing.T) {
 	}))
 	defer srv.Close()
 	d := New(slackhttp.NewAuthResolver(nil), t.TempDir())
-	_, _, err := d.get(context.Background(), srv.URL, slackhttp.TeamAuth{TeamID: "T1", Token: "xoxc-test", DCookie: "cookie-test"})
+	_, _, _, err := d.get(context.Background(), srv.URL, slackhttp.TeamAuth{TeamID: "T1", Token: "xoxc-test", DCookie: "cookie-test"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +85,26 @@ func TestDownloadHTTPError(t *testing.T) {
 	d := New(slackhttp.NewAuthResolver(nil), t.TempDir())
 	if _, err := d.Download(context.Background(), srv.URL, "x.csv"); err == nil {
 		t.Fatal("expected error on 403")
+	}
+}
+
+func TestDownloadHTMLLoginPageIsAuthFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte("<html><body>Slack login</body></html>"))
+	}))
+	defer srv.Close()
+	dir := t.TempDir()
+	d := New(slackhttp.NewAuthResolver(nil), dir)
+	if _, err := d.Download(context.Background(), srv.URL+"/report.csv", "report.csv"); err == nil {
+		t.Fatal("expected error on 200 text/html login page")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected no file written, found %d entries", len(entries))
 	}
 }
 
