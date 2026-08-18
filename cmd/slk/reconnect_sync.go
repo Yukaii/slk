@@ -62,6 +62,12 @@ type teaSender interface {
 //  2. Mark every other channel stale, so it revalidates when opened.
 //  3. Refresh the channel actually on screen, through the same path a
 //     channel switch uses.
+//
+// Thread subscriptions are NOT one of the steps. They rejoined the
+// reconnect path later, but at the handler level (syncOnReconnect's
+// ensureThreadSubs kick) with their own 30-minute throttle — one
+// paginated sweep per window, not the unbounded per-reconnect phase
+// measured above.
 type reconnectSync struct {
 	client      reconnectClient
 	db          *cache.DB

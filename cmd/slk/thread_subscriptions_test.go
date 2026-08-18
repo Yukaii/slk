@@ -156,19 +156,73 @@ func TestThreadSubscriptions_SuccessTriggersAvailabilityCallback(t *testing.T) {
 	}
 }
 
-func TestEnsureThreadSubscriptions_FetchesOncePerWorkspace(t *testing.T) {
-	// The Threads view refetches its list on activation and on every
-	// ThreadsListDirtyMsg — including the one this sync itself sends —
-	// so an ungated trigger here would either loop or fire on every
-	// interaction. subscriptions.thread.getView paginates to a
-	// 1000-item hard cap, measured at 62 requests per workspace on a
-	// real account, which makes "once" the difference between a
-	// deferred cost and a much worse one.
+// zeroStagger neutralises the cross-workspace startup stagger for
+// tests that don't exercise it, and restores it afterwards. Without
+// this the package-global slot counter would hand later tests delays
+// of minutes.
+func zeroStagger(t *testing.T) {
+	t.Helper()
+	oldStep := threadSubsStaggerStep
+	threadSubsStagger.Store(0)
+	threadSubsStaggerStep = 0
+	t.Cleanup(func() {
+		threadSubsStaggerStep = oldStep
+		threadSubsStagger.Store(0)
+	})
+}
+
+func TestThreadSubsGate_FirstSyncAdmittedOnce(t *testing.T) {
+	g := &threadSubsGate{window: time.Hour}
+	now := time.Now()
+
+	first, ok := g.tryStart(now)
+	if !ok || !first {
+		t.Fatalf("first tryStart = (%v, %v); want (true, true)", first, ok)
+	}
+	g.done()
+
+	if _, ok := g.tryStart(now.Add(30 * time.Minute)); ok {
+		t.Fatal("tryStart inside the window admitted a second sync")
+	}
+	first, ok = g.tryStart(now.Add(2 * time.Hour))
+	if !ok {
+		t.Fatal("tryStart after the window did not admit a re-sync")
+	}
+	if first {
+		t.Error("re-sync reported first=true; the startup stagger must apply exactly once per workspace")
+	}
+	g.done()
+}
+
+func TestThreadSubsGate_BlocksWhileRunning(t *testing.T) {
+	// A second trigger landing mid-sync (view opened while the boot
+	// sync is still paginating) must not double the request volume,
+	// even when the throttle window has technically elapsed.
+	g := &threadSubsGate{window: 0}
+	if _, ok := g.tryStart(time.Now()); !ok {
+		t.Fatal("first tryStart not admitted")
+	}
+	if _, ok := g.tryStart(time.Now().Add(time.Hour)); ok {
+		t.Fatal("tryStart admitted while a sync is still running")
+	}
+	g.done()
+	if _, ok := g.tryStart(time.Now().Add(time.Hour)); !ok {
+		t.Fatal("tryStart after done() not admitted")
+	}
+}
+
+// The Threads view refetches its list on activation and on every
+// ThreadsListDirtyMsg — including the one this sync itself sends — so
+// an ungated trigger here would either loop or fire on every
+// interaction. subscriptions.thread.getView paginates to a 1000-item
+// hard cap, measured at 62 requests per workspace on a real account.
+func TestEnsureThreadSubscriptions_FetchesOnceWithinWindow(t *testing.T) {
+	zeroStagger(t)
 	db := newTestDB(t)
 	fake := &fakeSubscriptions{response: []slackclient.ThreadSubscriptionView{
 		subView("C1", "1700000100.000000", "1700000150.000000", "p1", "U2", true),
 	}}
-	var once sync.Once
+	gate := &threadSubsGate{window: time.Hour}
 	done := make(chan struct{}, 8)
 
 	var wg sync.WaitGroup
@@ -176,7 +230,7 @@ func TestEnsureThreadSubscriptions_FetchesOncePerWorkspace(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ensureThreadSubscriptions(context.Background(), &once,
+			ensureThreadSubscriptions(context.Background(), gate,
 				newSubscriptionSync(db, fake, nil),
 				func() { done <- struct{}{} })
 		}()
@@ -186,29 +240,127 @@ func TestEnsureThreadSubscriptions_FetchesOncePerWorkspace(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("the first open never completed a subscription sync")
+		t.Fatal("the first trigger never completed a subscription sync")
 	}
 
 	fake.mu.Lock()
 	calls := fake.calls
 	fake.mu.Unlock()
 	if calls != 1 {
-		t.Errorf("ListThreadSubscriptions called %d times; want 1 — the Threads view opens, refreshes and reopens constantly", calls)
+		t.Errorf("ListThreadSubscriptions called %d times; want 1 — boot, activation and dirty-refresh all trigger this", calls)
 	}
 	if len(done) != 0 {
 		t.Errorf("%d extra completions; the notify must fire once, or every one re-triggers the list fetch", len(done))
 	}
 }
 
+// The gate is a throttle, not a latch: after the window elapses a
+// trigger (wake-from-sleep, WS reconnect) syncs again. This is what
+// freshens threads after the app sat offline with a dead socket.
+func TestEnsureThreadSubscriptions_ResyncsAfterWindow(t *testing.T) {
+	zeroStagger(t)
+	db := newTestDB(t)
+	fake := &fakeSubscriptions{response: []slackclient.ThreadSubscriptionView{
+		subView("C1", "1700000100.000000", "1700000150.000000", "p1", "U2", true),
+	}}
+	gate := &threadSubsGate{window: 20 * time.Millisecond}
+	done := make(chan struct{}, 2)
+
+	ensureThreadSubscriptions(context.Background(), gate,
+		newSubscriptionSync(db, fake, nil),
+		func() { done <- struct{}{} })
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first sync never completed")
+	}
+
+	time.Sleep(40 * time.Millisecond)
+	ensureThreadSubscriptions(context.Background(), gate,
+		newSubscriptionSync(db, fake, nil),
+		func() { done <- struct{}{} })
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("re-sync after the window never completed")
+	}
+
+	fake.mu.Lock()
+	calls := fake.calls
+	fake.mu.Unlock()
+	if calls != 2 {
+		t.Errorf("ListThreadSubscriptions called %d times; want 2 (initial + post-window re-sync)", calls)
+	}
+}
+
+// On boot every workspace becomes ready at once; on Enterprise Grid
+// that would fire N paginated getView sweeps in the same second. The
+// first sync per workspace waits slot*step so the sweeps spread out.
+// The stagger applies to the first sync only — later re-syncs are
+// already thinned out by the window and must not wait.
+func TestEnsureThreadSubscriptions_FirstSyncStaggers(t *testing.T) {
+	oldStep := threadSubsStaggerStep
+	threadSubsStaggerStep = 100 * time.Millisecond
+	threadSubsStagger.Store(2) // this workspace drew slot 2 → 200ms delay
+	t.Cleanup(func() {
+		threadSubsStaggerStep = oldStep
+		threadSubsStagger.Store(0)
+	})
+
+	db := newTestDB(t)
+	fake := &fakeSubscriptions{response: []slackclient.ThreadSubscriptionView{
+		subView("C1", "1700000100.000000", "1700000150.000000", "p1", "U2", true),
+	}}
+	gate := &threadSubsGate{window: 50 * time.Millisecond}
+	done := make(chan struct{}, 2)
+
+	ensureThreadSubscriptions(context.Background(), gate,
+		newSubscriptionSync(db, fake, nil),
+		func() { done <- struct{}{} })
+
+	time.Sleep(50 * time.Millisecond)
+	fake.mu.Lock()
+	early := fake.calls
+	fake.mu.Unlock()
+	if early != 0 {
+		t.Fatalf("first sync fetched after 50ms despite a 200ms stagger slot")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("staggered first sync never completed")
+	}
+
+	// Re-sync after the window: no stagger, runs immediately even
+	// though the slot counter says this process has booted workspaces.
+	time.Sleep(60 * time.Millisecond)
+	ensureThreadSubscriptions(context.Background(), gate,
+		newSubscriptionSync(db, fake, nil),
+		func() { done <- struct{}{} })
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("re-sync after the window never completed")
+	}
+	fake.mu.Lock()
+	calls := fake.calls
+	fake.mu.Unlock()
+	if calls != 2 {
+		t.Errorf("ListThreadSubscriptions called %d times; want 2 (staggered first + immediate re-sync)", calls)
+	}
+}
+
 func TestEnsureThreadSubscriptions_FailureDoesNotNotify(t *testing.T) {
 	// A ThreadsListDirtyMsg after a failed fetch would send the view
 	// back to the same cache it already rendered, for nothing.
+	zeroStagger(t)
 	db := newTestDB(t)
 	fake := &fakeSubscriptions{err: errors.New("boom")}
-	var once sync.Once
+	gate := &threadSubsGate{window: time.Hour}
 	notified := make(chan struct{}, 1)
 
-	ensureThreadSubscriptions(context.Background(), &once,
+	ensureThreadSubscriptions(context.Background(), gate,
 		newSubscriptionSync(db, fake, nil),
 		func() { notified <- struct{}{} })
 

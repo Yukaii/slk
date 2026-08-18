@@ -2019,6 +2019,66 @@ func TestListThreadSubscriptions_ReturnsErrorOnNotOK(t *testing.T) {
 	}
 }
 
+func TestListThreadSubscriptions_RetriesOnRateLimit(t *testing.T) {
+	var calls int
+	var capturedCurrentTS []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_ = r.ParseForm()
+		capturedCurrentTS = append(capturedCurrentTS, r.PostForm.Get("current_ts"))
+		if calls == 1 {
+			w.Header().Set("Retry-After", "0") // retry immediately, keep test fast
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok": true, "threads": [], "has_more": false, "max_ts": ""}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{token: "xoxc-test", cookie: "d-cookie", apiBaseURL: srv.URL + "/api/"}
+	got, err := c.ListThreadSubscriptions(context.Background())
+	if err != nil {
+		t.Fatalf("ListThreadSubscriptions: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 API calls (1 rate-limited + 1 retry), got %d", calls)
+	}
+	if len(got) != 0 {
+		t.Errorf("len(got) = %d, want 0", len(got))
+	}
+	// On rate-limit the cursor must NOT advance — the retry hits the same page.
+	if capturedCurrentTS[0] != "" || capturedCurrentTS[1] != "" {
+		t.Errorf("current_ts = %v, want [\"\", \"\"]", capturedCurrentTS)
+	}
+}
+
+func TestListThreadSubscriptions_GivesUpAfterRepeatedRateLimits(t *testing.T) {
+	// A persistently 429ing endpoint must not spin the background sync
+	// forever: bound the retries, return the error, let the UI banner
+	// and the caller's throttle window back off instead.
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Retry-After", "0")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	c := &Client{token: "xoxc-test", cookie: "d-cookie", apiBaseURL: srv.URL + "/api/"}
+	_, err := c.ListThreadSubscriptions(context.Background())
+	if err == nil {
+		t.Fatal("expected error after repeated 429s, got nil")
+	}
+	if !strings.Contains(err.Error(), "rate") {
+		t.Errorf("error = %q, want it to mention rate limiting", err.Error())
+	}
+	// 1 initial + bounded retries; unbounded would hang this test.
+	if calls < 2 || calls > 5 {
+		t.Errorf("calls = %d, want a small bounded retry count (2..5)", calls)
+	}
+}
+
 func TestNewClient_UsesBrowserTransport(t *testing.T) {
 	var gotHeaders http.Header
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

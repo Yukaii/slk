@@ -385,3 +385,68 @@ func TestReconnect_NoActiveChannelMakesNoHistoryCall(t *testing.T) {
 		t.Errorf("calls = %v; want only client.counts", got)
 	}
 }
+
+// The socket replays nothing, so after a wake-from-sleep or reconnect
+// the thread_subscriptions table is missing every subscription,
+// unsubscription, mark and reply from the gap. The reconnect catch-up
+// must kick the (throttled) subscription sync alongside the channel
+// work — without the kick, threads stay stale until the next boot.
+func TestSyncOnReconnect_KicksThreadSubscriptionSync(t *testing.T) {
+	kicked := make(chan struct{}, 1)
+	h := &rtmEventHandler{
+		db:              newTestDB(t),
+		wsCtx:           &WorkspaceContext{Client: &slackclient.Client{}},
+		backfillGate:    dedupeGate{window: 30 * time.Second},
+		activeChannelID: func() string { return "" },
+		ensureThreadSubs: func() {
+			kicked <- struct{}{}
+		},
+	}
+
+	if !h.syncOnReconnect("wake") {
+		t.Fatal("syncOnReconnect was deduped on its first call")
+	}
+	select {
+	case <-kicked:
+	case <-time.After(time.Second):
+		t.Fatal("reconnect catch-up did not kick the thread subscription sync")
+	}
+}
+
+// The kick is a trigger, not a fetch: threadSubsGate inside
+// ensureThreadSubscriptions decides whether a sweep actually runs.
+// A reconnect flap that passes the 30 s dedupe must still cost zero
+// getView requests when the last sync was recent — but the wiring
+// must not hold the kick back either, or a long offline gap followed
+// by a flap would defer the reconciliation indefinitely. The handler
+// therefore fires unconditionally and stays dumb about throttling.
+func TestSyncOnReconnect_KickSurvivesDedupedPass(t *testing.T) {
+	kicked := make(chan struct{}, 2)
+	h := &rtmEventHandler{
+		db:              newTestDB(t),
+		wsCtx:           &WorkspaceContext{Client: &slackclient.Client{}},
+		backfillGate:    dedupeGate{window: 30 * time.Second},
+		activeChannelID: func() string { return "" },
+		ensureThreadSubs: func() {
+			kicked <- struct{}{}
+		},
+	}
+
+	h.syncOnReconnect("reconnect")
+	if h.syncOnReconnect("reconnect") {
+		t.Fatal("second pass inside the dedupe window should have been suppressed")
+	}
+	select {
+	case <-kicked:
+	case <-time.After(time.Second):
+		t.Fatal("first pass did not kick the thread subscription sync")
+	}
+	select {
+	case <-kicked:
+		// Both designs are defensible; this pins "kick even when the
+		// channel pass was deduped", since the thread gate throttles
+		// anyway and the kick is free.
+	case <-time.After(time.Second):
+		t.Fatal("deduped pass did not forward the kick to the thread gate, which owns the real throttle")
+	}
+}

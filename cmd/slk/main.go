@@ -160,10 +160,12 @@ type WorkspaceContext struct {
 	// us the workspace has zero unread threads, we trust that and
 	// suppress the heuristic-derived flags entirely.
 	ThreadsHasUnreads bool
-	// ThreadSubsOnce gates the workspace's one
-	// subscriptions.thread.getView fetch, fired on the first open of
-	// the Threads view. See ensureThreadSubscriptions.
-	ThreadSubsOnce sync.Once
+	// ThreadSubsGate throttles the workspace's
+	// subscriptions.thread.getView fetches to one per
+	// threadSubsSyncInterval. Fired on workspace-ready, on Threads
+	// view activation, and by the reconnect/wake catch-up. See
+	// ensureThreadSubscriptions.
+	ThreadSubsGate threadSubsGate
 	// SubscriptionsAvailable indicates whether the most recent
 	// threadSubscriptionSync attempt succeeded in fetching Slack's
 	// authoritative thread-subscription list. true on bootstrap
@@ -1744,24 +1746,24 @@ func run() error {
 					SubscriptionsAvailable: wctx.SubscriptionsAvailable,
 				}
 			},
-			// First open of the Threads view for this workspace is what
-			// pays for subscriptions.thread.getView, instead of every
-			// boot and (before that) every reconnect. Returns
-			// immediately; the list renders from cache and refreshes
-			// via ThreadsListDirtyMsg when the fetch lands.
+			// Workspace-ready (boot) is the primary trigger, with
+			// Threads-view activation as the safety net; the gate
+			// inside ensureThreadSubscriptions collapses both to one
+			// throttled, staggered getView sweep per workspace.
+			// Returns immediately; the list renders from cache and
+			// refreshes via ThreadsListDirtyMsg when the fetch lands.
+			//
+			// ByID, not Active: boot fires this for every workspace
+			// as it connects, including background ones the user may
+			// never activate this session — on Enterprise Grid those
+			// are exactly the workspaces whose threads would
+			// otherwise stay stale.
 			EnsureSubscriptions: func(teamID ids.TeamID) {
-				wctx := router.Active()
-				if wctx == nil || string(teamID) != wctx.TeamID {
+				wctx := router.ByID(string(teamID))
+				if wctx == nil || wctx.Client == nil {
 					return
 				}
-				ensureThreadSubscriptions(ctx, &wctx.ThreadSubsOnce,
-					&threadSubscriptionSync{
-						client:      wctx.Client,
-						db:          db,
-						workspaceID: wctx.TeamID,
-						availableCb: func(available bool) { wctx.SubscriptionsAvailable = available },
-					},
-					func() { p.Send(ui.ThreadsListDirtyMsg{TeamID: wctx.TeamID}) })
+				ensureWorkspaceThreadSubs(ctx, wctx, db, p.Send)
 			},
 			ChannelLastRead: func(channelID ids.ChannelID) string {
 				wctx := router.Active()
@@ -2021,6 +2023,12 @@ func run() error {
 						LastReadTS: state.LastReadTS,
 					})
 				},
+				// Reconnect/wake kick for the throttled thread-
+				// subscription sync; the gate inside decides whether a
+				// getView sweep actually runs.
+				ensureThreadSubs: func() {
+					ensureWorkspaceThreadSubs(context.Background(), wctx, db, p.Send)
+				},
 			}
 			wctx.RTMHandler = handler
 			wctx.ConnMgr = slackclient.NewConnectionManager(wctx.Client, handler)
@@ -2260,6 +2268,7 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		BotUserIDs:           make(map[string]bool),
 		CustomEmoji:          make(map[string]string),
 		LastVisitedByChannel: make(map[string]int64),
+		ThreadSubsGate:       threadSubsGate{window: threadSubsSyncInterval},
 	}
 	wctx.SubscriptionsAvailable = true
 
@@ -2438,12 +2447,13 @@ func connectWorkspace(ctx context.Context, token slackclient.Token, db *cache.DB
 		wctx.MuteStore = store
 	}
 
-	// Thread subscriptions are deliberately NOT fetched here. They are
-	// pulled on the first open of the Threads view, by
-	// ensureThreadSubscriptions via the threads list fetcher. See that
-	// function for why: the call paginates to a 1000-item hard cap,
-	// ~62 requests per workspace on a real account, and the Threads
-	// view is not on screen at boot.
+	// Thread subscriptions are deliberately NOT fetched here. The
+	// trigger is the WorkspaceReadyMsg the reducer handles after
+	// connectWorkspace returns: ensureThreadSubscriptions runs the
+	// sync throttled (one sweep per threadSubsSyncInterval) and
+	// staggered per workspace, so a Grid boot doesn't fire every
+	// workspace's ~62-request paginated sweep in the same second.
+	// See that function for the full rationale.
 
 	// There is deliberately no workspace-wide user fetch here.
 	//
@@ -3843,6 +3853,14 @@ type rtmEventHandler struct {
 	//
 	// nil in tests that construct a handler for unrelated events.
 	refreshChannel func(ctx context.Context, channelID string)
+
+	// ensureThreadSubs kicks the workspace's throttled thread-
+	// subscription sync (subscriptions.thread.getView). The reconnect
+	// catch-up fires it on every pass — the threadSubsGate inside
+	// owns the real throttling, so the kick itself is free.
+	//
+	// nil in tests that construct a handler for unrelated events.
+	ensureThreadSubs func()
 }
 
 func (h *rtmEventHandler) OnMessage(channelID, userID, ts, text, threadTS, subtype string, edited bool, files []slack.File, blocks slack.Blocks, attachments []slack.Attachment, botID, username string) {
@@ -4222,6 +4240,15 @@ func (h *rtmEventHandler) refreshActiveMembership() {
 func (h *rtmEventHandler) syncOnReconnect(trigger string) bool {
 	if h.wsCtx == nil || h.db == nil || h.wsCtx.Client == nil {
 		return false
+	}
+	// Threads: same "socket replays nothing" gap as the channel pass
+	// below. Fired BEFORE the dedupe check and unconditionally: the
+	// threadSubsGate inside throttles to one sweep per
+	// threadSubsSyncInterval, so the kick costs nothing when the last
+	// sync was recent, and a long offline gap must not have its
+	// reconciliation skipped just because a channel pass ran 10 s ago.
+	if h.ensureThreadSubs != nil {
+		h.ensureThreadSubs()
 	}
 	if !h.backfillGate.tryStart(time.Now()) {
 		debuglog.Backfill("team=%s trigger=%s skipped reason=dedupe", h.workspaceID, trigger)

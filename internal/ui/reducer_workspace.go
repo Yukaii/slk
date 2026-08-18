@@ -239,6 +239,17 @@ func reduceWorkspaceReady(a *App, m WorkspaceReadyMsg) tea.Cmd {
 	threads := a.threads
 	team := ids.TeamID(m.TeamID)
 	batch = append(batch, func() tea.Msg { return threads.ListFetch(team) })
+	// Boot is also the subscription sync's primary trigger: the socket
+	// replays nothing, so after any offline gap (app closed, laptop
+	// asleep) the cached thread_subscriptions table is stale and only
+	// subscriptions.thread.getView reconciles it. Fires for EVERY
+	// workspace, not just the active one — the reducer stays dumb;
+	// the main-package gate collapses this to one throttled, staggered
+	// network sweep per workspace.
+	batch = append(batch, func() tea.Msg {
+		threads.EnsureSubscriptions(team)
+		return nil
+	})
 	return tea.Batch(batch...)
 }
 
