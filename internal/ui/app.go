@@ -1086,7 +1086,7 @@ func (a *App) openLinksOfSelected() tea.Cmd {
 		for i, l := range links {
 			items[i] = linkpicker.Item{URL: l.URL, Label: l.Label, InApp: a.linkOpensInApp(l.URL)}
 		}
-		a.linkPicker.Open(items)
+		a.linkPicker.Open("Open link", items)
 		a.SetMode(ModeLinkPicker)
 		return nil
 	}
