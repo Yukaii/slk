@@ -3,6 +3,7 @@ package slackclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1466,6 +1467,20 @@ func (c *Client) ShouldReload(ctx context.Context) (string, error) {
 	return strconv.FormatInt(srr.RecommendedBuildVersion, 10), nil
 }
 
+// rateLimitError is what postForm returns on HTTP 429, carrying the
+// server-advised Retry-After so callers can sleep and retry the same
+// page instead of failing the whole sweep. Slack's internal endpoints
+// answer 429 (not ok=false ratelimited) when a paginated loop outruns
+// the limiter.
+type rateLimitError struct {
+	method     string
+	retryAfter time.Duration
+}
+
+func (e *rateLimitError) Error() string {
+	return fmt.Sprintf("calling %s: rate limited (HTTP 429), retry after %s", e.method, e.retryAfter)
+}
+
 // postForm performs a cookie-aware POST to an endpoint under
 // c.apiBaseURL with form values. The xoxc token is injected into the
 // form body — the same convention slack-go and the official browser
@@ -1505,6 +1520,12 @@ func (c *Client) postForm(ctx context.Context, method string, form url.Values) (
 	// non-2xx here is a transport/proxy/edge failure whose body is HTML
 	// at best: reporting it as a JSON parse failure at the call site
 	// (as this used to) hides what actually happened.
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, &rateLimitError{
+			method:     method,
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), 5*time.Second),
+		}
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, fmt.Errorf("calling %s: HTTP %s: %s", method, resp.Status, truncateForLog(raw))
 	}
@@ -1729,14 +1750,35 @@ const listThreadSubscriptionsHardCap = 1000
 // Returns (nil, err) on network failure or ok=false JSON. The caller
 // (the reconnect backfill phase) treats any error as "subscriptions
 // unavailable" and surfaces the UI banner.
+// listThreadSubscriptionsMaxRateLimitRetries bounds how often one
+// paginated sweep retries a 429ing page. The caller is a background
+// sync; an endpoint that keeps limiting after a few server-advised
+// waits is failed back to the UI banner and the caller's throttle
+// window instead of sleeping forever.
+const listThreadSubscriptionsMaxRateLimitRetries = 3
+
 func (c *Client) ListThreadSubscriptions(ctx context.Context) ([]ThreadSubscriptionView, error) {
 	var all []ThreadSubscriptionView
 	currentTS := ""
+	rateLimitRetries := 0
 	for {
 		body, err := c.callListThreadSubscriptions(ctx, currentTS)
 		if err != nil {
+			var rl *rateLimitError
+			if errors.As(err, &rl) && rateLimitRetries < listThreadSubscriptionsMaxRateLimitRetries {
+				rateLimitRetries++
+				// Retry the SAME page: currentTS deliberately does
+				// not advance.
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(rl.retryAfter):
+				}
+				continue
+			}
 			return nil, err
 		}
+		rateLimitRetries = 0
 		var resp listThreadSubscriptionsResponse
 		if err := json.Unmarshal(body, &resp); err != nil {
 			return nil, fmt.Errorf("parsing subscriptions.thread.getView: %w (body=%s)", err, truncateForLog(body))

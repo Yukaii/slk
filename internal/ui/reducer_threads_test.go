@@ -8,15 +8,18 @@ import (
 	"github.com/gammons/slk/internal/ids"
 )
 
-// TestApp_OnlyThreadsViewActivationEnsuresSubscriptions pins where the
-// subscriptions.thread.getView fetch is allowed to happen.
+// TestApp_WorkspaceReadyAndActivationBothEnsureSubscriptions pins where
+// the subscriptions.thread.getView fetch is triggered.
 //
-// The list fetcher runs on workspace-ready too, because the sidebar
-// shows a Threads unread badge before the user ever opens the view —
-// but that read is cache-only. Hanging the network sync off it puts a
-// ~62-request paginated call back into every boot, which is what this
-// task removed.
-func TestApp_OnlyThreadsViewActivationEnsuresSubscriptions(t *testing.T) {
+// Boot is a trigger because the socket replays nothing: an app that
+// was closed (or asleep) for days missed every thread_subscription_
+// changed event, and rendering the threads view from the days-old
+// SQLite snapshot is the staleness this fetch fixes. Activation stays
+// a trigger as a safety net. Collapsing both to one actual network
+// sweep per workspace is the main-package gate's job
+// (threadSubsGate) — the reducer deliberately fires unconditionally
+// and stays dumb about throttling.
+func TestApp_WorkspaceReadyAndActivationBothEnsureSubscriptions(t *testing.T) {
 	app := NewApp()
 	ensured := make(chan string, 4)
 	app.SetThreadService(NewThreadService(ThreadServiceFuncs{
@@ -34,8 +37,11 @@ func TestApp_OnlyThreadsViewActivationEnsuresSubscriptions(t *testing.T) {
 	}
 	select {
 	case team := <-ensured:
-		t.Fatalf("workspace-ready ensured subscriptions for %s; that fetch belongs to the first Threads-view open", team)
-	case <-time.After(50 * time.Millisecond):
+		if team != "T1" {
+			t.Errorf("workspace-ready ensured subscriptions for %q; want T1", team)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("workspace-ready did not ensure subscriptions; a workspace slk never opens the Threads view on stays stale for the whole session")
 	}
 
 	app.activeTeamID = "T1"
@@ -46,9 +52,9 @@ func TestApp_OnlyThreadsViewActivationEnsuresSubscriptions(t *testing.T) {
 	select {
 	case team := <-ensured:
 		if team != "T1" {
-			t.Errorf("ensured subscriptions for %q; want T1", team)
+			t.Errorf("activation ensured subscriptions for %q; want T1", team)
 		}
 	case <-time.After(100 * time.Millisecond):
-		t.Fatal("opening the Threads view did not ensure subscriptions; the list would render from a cache nothing ever fills")
+		t.Fatal("opening the Threads view did not ensure subscriptions")
 	}
 }

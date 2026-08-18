@@ -158,15 +158,17 @@ type ThreadService interface {
 	// ThreadsListLoadedMsg).
 	ListFetch(teamID ids.TeamID) tea.Msg
 
-	// EnsureSubscriptions makes sure the workspace's thread
-	// subscriptions have been fetched from Slack at least once this
-	// session, in the background.
+	// EnsureSubscriptions kicks the workspace's throttled thread-
+	// subscription sync (subscriptions.thread.getView) in the
+	// background. Called on workspace-ready and on Threads-view
+	// activation; the implementation collapses those to at most one
+	// network sweep per throttle window, so callers fire
+	// unconditionally.
 	//
 	// Separate from ListFetch because ListFetch is cache-only and runs
 	// on workspace-ready (for the sidebar's Threads badge), whereas
-	// this issues subscriptions.thread.getView, which paginates to a
-	// 1000-item hard cap — measured at ~62 requests per workspace.
-	// Only opening the Threads view is worth that.
+	// this may issue subscriptions.thread.getView, which paginates to
+	// a 1000-item hard cap — measured at ~62 requests per workspace.
 	EnsureSubscriptions(teamID ids.TeamID)
 
 	// ChannelLastRead returns the parent channel's last_read_ts so
