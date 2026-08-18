@@ -129,7 +129,7 @@ func blockquoteStyle() lipgloss.Style {
 //
 // Output format per attachment:
 //
-//	[Image] https://files.slack.com/...
+//	[Image] photo.png
 //
 // Callers must pass the result through WordWrap before composing it into
 // a width-bounded layout, since file URLs frequently exceed the panel
