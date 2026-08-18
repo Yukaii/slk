@@ -171,6 +171,9 @@ func TestRenderBlock_NonImage_FallsBackToLegacyLine(t *testing.T) {
 	if !strings.Contains(res.Lines[0], "[File]") {
 		t.Fatalf("expected [File] prefix in fallback, got %q", res.Lines[0])
 	}
+	if !strings.Contains(res.Lines[0], "doc.pdf") {
+		t.Fatalf("expected filename in fallback, got %q", res.Lines[0])
+	}
 }
 
 // TestRenderBlock_ImageWithProtoOff_FallsBack confirms the inline
