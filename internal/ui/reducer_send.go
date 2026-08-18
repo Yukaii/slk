@@ -273,6 +273,19 @@ func reduceNewMessage(a *App, m NewMessageMsg) tea.Cmd {
 			mm.IncrementReplyCount(m.Message.ThreadTS, m.Message.TS)
 		}
 	}
+	// Route thread replies to the open thread panel keyed on the
+	// PANEL's identity (its channel + thread ts), not the active
+	// channel. The panel can be showing a thread from a non-active
+	// channel — opened from the Threads view, or from a permalink
+	// pointing into another channel; neither path touches
+	// activeChannelID — and live replies must still land.
+	// (Previously this lived inside the active-channel branch below,
+	// so those panels went stale until a reopen forced a refetch.)
+	if a.threadVisible &&
+		m.ChannelID == a.threadPanel.ChannelID() &&
+		m.Message.ThreadTS == a.threadPanel.ThreadTS() {
+		a.threadPanel.AddReply(m.Message)
+	}
 	if m.ChannelID == a.activeChannelID {
 		// "active_channel_no_unread_bump": message arrived for the
 		// FOCUSED channel, so no unread bump is applied -- the user
@@ -280,12 +293,6 @@ func reduceNewMessage(a *App, m NewMessageMsg) tea.Cmd {
 		// entry via MarkChannel/MarkRead elsewhere).
 		debuglog.Cache("NewMessageMsg: channel=%s ts=%s decision=active_channel_no_unread_bump",
 			m.ChannelID, m.Message.TS)
-		// Route thread replies to the thread panel if it matches
-		// the open thread. The panel follows the focused window
-		// (spec §7), so this keeps the legacy focused-channel gate.
-		if a.threadVisible && m.Message.ThreadTS == a.threadPanel.ThreadTS() {
-			a.threadPanel.AddReply(m.Message)
-		}
 	} else {
 		// Message arrived for a channel that is NOT focused -- bump
 		// its unread state so the sidebar shows the dot + bold
