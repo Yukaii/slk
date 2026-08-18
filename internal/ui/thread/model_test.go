@@ -284,8 +284,11 @@ func TestRemoveMessageByTS_LastBecomesEmpty(t *testing.T) {
 	if len(m.replies) != 0 {
 		t.Error("expected empty replies")
 	}
-	if m.SelectedReply() != nil {
-		t.Error("SelectedReply should be nil when empty")
+	// With no replies left the cursor falls back to the parent row
+	// (parentSelected) so message ops still have a target.
+	sel := m.SelectedReply()
+	if sel == nil || sel.TS != "P1" {
+		t.Errorf("SelectedReply = %+v, want parent (TS P1) when replies empty", sel)
 	}
 }
 
