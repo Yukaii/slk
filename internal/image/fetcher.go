@@ -372,6 +372,9 @@ func (f *Fetcher) download(ctx context.Context, url string) (body []byte, conten
 		}
 		if status == http.StatusOK && strings.HasPrefix(strings.ToLower(ct), "image/") {
 			// Success. Remember which auth worked for foreign-team URLs.
+			if teamID != "" && auth.TeamID != "" {
+				debuglog.ImgFetch("file auth: learned team %q is reachable via team %q's auth", teamID, auth.TeamID)
+			}
 			f.resolver.Learn(teamID, auth)
 			return body, ct, nil
 		}
