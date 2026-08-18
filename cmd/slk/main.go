@@ -2623,6 +2623,8 @@ func extractAttachments(files []slack.File) []messages.Attachment {
 			name = f.Name
 		}
 		att := messages.Attachment{Kind: kind, Name: name, URL: pickAttachmentURL(f, kind)}
+		att.DownloadURL = f.URLPrivate
+		att.Size = int64(f.Size)
 		if kind == "image" {
 			att.FileID = f.ID
 			att.Mime = f.Mimetype
