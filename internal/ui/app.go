@@ -23,6 +23,7 @@ import (
 	"github.com/gammons/slk/internal/debuglog"
 	"github.com/gammons/slk/internal/emoji"
 	"github.com/gammons/slk/internal/export"
+	"github.com/gammons/slk/internal/filedl"
 	"github.com/gammons/slk/internal/ids"
 	imgpkg "github.com/gammons/slk/internal/image"
 	"github.com/gammons/slk/internal/slackurl"
@@ -271,6 +272,16 @@ type App struct {
 
 	// linkPicker is the open-link choice modal (issue #62).
 	linkPicker *linkpicker.Model
+
+	// fileDownloader downloads file attachments for the `d`
+	// keybinding. Nil in tests; downloadFileCmd toasts when unset.
+	fileDownloader *filedl.Downloader
+
+	// pickerKind records what the linkpicker modal is choosing:
+	// "links" (Enter dispatches OpenLinkMsg) or "files" (Enter
+	// dispatches DownloadFileMsg from pickerFiles).
+	pickerKind  string
+	pickerFiles []messages.Attachment
 
 	// Reaction picker
 	reactionPicker *reactionpicker.Model
@@ -606,6 +617,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		reduceSend,
 		reduceChannels,
 		reduceLinks,
+		reduceFiles,
 		reduceSearch,
 		reduceWorkspace,
 		reduceNewMessagePicker,
@@ -2050,6 +2062,12 @@ func (a *App) SetImageProtocol(p imgpkg.Protocol) {
 	a.imgProtocol = p
 }
 
+// SetFileDownloader wires the file attachment downloader used by the
+// `d` keybinding.
+func (a *App) SetFileDownloader(d *filedl.Downloader) {
+	a.fileDownloader = d
+}
+
 // openImagePreviewCmd looks up the (channel, ts, attIdx) attachment in
 // the active messages pane, picks the largest available thumb, and
 // returns a tea.Cmd that asynchronously fetches it; on completion the
@@ -2276,6 +2294,26 @@ func openURLCmd(url string) tea.Cmd {
 			return ToastMsg{Text: "Failed to open link"}
 		}
 		return nil
+	}
+}
+
+// downloadFileCmd downloads att to the temp download dir and opens it
+// in the OS default app. Runs async; the user gets a toast either way.
+func (a *App) downloadFileCmd(att messages.Attachment) tea.Cmd {
+	return func() tea.Msg {
+		if a.fileDownloader == nil {
+			return ToastMsg{Text: "File downloads unavailable"}
+		}
+		path, err := a.fileDownloader.Download(context.Background(), att.DownloadURL, att.Name)
+		if err != nil {
+			log.Printf("file download failed: %v", err)
+			return ToastMsg{Text: "Download failed: " + att.Name}
+		}
+		if err := launchOS(path); err != nil {
+			log.Printf("file open failed: %v", err)
+			return ToastMsg{Text: "Failed to open " + att.Name}
+		}
+		return ToastMsg{Text: "Downloaded " + att.Name}
 	}
 }
 
