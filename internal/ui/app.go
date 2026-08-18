@@ -1098,7 +1098,57 @@ func (a *App) openLinksOfSelected() tea.Cmd {
 		for i, l := range links {
 			items[i] = linkpicker.Item{URL: l.URL, Label: l.Label, InApp: a.linkOpensInApp(l.URL)}
 		}
+		a.pickerKind = "links"
 		a.linkPicker.Open("Open link", items)
+		a.SetMode(ModeLinkPicker)
+		return nil
+	}
+}
+
+// downloadFilesOfSelected implements the `d` keybinding: collect the
+// downloadable (non-image) file attachments of the selected message
+// (messages pane or thread panel). 0 files -> toast; 1 file ->
+// dispatch DownloadFileMsg directly; 2+ -> open the picker modal in
+// "files" mode. Mirrors openLinksOfSelected. Images are excluded: they
+// already have the preview flow (O/v).
+func (a *App) downloadFilesOfSelected() tea.Cmd {
+	var atts []messages.Attachment
+	switch a.focusedPanel {
+	case PanelMessages:
+		msg, ok := a.messagepane.SelectedMessage()
+		if !ok {
+			return nil
+		}
+		atts = msg.Attachments
+	case PanelThread:
+		reply := a.threadPanel.SelectedReply()
+		if reply == nil {
+			return nil
+		}
+		atts = reply.Attachments
+	default:
+		return nil
+	}
+	files := make([]messages.Attachment, 0, len(atts))
+	for _, att := range atts {
+		if att.Kind == "file" && att.DownloadURL != "" {
+			files = append(files, att)
+		}
+	}
+	switch len(files) {
+	case 0:
+		return func() tea.Msg { return ToastMsg{Text: "No files in message"} }
+	case 1:
+		att := files[0]
+		return func() tea.Msg { return DownloadFileMsg{Attachment: att} }
+	default:
+		items := make([]linkpicker.Item, len(files))
+		for i, f := range files {
+			items[i] = linkpicker.Item{Label: f.Name, Detail: humanSize(f.Size)}
+		}
+		a.pickerKind = "files"
+		a.pickerFiles = files
+		a.linkPicker.Open("Download file", items)
 		a.SetMode(ModeLinkPicker)
 		return nil
 	}

@@ -272,6 +272,9 @@ func handleNormalMode(a *App, msg tea.KeyMsg) tea.Cmd {
 	case key.Matches(msg, a.keys.OpenLink):
 		return a.openLinksOfSelected()
 
+	case key.Matches(msg, a.keys.DownloadFile):
+		return a.downloadFilesOfSelected()
+
 	case key.Matches(msg, a.keys.MarkUnread):
 		return a.markUnreadOfSelected()
 
