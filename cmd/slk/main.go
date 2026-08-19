@@ -26,6 +26,7 @@ import (
 	"github.com/gammons/slk/internal/config"
 	"github.com/gammons/slk/internal/debuglog"
 	emojiwidth "github.com/gammons/slk/internal/emoji"
+	"github.com/gammons/slk/internal/filedl"
 	"github.com/gammons/slk/internal/ids"
 	imgpkg "github.com/gammons/slk/internal/image"
 	"github.com/gammons/slk/internal/notify"
@@ -966,6 +967,13 @@ func run() error {
 	imageFetcher := imgpkg.NewFetcher(imageCache, newImageHTTPClient())
 	imageFetcher.SetAuths(auths)
 
+	// File attachment downloads (`d` keybinding) share the image
+	// fetcher's auth mechanism via slackhttp.AuthResolver. The
+	// downloader gets its own resolver instance; it learns foreign-team
+	// (Slack Connect) auth independently of the image fetcher.
+	fileDownloader := filedl.New(slackhttp.NewAuthResolver(auths),
+		filepath.Join(os.TempDir(), "slk-files"))
+
 	// Migrate old avatar cache (one-time, idempotent).
 	oldAvatarDir := filepath.Join(cacheDir, "avatars")
 	if n, err := imgpkg.MigrateAvatars(oldAvatarDir, imagesDir); err != nil {
@@ -1099,6 +1107,7 @@ func run() error {
 	}
 	app.SetImageContext(buildImgCtx(nil))
 	app.SetImageFetcher(imageFetcher)
+	app.SetFileDownloader(fileDownloader)
 	app.SetImageProtocol(proto)
 
 	// Emoji-image rendering. Active only on kitty (per ImageMode
@@ -2665,6 +2674,8 @@ func extractAttachments(files []slack.File) []messages.Attachment {
 			name = f.Name
 		}
 		att := messages.Attachment{Kind: kind, Name: name, URL: pickAttachmentURL(f, kind)}
+		att.DownloadURL = f.URLPrivate
+		att.Size = int64(f.Size)
 		if kind == "image" {
 			att.FileID = f.ID
 			att.Mime = f.Mimetype

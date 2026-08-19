@@ -124,13 +124,12 @@ func blockquoteStyle() lipgloss.Style {
 // whole line is wrapped in an OSC 8 hyperlink escape so it's clickable in
 // modern terminals. Returns "" if there are no attachments.
 //
-// Filenames are intentionally omitted: most Slack file names are noisy
-// (e.g. UUID-style image names) and including them in addition to the
-// already-long URL pushed message lines past the panel width.
+// The filename is the link label; the raw URL is not shown (it's in
+// the OSC 8 escape). Attachments with no name fall back to the URL.
 //
 // Output format per attachment:
 //
-//	[Image] https://files.slack.com/...
+//	[Image] photo.png
 //
 // Callers must pass the result through WordWrap before composing it into
 // a width-bounded layout, since file URLs frequently exceed the panel
@@ -146,11 +145,13 @@ func RenderAttachments(attachments []Attachment) string {
 	return strings.Join(lines, "\n")
 }
 
-// renderSingleAttachment formats one attachment as the legacy single-line
-// "[Image] <url>" or "[File] <url>" form, wrapped in an OSC 8 hyperlink.
-// The messages-pane image-rendering pipeline uses this when no inline
-// renderer is available (ProtoOff, missing thumbs) and the thread pane
-// uses it via RenderAttachments for all attachments.
+// renderSingleAttachment formats one attachment as the single-line
+// "[Image] <name>" / "[File] <name>" form, with the name wrapped in an
+// OSC 8 hyperlink to the URL. Falls back to the URL as label when the
+// attachment has no name. The messages-pane image-rendering pipeline
+// uses this when no inline renderer is available (ProtoOff, missing
+// thumbs) and the thread pane uses it via RenderAttachments for all
+// attachments.
 func renderSingleAttachment(a Attachment) string {
 	markerStyle := lipgloss.NewStyle().Foreground(styles.TextMuted).Bold(true)
 	urlStyle := linkStyle()
@@ -158,7 +159,11 @@ func renderSingleAttachment(a Attachment) string {
 	if a.Kind == "image" {
 		marker = "[Image]"
 	}
-	body := markerStyle.Render(marker) + " " + urlStyle.Render(a.URL)
+	label := a.Name
+	if label == "" {
+		label = a.URL
+	}
+	body := markerStyle.Render(marker) + " " + urlStyle.Render(label)
 	return osc8Hyperlink(a.URL, body)
 }
 

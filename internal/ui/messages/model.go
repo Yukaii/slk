@@ -57,6 +57,12 @@ type Attachment struct {
 	Name string // display filename / title
 	URL  string // permalink (preferred) or url_private
 
+	// DownloadURL is the auth-gated url_private, used by the `d`
+	// download keybinding. Size is the file size in bytes (0 when
+	// Slack didn't provide one); shown in the file picker.
+	DownloadURL string
+	Size        int64
+
 	// Populated only for Kind == "image":
 	FileID string      // Slack file ID for cache key
 	Mime   string      // e.g. "image/png"

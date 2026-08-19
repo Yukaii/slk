@@ -475,6 +475,12 @@ type MessageDeletedMsg struct {
 // picker modal.
 type OpenLinkMsg struct{ URL string }
 
+// DownloadFileMsg requests download + OS-open of a file attachment.
+// Dispatched by the `d` keybinding (directly for single-file messages)
+// and by the picker modal for multi-file messages. Handled by
+// reduceFiles.
+type DownloadFileMsg struct{ Attachment messages.Attachment }
+
 // MarkUnreadMsg requests the App to mark the given message as unread.
 // ThreadTS is "" for channel-level mark-unread; non-empty for thread-level
 // (in which case ChannelID is the parent channel and BoundaryTS is the
