@@ -108,7 +108,7 @@ type WorkspaceContext struct {
 	// Edge is the edgeapi client for this workspace: the
 	// conditional-revalidation and server-side-search endpoints. Nil
 	// only if construction failed, and every caller nil-checks.
-	Edge       *edge.Client
+	Edge *edge.Client
 	// EdgeHealth records whether edge resolution is working for this
 	// workspace this session. bootstrap marks it degraded on a
 	// wholesale failure; the user resolver reads it to skip batch
@@ -1063,14 +1063,13 @@ func run() error {
 	// per visible avatar per redraw would dominate the bandwidth budget.
 	avatarCache := avatar.NewCache(imageFetcher, imgpkg.KittyRendererInstance(), proto == imgpkg.ProtoKitty)
 
-	// Cell pixel metrics for sizing decisions.
+	// Cell pixel metrics for image encoding. Sixel uses them for its
+	// absolute raster dimensions; kitty places by cell but uses them to
+	// transmit enough source pixels for the terminal's native cell
+	// resolution. SetCellPixels retains its 8x16 fallback when the
+	// terminal reports no usable geometry.
 	pxW, pxH := imgpkg.CellPixels(int(os.Stdout.Fd()))
 	debuglog.ImgRender("cell pixels: %dx%d", pxW, pxH)
-	// Sixel encodes at absolute pixel dimensions — the terminal paints
-	// one sixel pixel per device pixel rather than scaling into a cell
-	// box the way kitty does. Hand it the measured metrics so an image
-	// occupying N rows of layout is encoded N*cellHeight pixels tall and
-	// actually lands on those rows.
 	imgpkg.SetCellPixels(pxW, pxH)
 
 	// Wire the inline-image pipeline into the messages pane. SendMsg
