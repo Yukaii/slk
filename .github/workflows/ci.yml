@@ -61,4 +61,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.12.2
+          # v2.13.0+ is required for go1.27 (which setup-go's "stable"
+          # now resolves to); older binaries panic in go/types with
+          # "file requires newer Go version go1.27".
+          version: v2.13.1
