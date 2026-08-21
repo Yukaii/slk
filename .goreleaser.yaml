@@ -8,7 +8,36 @@ before:
   hooks:
     - go mod tidy
 
+# Two build entries because of cgo:
+#
+#   * darwin NEEDS CGO_ENABLED=1: golang.design/x/clipboard reads the macOS
+#     pasteboard through Cocoa, which is cgo-only. The CGO_ENABLED=0 cask
+#     binary made clipboard.Init() fail at startup and silently disabled
+#     Ctrl+V smart-paste (issue #156). This requires the release workflow
+#     to run on a macOS runner.
+#   * linux/windows stay CGO_ENABLED=0: static binaries are what make the
+#     deb/rpm/apk packages and the Windows zip portable. Linux Wayland paste
+#     works without cgo (slk shells out to wl-paste); Linux X11 paste needs
+#     cgo + libX11, and dynamically linking it would break musl/Alpine and
+#     minimal containers, so release binaries keep X11 paste disabled.
 builds:
+  - id: slk-darwin
+    main: ./cmd/slk
+    binary: slk
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
   - id: slk
     main: ./cmd/slk
     binary: slk
@@ -16,7 +45,6 @@ builds:
       - CGO_ENABLED=0
     goos:
       - linux
-      - darwin
       - windows
     goarch:
       - amd64
