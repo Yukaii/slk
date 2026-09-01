@@ -62,6 +62,7 @@ type KeyMap struct {
 	WinCycle            key.Binding
 	WinClose            key.Binding
 	WinOnly             key.Binding
+	ToggleBroadcast     key.Binding
 }
 
 func DefaultKeyMap() KeyMap {
@@ -132,5 +133,8 @@ func DefaultKeyMap() KeyMap {
 		WinCycle:     key.NewBinding(key.WithHelp("ctrl+w w", "cycle windows")),
 		WinClose:     key.NewBinding(key.WithHelp("ctrl+w q / :q", "close window")),
 		WinOnly:      key.NewBinding(key.WithHelp("ctrl+w o / :only", "close other windows")),
+		// Insert mode, thread compose only: toggles Slack's
+		// "Also send to #channel" checkbox for the next reply.
+		ToggleBroadcast: key.NewBinding(key.WithKeys("ctrl+o"), key.WithHelp("ctrl+o", "also send thread reply to channel")),
 	}
 }

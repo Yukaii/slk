@@ -43,6 +43,10 @@ See [[Terminal Compatibility|Terminal-Compatibility]] for which protocol your te
 
 - Side panel (35% width), opened with `Enter`, toggled with `Ctrl+]`
 - Live thread reply routing, real-time updates
+- Also send to channel: `Ctrl+O` while composing a thread reply toggles Slack's
+  "Also send to #channel" broadcast (`reply_broadcast=true`). An accent-colored
+  `↪ also send to #channel` line under the input shows when it's armed; the
+  toggle resets when you open a different thread.
 - Auto-closes on channel switch or narrow terminals
 - **Threads view** (`⚑ Threads` at top of sidebar): scrollable list of every
   thread you authored, replied to, or were @-mentioned in for the active
