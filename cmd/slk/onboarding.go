@@ -67,7 +67,7 @@ func addWorkspace() error {
 				Description("All selected by default; space to toggle, enter to confirm.").
 				Options(opts...).
 				Value(&chosen).
-				Height(visibleRows+4),
+				Height(visibleRows + 4),
 		),
 	).WithTheme(huh.ThemeFunc(huh.ThemeDracula))
 	if err := form.Run(); err != nil {
