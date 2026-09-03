@@ -108,7 +108,7 @@ type WorkspaceContext struct {
 	// Edge is the edgeapi client for this workspace: the
 	// conditional-revalidation and server-side-search endpoints. Nil
 	// only if construction failed, and every caller nil-checks.
-	Edge       *edge.Client
+	Edge *edge.Client
 	// EdgeHealth records whether edge resolution is working for this
 	// workspace this session. bootstrap marks it degraded on a
 	// wholesale failure; the user resolver reads it to skip batch
