@@ -156,12 +156,35 @@ func (m Model) View(height int) string {
 		} else {
 			style = styles.WorkspaceInactive
 		}
+		// Fixed tile width keeps the rail stable: every tile is
+		// 3 content cells (2 initials + 1 unread slot) + 2 padding
+		// cells = 5 wide, centered in the 6-wide rail. Without this
+		// the unread dot ("BI" -> "BI●") widens the tile 4->5 and
+		// the outer centering shifts it left by a cell; hiding the
+		// dot on the selected workspace caused the same jitter on
+		// every workspace switch.
+		tile := style.Width(5)
 
+		// Always reserve the unread slot so showing/clearing the dot
+		// (or switching to/from an unread workspace, whose dot is
+		// hidden while selected) never changes the tile width. The
+		// slot is a plain space when empty and a dot painted with
+		// the tile's own background when set -- PresenceOnline alone
+		// carries no background, and its ANSI reset would punch a
+		// rail-colored hole into the tile. Keeping the dot separate
+		// from the initials also means a future icon renderer can
+		// swap the initials for an image and reuse this slot as-is.
+		showDot := item.HasUnread && i != m.selected
 		initials := item.Initials
-		if item.HasUnread && i != m.selected {
-			initials = initials + styles.PresenceOnline.Render("●")
+		var dot string
+		if showDot {
+			// Read the background off the tile style so the dot
+			// tracks themes and Apply().
+			dot = lipgloss.NewStyle().Background(tile.GetBackground()).Foreground(styles.Accent).Render("●")
+		} else {
+			dot = " "
 		}
-		label := style.Render(initials)
+		label := tile.Render(initials + dot)
 		rows = append(rows, label)
 	}
 
