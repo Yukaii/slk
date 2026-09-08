@@ -69,6 +69,23 @@ func TestOverlay_PadsShortRowsToWidth(t *testing.T) {
 	}
 }
 
+func TestOverlay_WideCharAtGutterEdgeStaysAligned(t *testing.T) {
+	// A full-width row ending with a 2-cell char (CJK / emoji at the wrap
+	// edge): cutting to gutterCol drops the whole cluster, so without a
+	// post-cut re-pad the overlaid row ends up one cell short and the
+	// scrollbar gutter staggers. Every row must stay exactly width.
+	//
+	// width=6 -> gutterCol=5. "abcdあ" is 4 + 2 = 6 cells; Cut to 5 drops
+	// "あ" leaving 4 cells.
+	in := []string{"abcdあ", "abcdef", "abcあd"}
+	out := Overlay(append([]string(nil), in...), 6, 9, 0, 3, bg, track, thumb)
+	for i, row := range out {
+		if w := ansi.StringWidth(row); w != 6 {
+			t.Fatalf("row %d width = %d; want 6 (%q)", i, w, row)
+		}
+	}
+}
+
 func TestVisible(t *testing.T) {
 	if Visible(5, 5) {
 		t.Error("Visible(5,5) should be false")

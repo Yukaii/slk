@@ -79,12 +79,22 @@ func Overlay(visible []string, width, total, yOffset, visibleHeight int, bg, tra
 		// SGR state; rows shorter than gutterCol are padded by appending
 		// background-colored spaces so the scrollbar lands at a consistent
 		// column across rows of varying width.
+		//
+		// Post-cut re-pad: ansi.Cut never splits a grapheme, so cutting
+		// a full-width row whose last cell is the second half of a wide
+		// char (CJK / emoji at the wrap edge) drops the whole cluster and
+		// yields gutterCol-1 cells. Without a re-pad that row ends up one
+		// cell short and the scrollbar gutter staggers by a column,
+		// breaking the vertical border/scroll line.
 		line := visible[i]
 		w := ansi.StringWidth(line)
 		var prefix string
 		switch {
 		case w > gutterCol:
 			prefix = ansi.Cut(line, 0, gutterCol)
+			if pw := ansi.StringWidth(prefix); pw < gutterCol {
+				prefix += lipgloss.NewStyle().Background(bg).Width(gutterCol - pw).Render("")
+			}
 		case w == gutterCol:
 			prefix = line
 		default:

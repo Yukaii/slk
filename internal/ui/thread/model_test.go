@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/x/ansi"
 	"github.com/gammons/slk/internal/config"
@@ -741,6 +742,55 @@ func TestThreadView_HasScrollbarWhenOverflowing(t *testing.T) {
 	// definitely draws.
 	if !strings.ContainsRune(view, '│') && !strings.ContainsRune(view, '█') {
 		t.Fatalf("expected scrollbar glyph in overflowing thread view; got:\n%s", view)
+	}
+}
+
+// TestThreadView_ScrollbarStaysAlignedOnWideCharWrapEdge guards the
+// "thread-box border/scroll line breaks on wrapped text" report: when a
+// wrapped row is exactly full-width and ends with a 2-cell char (CJK /
+// emoji at the wrap edge), cutting that row for the scrollbar gutter must
+// not leave it one cell short (ansi.Cut drops the straddling cluster).
+// Every reply-area row must stay exactly width cells with the scrollbar
+// glyph in the last column.
+func TestThreadView_ScrollbarStaysAlignedOnWideCharWrapEdge(t *testing.T) {
+	const width = 30
+	m := New()
+	parent := messages.MessageItem{TS: "1.0", UserName: "alice", Text: "p"}
+	// contentWidth inside a reply is width-4 = 26 (even), so a run of
+	// 2-cell "あ" hard-breaks into lines of exactly 13 chars = 26 cells,
+	// each ending with a wide char at the row edge.
+	var replies []messages.MessageItem
+	for i := 0; i < 30; i++ {
+		replies = append(replies, messages.MessageItem{
+			TS:       fmt.Sprintf("%d.0", i+2),
+			UserName: "bob",
+			Text:     strings.Repeat("あ", 40),
+		})
+	}
+	m.SetThread(parent, replies, "C1", "1.0")
+
+	const height = 10
+	view := m.View(height, width)
+	rows := strings.Split(view, "\n")
+	if len(rows) != height {
+		t.Fatalf("view rows = %d; want %d", len(rows), height)
+	}
+	for i, row := range rows {
+		if w := ansi.StringWidth(row); w != width {
+			t.Fatalf("row %d width = %d; want %d (%q)", i, w, width, row)
+		}
+	}
+	// Chrome (header + separator) carries no scrollbar; every reply-area
+	// row must end with the gutter glyph.
+	for i := m.chromeHeight; i < len(rows); i++ {
+		plain := ansi.Strip(rows[i])
+		if plain == "" {
+			continue
+		}
+		last, _ := utf8.DecodeLastRuneInString(plain)
+		if last != '│' && last != '█' {
+			t.Fatalf("row %d last cell = %q; want scrollbar glyph (view=%q)", i, last, view)
+		}
 	}
 }
 
